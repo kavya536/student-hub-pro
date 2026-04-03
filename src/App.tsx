@@ -344,9 +344,9 @@ const MOCK_CHATS: Chat[] = [
     time: '10:30 AM',
     unreadCount: 2,
     messages: [
-      { id: 'm1', senderId: '1', text: 'Hi Alex, are you ready for our session?', timestamp: '09:00 AM' },
-      { id: 'm2', senderId: 'user', text: 'Yes, I have my notes ready!', timestamp: '09:05 AM' },
-      { id: 'm3', senderId: '1', text: 'Great! See you in our next session!', timestamp: '10:30 AM' },
+      { id: 'm1', senderId: '1', text: 'Hi Alex, are you ready for our session?', timestamp: '09:00 AM', date: 'YESTERDAY' },
+      { id: 'm2', senderId: 'user', text: 'Yes, I have my notes ready!', timestamp: '09:05 AM', date: 'YESTERDAY' },
+      { id: 'm3', senderId: '1', text: 'Great! See you in our next session!', timestamp: '10:30 AM', date: 'TODAY' },
     ]
   },
   {
@@ -357,7 +357,8 @@ const MOCK_CHATS: Chat[] = [
     time: 'Yesterday',
     unreadCount: 0,
     messages: [
-      { id: 'm4', senderId: '2', text: 'I can help with that project.', timestamp: 'Yesterday' },
+      { id: 'm4', senderId: '2', text: 'I can help with that project.', timestamp: '11:00 AM', date: 'YESTERDAY' },
+      { id: 'm5', senderId: 'user', text: 'ok', timestamp: '11:12 AM', date: 'TODAY' },
     ]
   }
 ];
@@ -2780,73 +2781,75 @@ const ChatView = ({
   }, [activeChatId, chats]);
 
   return (
-    <div className="chat-container-full">
-      {/* Left Panel: Contacts List */}
-      <div className={`${activeChatId ? 'hidden md:flex' : 'flex'} w-full md:w-80 border-r border-primary/5 flex-col bg-white/20 h-full`}>
-        <div className="p-6 md:p-8 border-b border-primary/5">
-          <div className="flex items-center gap-4 mb-6">
-            <button 
-              onClick={() => setView('dashboard')}
-              className="p-2 hover:bg-primary/5 rounded-xl text-primary/40 hover:text-primary transition-all"
-              title="Back to Dashboard"
-            >
-              <ArrowLeft size={20} />
-            </button>
-            <h3 className="text-xl md:text-2xl font-serif font-bold italic text-on-surface">Messages</h3>
-          </div>
-          <div className="relative">
-            <input 
-              type="text" 
-              placeholder="Search chats..." 
-              className="w-full bg-primary/5 border-none rounded-xl py-3 pl-4 pr-12 focus:ring-2 focus:ring-primary/10 transition-all placeholder:text-primary/40 text-sm font-medium" 
-              value={chatSearch}
-              onChange={(e) => setChatSearch(e.target.value)}
-            />
-            <Search className="absolute right-4 top-1/2 -translate-y-1/2 text-primary/50" size={16} />
-          </div>
-        </div>
-        
-        <div className="flex-1 overflow-y-auto custom-scrollbar">
-          {filteredChats.length > 0 ? (
-            filteredChats.map(chat => (
-              <button 
-                key={chat.tutorId}
-                onClick={() => {
-                  if (activeChatId !== chat.tutorId) {
-                    setActiveChatId(chat.tutorId);
-                  }
-                }}
-                className={`w-full p-4 md:p-6 flex items-center gap-4 hover:bg-white/40 transition-all border-b border-primary/5 last:border-0 relative group ${activeChatId === chat.tutorId ? 'bg-white/80' : ''}`}
-              >
-                {activeChatId === chat.tutorId && (
-                  <motion.div layoutId="active-chat-indicator" className="absolute left-0 top-0 bottom-0 w-1 bg-accent" />
-                )}
-                <Avatar src={chat.avatar} size="md" />
-                <div className="flex-1 text-left min-w-0">
-                  <div className="flex items-center justify-between mb-1">
-                    <h5 className={`text-sm truncate transition-colors ${activeChatId === chat.tutorId ? 'font-bold text-primary' : 'font-semibold text-primary/70'}`}>
-                      {chat.tutorName}
-                    </h5>
-                    <span className="text-[10px] font-bold text-primary/60 uppercase tracking-widest">{chat.time}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <p className="text-xs text-black/60 truncate font-medium">{chat.lastMessage}</p>
-                    {chat.unreadCount > 0 && (
-                      <span className="bg-accent text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-lg shadow-accent/20">
-                        {chat.unreadCount}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </button>
-            ))
-          ) : (
-            <div className="p-10 text-center">
-              <p className="text-xs font-bold text-primary/20 uppercase tracking-widest">No conversations yet</p>
-            </div>
-          )}
+    <div className="h-full flex flex-col md:p-6 p-2 antialiased">
+      <div className="flex items-center justify-between mb-4 md:mb-6 shrink-0 mt-4 md:mt-0">
+        <h2 className="text-2xl font-black text-on-surface tracking-tight ml-2 md:ml-0">Messages</h2>
+        <div className="flex items-center gap-2 bg-primary/10 px-4 py-2 rounded-full">
+          <span className="w-2 h-2 bg-primary rounded-full animate-pulse"></span>
+          <span className="text-[10px] font-black text-primary uppercase tracking-widest hidden md:inline">Live Support</span>
+          <span className="text-[10px] font-black text-primary uppercase tracking-widest md:hidden">Live</span>
         </div>
       </div>
+
+      <div className="flex bg-white rounded-[2rem] md:rounded-[2.5rem] shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden flex-1 border border-slate-100 relative">
+        {/* Left Panel: Contacts List */}
+        <div className={`${activeChatId ? 'hidden md:flex' : 'flex'} w-full md:w-[320px] lg:w-[400px] border-r border-slate-100 flex-col bg-white shrink-0`}>
+          <div className="p-4 md:p-6 border-b border-slate-100 flex items-center justify-between">
+            <h4 className="font-black text-sm uppercase tracking-widest text-on-surface">Tutors</h4>
+            <span className="bg-slate-100 text-slate-500 text-[10px] font-black px-2 py-1 rounded-md">{filteredChats.length}</span>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto p-2 md:p-4 space-y-1 md:space-y-2 custom-scrollbar">
+            {filteredChats.length > 0 ? (
+              filteredChats.map(chat => {
+                const initials = chat.tutorName.split(' ').map((n: string) => n[0]).join('').substring(0,2).toUpperCase();
+                return (
+                  <button 
+                    key={chat.tutorId}
+                    onClick={() => {
+                      if (activeChatId !== chat.tutorId) {
+                        setActiveChatId(chat.tutorId);
+                      }
+                    }}
+                    className={`w-full flex items-center gap-3 md:gap-4 p-3 md:p-4 rounded-xl md:rounded-2xl transition-all text-left group relative ${activeChatId === chat.tutorId ? 'bg-primary/10 shadow-sm' : 'hover:bg-slate-50'}`}
+                  >
+                    {activeChatId === chat.tutorId && (
+                      <motion.div layoutId="active-chat-indicator" className="absolute left-0 top-3 bottom-3 md:top-4 md:bottom-4 w-1 bg-primary rounded-r-full" />
+                    )}
+                    <div className="relative shrink-0">
+                      <div className={`w-10 h-10 md:w-12 md:h-12 rounded-full font-black flex items-center justify-center text-xs md:text-sm transition-transform group-hover:scale-105 ${activeChatId === chat.tutorId ? "bg-primary/20 text-primary" : "bg-slate-200 text-slate-500"}`}>
+                        {initials}
+                      </div>
+                      <span className="absolute bottom-0 right-0 w-3 h-3 md:w-3.5 md:h-3.5 bg-green-500 border-2 border-white rounded-full"></span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between mb-0.5 md:mb-1">
+                        <p className="font-black text-xs md:text-sm truncate text-on-surface">
+                          {chat.tutorName}
+                        </p>
+                        <span className="text-[8px] md:text-[9px] font-bold text-on-surface-variant opacity-60">{chat.time}</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <p className={`text-[10px] md:text-xs truncate ${chat.unreadCount > 0 ? 'font-bold text-on-surface' : 'font-medium text-on-surface-variant opacity-70'}`}>
+                          {chat.lastMessage}
+                        </p>
+                        {chat.unreadCount > 0 && (
+                          <span className="bg-primary text-white text-[8px] md:text-[9px] font-black min-w-[16px] md:min-w-[18px] h-[16px] md:h-[18px] flex items-center justify-center rounded-full shadow-sm">
+                            {chat.unreadCount}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                )
+              })
+            ) : (
+              <div className="p-10 text-center">
+                <p className="text-xs font-bold text-primary/20 uppercase tracking-widest">No conversations yet</p>
+              </div>
+            )}
+          </div>
+        </div>
 
       {/* Right Panel: Active Chat */}
       <div className={`${activeChatId ? 'flex' : 'hidden md:flex'} flex-1 flex-col bg-background/20 relative h-full`}>
@@ -2878,10 +2881,10 @@ const ChatView = ({
             <div className="absolute bottom-0 right-0 w-3 h-3 md:w-4 md:h-4 bg-emerald-500 border-2 border-white rounded-full shadow-sm" />
           </div>
           <div>
-            <h4 className="font-serif font-bold text-lg md:text-xl italic text-primary">{activeChat.tutorName}</h4>
-            <div className="flex items-center gap-2">
+            <h4 className="font-black text-sm md:text-lg leading-tight text-on-surface">{activeChat.tutorName}</h4>
+            <div className="flex items-center gap-1.5 mt-0.5">
               <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-              <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest">Online Now</p>
+              <p className="text-[8px] md:text-[10px] font-black text-on-surface-variant uppercase tracking-widest opacity-60">Online Now</p>
             </div>
           </div>
         </div>
@@ -2920,46 +2923,63 @@ const ChatView = ({
         </div>
       </div>
 
-            {/* Messages Area */}
-            <div className="flex-1 overflow-y-auto p-4 md:p-10 space-y-6 md:space-y-8 custom-scrollbar bg-pattern-dots">
+            <div className="flex-1 overflow-y-auto p-4 md:p-10 space-y-4 md:space-y-6 custom-scrollbar bg-gradient-to-b from-slate-50/50 to-slate-100/80 relative">
+              {/* Subtle Modern Dot Pattern */}
+              <div className="absolute inset-0 opacity-[0.15] pointer-events-none bg-[radial-gradient(#94a3b8_1px,transparent_1px)] [background-size:24px_24px]"></div>
+              
               {activeChat.messages.map((msg, idx) => {
                 const isUser = msg.senderId === 'user';
+                const showDateSeparator = idx === 0 || msg.date !== activeChat.messages[idx-1].date;
+                const displayDate = msg.date || (idx < activeChat.messages.length - 1 ? 'YESTERDAY' : 'TODAY');
+
                 return (
-                  <motion.div 
-                    key={msg.id}
-                    initial={{ opacity: 0, x: isUser ? 20 : -20 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: idx * 0.05 }}
-                    className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div className={`max-w-[85%] md:max-w-[70%] flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-                      <div className="flex items-center gap-2">
-                        <div className={`
-                          px-4 md:px-6 py-3 md:py-4 rounded-2xl md:rounded-[2rem] text-sm font-medium shadow-sm leading-relaxed
-                          ${isUser 
-                            ? 'bg-primary text-black rounded-tr-none shadow-primary/10' 
-                            : 'bg-white text-black rounded-tl-none shadow-black/5'}
-                        `}>
-                          {msg.text}
-                        </div>
-                        {isUser && (
-                          <button 
-                            onClick={() => {
-                              setEditingMessageId(msg.id);
-                              setDrafts(prev => ({ ...prev, [activeChatId!]: msg.text }));
-                            }}
-                            className="p-2 text-primary/30 hover:text-primary transition-colors"
-                            title="Edit message"
-                          >
-                            <Edit2 size={14} />
-                          </button>
-                        )}
+                  <React.Fragment key={msg.id}>
+                    {showDateSeparator && (
+                      <div className="flex justify-center my-4 md:my-6 relative z-10 w-full">
+                        <span className="bg-slate-200/60 text-slate-600 text-[9px] md:text-[10px] font-bold px-3 py-1 rounded-lg uppercase tracking-widest backdrop-blur-sm">
+                          {displayDate}
+                        </span>
                       </div>
-                      <p className="mt-2 text-[10px] font-bold text-primary/50 uppercase tracking-widest px-2">
-                        {msg.timestamp} {msg.edited && <span className="ml-1 opacity-60">(edited)</span>}
-                      </p>
+                    )}
+                    <motion.div 
+                      initial={{ opacity: 0, y: 15, scale: 0.9, filter: 'blur(4px)' }}
+                      animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                      transition={{ delay: idx * 0.05 }}
+                      className={`flex w-full group relative ${isUser ? 'justify-end' : 'justify-start'}`}
+                    >
+                    {isUser && (
+                      <button 
+                        onClick={() => {
+                          setEditingMessageId(msg.id);
+                          setDrafts(prev => ({ ...prev, [activeChatId!]: msg.text }));
+                        }}
+                        className="bg-white/90 p-2 rounded-full shadow-sm mr-2 opacity-0 group-hover:opacity-100 transition-all hover:bg-primary hover:text-white self-center border border-primary/10 z-20"
+                        title="Edit message"
+                      >
+                        <Edit2 size={14} />
+                      </button>
+                    )}
+                    <div className={`
+                      max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-2xl md:rounded-[1.5rem] shadow-sm relative transition-all z-10
+                      ${isUser 
+                        ? 'bg-primary text-white rounded-tr-md shadow-primary/20' 
+                        : 'bg-white text-on-surface rounded-tl-md border border-slate-100'}
+                    `}>
+                      {!isUser && (
+                        <p className="text-[10px] font-bold text-primary/70 uppercase tracking-widest mb-1.5 opacity-100">
+                          {activeChat.tutorName}
+                        </p>
+                      )}
+                      <p className="text-base md:text-lg font-bold leading-snug mb-1">{msg.text}</p>
+                      <div className={`flex items-center gap-1.5 mt-2 justify-end ${isUser ? 'text-white/90' : 'text-on-surface-variant/90'}`}>
+                        <span className="text-[9px] md:text-[10px] font-bold uppercase tracking-widest">
+                          {msg.timestamp} {msg.edited && <span className="ml-1 opacity-60">(edited)</span>}
+                        </span>
+                        {isUser && <Check size={14} className="text-white/90" />}
+                      </div>
                     </div>
                   </motion.div>
+                 </React.Fragment>
                 );
               })}
               <div ref={chatEndRef} />
@@ -3068,17 +3088,18 @@ const ChatView = ({
             </div>
           </>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-center p-10">
-            <div className="w-32 h-32 bg-white/40 rounded-[3rem] flex items-center justify-center shadow-2xl mb-8 border border-primary/5">
-              <MessageSquare className="text-primary/10" size={64} />
+          <div className="flex-1 flex flex-col items-center justify-center text-center p-10 bg-[#f0f2f5]">
+            <div className="w-24 h-24 bg-primary/10 rounded-full flex items-center justify-center mb-6">
+              <User size={40} className="text-primary/40" />
             </div>
-            <h3 className="text-3xl font-serif font-bold italic text-primary">Your Inbox</h3>
-            <p className="text-primary/60 mt-4 max-w-xs font-medium leading-relaxed">
-              Select a conversation from the left to start chatting with your tutors.
+            <h3 className="text-2xl font-black text-on-surface tracking-tight mb-2">Your Inbox</h3>
+            <p className="text-sm font-bold text-on-surface-variant opacity-70">
+              Select a tutor from the list to start a conversation
             </p>
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 };
