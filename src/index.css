@@ -18,11 +18,6 @@
 @layer base {
   body {
     @apply bg-background text-on-surface font-sans antialiased;
-    font-size: 14px;
-    font-weight: 500;
-  }
-  h1, h2, h3, h4, h5, h6 {
-    font-family: "Inter", sans-serif;
   }
 }
 
@@ -31,9 +26,7 @@
 }
 
 .sidebar-item {
-  @apply flex items-center gap-4 px-6 py-4 rounded-2xl transition-all duration-300 text-on-surface/40 hover:text-primary hover:bg-primary/5;
-  font-size: 14px;
-  font-weight: 500;
+  @apply flex items-center gap-4 px-6 py-4 rounded-2xl transition-all duration-300 font-bold text-on-surface/40 hover:text-primary hover:bg-primary/5;
 }
 
 .sidebar-item-active {
@@ -73,10 +66,7 @@
 }
 
 .pill-tag {
-  @apply px-4 py-1.5 rounded-full bg-gray-100 uppercase text-on-surface-variant;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 1px;
+  @apply px-4 py-1.5 rounded-full bg-gray-100 text-[10px] font-black uppercase tracking-widest text-on-surface-variant;
 }
 
 .input-field {
