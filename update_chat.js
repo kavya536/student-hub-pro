@@ -1,0 +1,349 @@
+const fs = require('fs');
+const path = 'd:/tutor_website/student-hub-pro/src/App.tsx';
+let content = fs.readFileSync(path, 'utf8');
+
+const start = 'const ChatView = ({';
+const startIndex = content.indexOf(start);
+
+if (startIndex >= 0) {
+  const newChatView = `const ChatView = ({ 
+  chats, 
+  activeChatId, 
+  setActiveChatId, 
+  setChats, 
+  drafts, 
+  setDrafts, 
+  sendMessage, 
+  setView, 
+  editingMessageId, 
+  setEditingMessageId,
+  setIsMobileSidebarOpen,
+  isChatMenuOpen,
+  setIsChatMenuOpen
+}: ChatViewProps) => {
+  const [chatSearch, setChatSearch] = useState('');
+  const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  
+  const filteredChats = chats.filter(c => {
+    const searchLower = chatSearch.toLowerCase();
+    return c.tutorName.toLowerCase().includes(searchLower);
+  });
+  
+  const activeChat = chats.find(c => c.tutorId === activeChatId);
+  const currentDraft = activeChatId ? (drafts[activeChatId] || '') : '';
+
+  const attachmentOptions = [
+    { icon: FileText, label: 'Document', color: 'bg-indigo-500 text-white' },
+    { icon: ImageIcon, label: 'Photos & videos', color: 'bg-blue-500 text-white' },
+    { icon: Camera, label: 'Camera', color: 'bg-rose-500 text-white' },
+    { icon: Mic, label: 'Audio', color: 'bg-orange-500 text-white' },
+    { icon: UserCircle, label: 'Contact', color: 'bg-blue-600 text-white' },
+    { icon: BarChart2, label: 'Poll', color: 'bg-amber-500 text-white' },
+  ];
+
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [activeChatId, chats]);
+
+  return (
+    <div className="h-[calc(100vh-80px)] md:h-[calc(100vh-100px)] flex flex-col animate-in fade-in slide-in-from-bottom-4 duration-500 -mt-2 md:-mt-4">
+      <div className="flex items-center justify-between mb-2 shrink-0">
+        <h1 className="page-title">Messages</h1>
+        <div className="flex items-center gap-1.5 bg-primary/10 px-3 py-1.5 rounded-full">
+          <span className="w-1.5 h-1.5 bg-primary rounded-full animate-pulse"></span>
+          <span className="status-label text-primary">Live Support</span>
+        </div>
+      </div>
+
+      <div className="flex bg-white rounded-xl md:rounded-3xl atelier-card-shadow overflow-hidden flex-1 border border-surface-variant relative">
+        {/* Left Panel: Contacts List */}
+        <div className={cn(
+          "w-full md:w-[320px] lg:w-[400px] border-r border-surface-variant flex flex-col bg-slate-50/30 transition-all duration-300 shrink-0",
+          activeChatId ? "hidden md:flex" : "flex"
+        )}>
+          <div className="p-3 md:p-4 border-b border-surface-variant flex items-center justify-between bg-white">
+            <h4 className="label-caps !text-[11px] text-on-surface">Tutors</h4>
+            <span className="bg-slate-100 text-slate-500 secondary-text font-black px-1.5 py-0.5 rounded-md !text-[11px]">{filteredChats.length}</span>
+          </div>
+          <div className="p-3 border-b border-surface-variant bg-white/30 backdrop-blur-sm">
+            <div className="relative">
+              <input 
+                type="text" 
+                placeholder="Search chats..." 
+                className="w-full bg-slate-50 border-none rounded-xl py-2.5 pl-10 pr-4 focus:ring-2 focus:ring-primary/50 transition-all text-sm outline-none font-bold" 
+                value={chatSearch}
+                onChange={(e) => setChatSearch(e.target.value)}
+              />
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-primary/30" size={16} />
+            </div>
+          </div>
+          
+          <div className="overflow-y-auto flex-1 p-2 md:p-3 space-y-1 md:space-y-2 custom-scrollbar">
+            {filteredChats.map((chat) => (
+              <button 
+                key={chat.tutorId}
+                onClick={() => setActiveChatId(chat.tutorId)}
+                className={cn(
+                  "w-full flex items-center gap-2 md:gap-3 p-2 md:p-3 rounded-lg md:rounded-xl transition-all text-left relative group",
+                  activeChatId === chat.tutorId ? "bg-primary/10 shadow-sm" : "hover:bg-slate-100/80"
+                )}
+              >
+                {activeChatId === chat.tutorId && (
+                  <motion.div layoutId="active-chat-pill" className="absolute left-0 top-3 bottom-3 md:top-4 md:bottom-4 w-1 bg-primary rounded-r-full" />
+                )}
+                <div className="relative shrink-0">
+                  <Avatar src={chat.avatar} size="md" className={cn("transition-transform group-hover:scale-105", activeChatId === chat.tutorId ? "ring-2 ring-primary/20" : "")} />
+                  <span className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full shadow-sm"></span>
+                </div>
+                <div className="flex-1 text-left min-w-0">
+                  <div className="flex items-center justify-between mb-0.5 md:mb-1">
+                    <h5 className={cn(
+                      "text-xs md:text-sm truncate transition-colors",
+                      activeChatId === chat.tutorId ? "font-black text-on-surface" : "font-bold text-on-surface/80"
+                    )}>
+                      {chat.tutorName}
+                    </h5>
+                    <span className="status-label opacity-60 shrink-0 ml-2">{chat.time}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <p className={cn(
+                      "text-[10px] md:text-xs truncate",
+                      chat.unreadCount > 0 ? "font-bold text-on-surface" : "font-medium text-on-surface-variant opacity-70"
+                    )}>
+                      {chat.lastMessage}
+                    </p>
+                    {chat.unreadCount > 0 && (
+                      <span className="bg-primary text-white text-[8px] md:text-[9px] font-black min-w-[16px] md:min-w-[18px] h-[16px] md:h-[18px] flex items-center justify-center rounded-full shrink-0 ml-2 shadow-sm">
+                        {chat.unreadCount}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Right Panel: Active Chat */}
+        <div className={cn(
+          "flex-1 flex flex-col bg-gradient-to-b from-slate-50/50 to-slate-100/80 relative transition-all duration-300 h-full",
+          !activeChatId ? "hidden md:flex" : "flex"
+        )}>
+          {activeChat ? (
+            <>
+              {/* Subtle pattern */}
+              <div className="absolute inset-0 opacity-[0.15] pointer-events-none bg-[radial-gradient(#94a3b8_1px,transparent_1px)] [background-size:24px_24px]"></div>
+              
+              {/* Chat Header */}
+              <div className="p-2 md:p-3 border-b border-surface-variant bg-white flex items-center justify-between shadow-sm relative z-10">
+                <div className="flex items-center gap-2 md:gap-3">
+                  <button 
+                    onClick={() => setActiveChatId(null)}
+                    className="md:hidden p-1 hover:bg-slate-100 rounded-full"
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <div className="relative">
+                    <Avatar src={activeChat.avatar} size="md" />
+                  </div>
+                  <div>
+                    <h4 className="font-black text-sm md:text-lg leading-tight text-on-surface">{activeChat.tutorName}</h4>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-emerald-500 rounded-full animate-pulse" />
+                      <span className="status-label opacity-60">Online Now</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button className="p-2 hover:bg-primary/5 rounded-xl transition-all text-primary/60 hover:text-primary">
+                    <Search size={20} />
+                  </button>
+                  <div className="relative">
+                    <button 
+                      onClick={() => setIsChatMenuOpen(!isChatMenuOpen)}
+                      className="p-2 hover:bg-primary/5 rounded-xl transition-all text-primary/60 hover:text-primary"
+                    >
+                      <MoreVertical size={20} />
+                    </button>
+                    <AnimatePresence>
+                      {isChatMenuOpen && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: 10 }}
+                          className="absolute right-0 top-full mt-2 w-48 bg-white rounded-2xl shadow-xl border border-surface-variant overflow-hidden z-50"
+                        >
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3">
+                            <UserCircle size={16} /> View Profile
+                          </button>
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3">
+                            <FileText size={16} /> Shared Files
+                          </button>
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-rose-500 border-t border-surface-variant">
+                            <LogOut size={16} /> Clear Chat
+                          </button>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              </div>
+
+              {/* Messages Area */}
+              <div className="flex-1 overflow-y-auto p-3 md:p-5 space-y-3 md:space-y-4 relative z-10 scroll-smooth custom-scrollbar">
+                {activeChat.messages.map((msg, i) => {
+                  const isUser = msg.senderId === 'user';
+                  const dateVal = (msg as any).date || 'TODAY';
+                  const prevDateVal = i > 0 ? ((activeChat.messages[i-1] as any).date || 'TODAY') : null;
+                  const showDate = i === 0 || dateVal !== prevDateVal;
+
+                  return (
+                    <React.Fragment key={msg.id}>
+                      {showDate && (
+                        <div className="flex justify-center my-4 md:my-6 relative z-10 w-full">
+                          <span className="bg-slate-200/60 text-slate-600 text-[9px] md:text-[10px] font-bold px-3 py-1 rounded-lg uppercase tracking-widest backdrop-blur-sm shadow-sm">
+                            {dateVal}
+                          </span>
+                        </div>
+                      )}
+                      <motion.div
+                        initial={{ opacity: 0, y: 15, scale: 0.9, filter: 'blur(4px)' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                        transition={{ duration: 0.4, ease: "easeOut" }}
+                        className={cn(
+                          "flex w-full group relative",
+                          isUser ? "justify-end" : "justify-start"
+                        )}
+                      >
+                        {isUser && (
+                          <button
+                            onClick={() => {
+                              setEditingMessageId(msg.id);
+                              setDrafts(prev => ({ ...prev, [activeChatId!]: msg.text }));
+                            }}
+                            className="bg-white/90 p-2 rounded-full shadow-sm mr-2 opacity-0 group-hover:opacity-100 transition-all hover:bg-primary hover:text-white self-center border border-primary/10"
+                            title="Edit message"
+                          >
+                            <Edit2 size={12} />
+                          </button>
+                        )}
+                        <div className={cn(
+                          "max-w-[85%] md:max-w-[70%] px-3 py-2 rounded-2xl shadow-sm relative transition-all w-fit",
+                          isUser ? "bg-primary text-white rounded-tr-md shadow-primary/20" : "bg-white text-on-surface rounded-tl-md border border-slate-100"
+                        )}>
+                          <p className="text-sm md:text-sm font-bold leading-snug">{msg.text}</p>
+                          <div className={cn(
+                            "flex items-center gap-1.5 mt-1 justify-end",
+                            isUser ? "text-white/80" : "text-on-surface-variant/90"
+                          )}>
+                            <span className="status-label !text-[9px] opacity-60">{msg.timestamp}</span>
+                            {isUser && <Check size={12} className="text-white/90" />}
+                          </div>
+                        </div>
+                      </motion.div>
+                    </React.Fragment>
+                  );
+                })}
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* Input Area */}
+              <div className="p-3 md:p-5 bg-white border-t border-surface-variant flex flex-col gap-2 relative z-10 shadow-[0_-4px_20px_rgba(0,0,0,0.02)]">
+                {editingMessageId && (
+                  <div className="flex items-center justify-between bg-primary/5 px-4 py-2 rounded-xl mb-1 border-l-4 border-primary">
+                    <p className="status-label text-primary">Editing Message</p>
+                    <button onClick={() => { setEditingMessageId(null); setDrafts(prev => ({ ...prev, [activeChatId!]: '' })); }} className="p-1 hover:bg-primary/10 rounded-full">
+                      <X className="w-3 h-3 text-primary" />
+                    </button>
+                  </div>
+                )}
+                
+                <div className="flex gap-2 md:gap-4 w-full">
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => setIsAttachmentMenuOpen(!isAttachmentMenuOpen)}
+                      className="p-3 transition-all rounded-xl text-primary/40 hover:text-primary hover:bg-primary/5"
+                    >
+                      <Paperclip size={20} />
+                    </button>
+                    <AnimatePresence>
+                      {isAttachmentMenuOpen && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: 20, scale: 0.9 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          exit={{ opacity: 0, y: 20, scale: 0.9 }}
+                          className="absolute bottom-full left-4 mb-4 w-64 bg-white rounded-2xl shadow-xl border border-surface-variant p-3 z-50 overflow-hidden"
+                        >
+                          <div className="grid grid-cols-1 gap-1">
+                            {attachmentOptions.map((opt) => (
+                              <button 
+                                key={opt.label}
+                                onClick={() => {
+                                  setIsAttachmentMenuOpen(false);
+                                  if (opt.label === 'Document' || opt.label === 'Photos & videos') {
+                                    fileInputRef.current?.click();
+                                  }
+                                }}
+                                className="flex items-center gap-3 p-3 hover:bg-slate-50 rounded-xl transition-all group"
+                              >
+                                <div className={cn("w-8 h-8 rounded-full flex items-center justify-center text-white shadow-sm transition-transform group-hover:scale-110", opt.color)}>
+                                  <opt.icon size={14} />
+                                </div>
+                                <span className="text-sm font-bold text-on-surface/70 group-hover:text-primary">{opt.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+
+                  <div className="flex-1 relative">
+                    <input 
+                      type="text" 
+                      placeholder={editingMessageId ? 'Edit your message...' : 'Type a message...'}
+                      className="w-full bg-slate-50 border-none rounded-xl md:rounded-2xl px-5 md:px-6 py-3.5 md:py-4 shadow-inner focus:ring-2 ring-primary outline-none text-sm md:text-base font-medium pr-12"
+                      value={currentDraft}
+                      onChange={(e) => setDrafts(prev => ({ ...prev, [activeChatId!]: e.target.value }))}
+                      onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                    />
+                    <button 
+                      onClick={sendMessage}
+                      disabled={!currentDraft.trim()}
+                      className={cn("absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg md:rounded-xl transition-all", currentDraft.trim() ? 'text-primary hover:bg-primary/10' : 'text-primary/30 cursor-not-allowed')}
+                    >
+                      <Send size={editingMessageId ? 20 : 22} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-4">
+              <div className="w-20 h-20 md:w-32 md:h-32 bg-primary/5 rounded-full flex items-center justify-center text-primary/20">
+                <User size={64} className="opacity-20" />
+              </div>
+              <div>
+                <h3 className="font-black text-xl md:text-2xl text-on-surface tracking-tight">Your Inbox</h3>
+                <p className="text-on-surface-variant font-medium text-sm md:text-base max-w-xs mx-auto">Select a tutor from the list to start a conversation</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};`;
+  
+  const endIndex = content.indexOf('};', startIndex);
+  if (endIndex >= 0) {
+    const endLength = (endIndex - startIndex) + 2;
+    content = content.substring(0, startIndex) + newChatView + content.substring(startIndex + endLength);
+    fs.writeFileSync(path, content);
+    console.log('Successfully updated App.tsx');
+  }
+}

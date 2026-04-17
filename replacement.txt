@@ -1,0 +1,315 @@
+  return (
+    <div className="h-[calc(100vh-40px)] md:h-[calc(100vh-60px)] flex flex-col p-4 md:p-6 lg:p-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="flex items-center justify-between mb-4 md:mb-6 shrink-0">
+        <h1 className="text-2xl md:text-3xl font-serif font-bold italic text-primary">Messages</h1>
+        <div className="flex items-center gap-1.5 bg-primary/10 px-3 md:px-4 py-1.5 md:py-2 rounded-full shadow-sm border border-primary/10">
+          <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-primary rounded-full animate-pulse"></span>
+          <span className="text-[10px] md:text-xs font-bold text-primary tracking-widest uppercase">Live Support</span>
+        </div>
+      </div>
+
+      <div className="flex bg-white/80 backdrop-blur-xl rounded-2xl md:rounded-[2.5rem] shadow-xl overflow-hidden flex-1 border border-primary/10 relative">
+        {/* Left Panel: Contacts List */}
+        <div className={cn(
+          "w-full md:w-[320px] lg:w-[400px] border-r border-primary/10 flex flex-col bg-slate-50/50 transition-all duration-300 shrink-0",
+          activeChatId ? "hidden md:flex" : "flex"
+        )}>
+          <div className="p-4 md:p-5 border-b border-primary/5 flex items-center justify-between bg-white/50 backdrop-blur-sm">
+            <h4 className="text-[11px] font-bold text-primary/60 uppercase tracking-widest">Tutors</h4>
+            <span className="bg-primary/10 text-primary font-black px-2 py-1 rounded-md text-[11px]">{filteredChats.length}</span>
+          </div>
+          <div className="p-3 md:p-4 border-b border-primary/5 bg-white/30 backdrop-blur-sm">
+            <div className="relative">
+              <input 
+                type="text" 
+                placeholder="Search chats..." 
+                className="w-full bg-white border border-primary/5 text-primary rounded-xl py-2.5 pl-4 pr-10 focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-primary/40 text-sm font-medium shadow-sm outline-none" 
+                value={chatSearch}
+                onChange={(e) => setChatSearch(e.target.value)}
+              />
+              <Search className="absolute right-3 top-1/2 -translate-y-1/2 text-primary/30" size={16} />
+            </div>
+          </div>
+          
+          <div className="overflow-y-auto flex-1 p-2 md:p-3 space-y-1 md:space-y-2 custom-scrollbar">
+            {filteredChats.length > 0 ? (
+              filteredChats.map((chat, i) => (
+                <button 
+                  key={chat.tutorId}
+                  onClick={() => setActiveChatId(chat.tutorId)}
+                  className={`w-full flex items-center gap-3 p-3 md:p-4 rounded-xl transition-all text-left relative group ${activeChatId === chat.tutorId ? 'bg-primary/10 shadow-sm' : 'hover:bg-white/60'}`}
+                >
+                  {activeChatId === chat.tutorId && (
+                    <motion.div layoutId="active-chat" className="absolute left-0 top-3 bottom-3 md:top-4 md:bottom-4 w-1 bg-primary rounded-r-full" />
+                  )}
+                  <div className="relative shrink-0">
+                    <Avatar src={chat.avatar} size="md" className={`transition-transform group-hover:scale-105 ${activeChatId === chat.tutorId ? 'ring-2 ring-primary/20' : ''}`} />
+                    <span className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full shadow-sm"></span>
+                  </div>
+                  <div className="flex-1 text-left min-w-0">
+                    <div className="flex items-center justify-between mb-1">
+                      <h5 className={`text-sm md:text-base truncate transition-colors ${activeChatId === chat.tutorId ? 'font-black text-primary' : 'font-bold text-primary/80'}`}>
+                        {chat.tutorName}
+                      </h5>
+                      <span className="text-[9px] md:text-[10px] font-bold text-primary/50 uppercase tracking-widest shrink-0 ml-2">{chat.time}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className={`text-[11px] md:text-xs truncate ${chat.unreadCount > 0 ? 'font-bold text-on-surface' : 'font-medium text-primary/60'}`}>{chat.lastMessage}</p>
+                      {chat.unreadCount > 0 && (
+                        <span className="bg-primary text-white text-[9px] md:text-[10px] font-black min-w-[18px] md:min-w-[20px] h-[18px] md:h-[20px] flex items-center justify-center rounded-full shrink-0 ml-2 shadow-sm">
+                          {chat.unreadCount}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="p-10 text-center">
+                <p className="text-xs font-bold text-primary/30 uppercase tracking-widest">No conversations</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel: Active Chat */}
+        <div className={cn(
+          "flex-1 flex flex-col bg-gradient-to-b from-slate-50/50 to-slate-100/80 relative transition-all duration-300 h-full",
+          !activeChatId ? "hidden md:flex" : "flex"
+        )}>
+          {activeChat ? (
+            <>
+              {/* Subtle pattern */}
+              <div className="absolute inset-0 opacity-[0.2] pointer-events-none bg-[radial-gradient(#94a3b8_1px,transparent_1px)] [background-size:24px_24px]"></div>
+              
+              {/* Chat Header */}
+              <div className="p-3 md:p-5 border-b border-primary/10 bg-white/90 backdrop-blur-xl flex items-center justify-between shadow-sm relative z-10">
+                <div className="flex items-center gap-3 md:gap-4">
+                  <button 
+                    onClick={() => setActiveChatId(null)}
+                    className="md:hidden p-2 hover:bg-primary/5 rounded-xl text-primary/60 transition-all"
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <div className="relative">
+                    <Avatar src={activeChat.avatar} size="md" mdSize="lg" />
+                  </div>
+                  <div>
+                    <h4 className="font-serif font-bold text-base md:text-xl italic text-primary leading-tight">{activeChat.tutorName}</h4>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-emerald-500 rounded-full animate-pulse" />
+                      <p className="text-[8px] md:text-[10px] font-bold text-emerald-600 uppercase tracking-widest opacity-80">Online Now</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button className="p-2.5 md:p-3 hover:bg-primary/5 rounded-xl transition-all text-primary/60 hover:text-primary">
+                    <Search size={20} />
+                  </button>
+                  <div className="relative">
+                    <button 
+                      onClick={() => setIsChatMenuOpen(!isChatMenuOpen)}
+                      className="p-2.5 md:p-3 hover:bg-primary/5 rounded-xl transition-all text-primary/60 hover:text-primary"
+                    >
+                      <MoreVertical size={20} />
+                    </button>
+                    <AnimatePresence>
+                      {isChatMenuOpen && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: 10 }}
+                          className="absolute right-0 top-full mt-2 w-48 bg-white rounded-2xl shadow-xl border border-primary/5 overflow-hidden z-50"
+                        >
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-primary/80">
+                            <UserCircle size={16} /> View Profile
+                          </button>
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-primary/80">
+                            <FileText size={16} /> Shared Files
+                          </button>
+                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-rose-500 border-t border-primary/5">
+                            <LogOut size={16} /> Clear Chat
+                          </button>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              </div>
+
+              {/* Messages Area */}
+              <div className="flex-1 overflow-y-auto p-4 md:p-6 lg:p-8 space-y-4 md:space-y-6 relative z-10 scroll-smooth custom-scrollbar">
+                {activeChat.messages.map((msg, idx) => {
+                  const isUser = msg.senderId === 'user';
+                  const msgDate = (msg as any).date || 'TODAY';
+                  const prevDate = idx > 0 ? ((activeChat.messages[idx - 1] as any).date || 'TODAY') : null;
+                  const showDateSep = idx === 0 || msgDate !== prevDate;
+                  
+                  return (
+                    <React.Fragment key={msg.id}>
+                      {showDateSep && (
+                        <div className="flex justify-center my-4 md:my-6 relative z-10 w-full">
+                          <span className="bg-slate-200/60 text-slate-600 text-[9px] md:text-[10px] font-bold px-3 py-1 rounded-lg uppercase tracking-widest backdrop-blur-sm shadow-sm">
+                            {msgDate}
+                          </span>
+                        </div>
+                      )}
+                      <motion.div
+                        initial={{ opacity: 0, y: 15, scale: 0.9, filter: 'blur(4px)' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                        transition={{ duration: 0.4, ease: "easeOut" }}
+                        className={`flex w-full group relative ${isUser ? 'justify-end' : 'justify-start'}`}
+                      >
+                        {isUser && (
+                          <button
+                            onClick={() => {
+                              setEditingMessageId(msg.id);
+                              setDrafts(prev => ({ ...prev, [activeChatId!]: msg.text }));
+                            }}
+                            className="bg-white/90 p-2 rounded-full shadow-sm mr-2 opacity-0 group-hover:opacity-100 transition-all hover:bg-primary hover:text-white self-center border border-primary/10"
+                            title="Edit message"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                        )}
+                        <div className={cn(
+                          "max-w-[85%] md:max-w-[70%] px-4 py-3 rounded-2xl shadow-sm relative transition-all w-fit",
+                          isUser
+                            ? "bg-primary text-white rounded-tr-md shadow-primary/20"
+                            : "bg-white text-on-surface rounded-tl-md border border-slate-100"
+                        )}>
+                          <p className="text-sm md:text-sm font-bold leading-snug">{msg.text}</p>
+                          <div className={cn(
+                            "flex items-center gap-1.5 mt-1 justify-end",
+                            isUser ? "text-white/80" : "text-on-surface-variant/90"
+                          )}>
+                            <span className="text-[9px] font-bold uppercase tracking-widest opacity-80">
+                              {msg.timestamp} {msg.edited && <span className="ml-1 opacity-60">(edited)</span>}
+                            </span>
+                            {isUser && <Check size={12} className="text-white/90" />}
+                          </div>
+                        </div>
+                      </motion.div>
+                    </React.Fragment>
+                  );
+                })}
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* Input Area */}
+              <div className="p-3 md:p-5 bg-white border-t border-primary/10 flex flex-col gap-2 relative z-10 shadow-[0_-4px_20px_rgba(0,0,0,0.02)]">
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  className="hidden" 
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      setChats(prev => prev.map(chat => {
+                        if (chat.tutorId === activeChatId) {
+                          return {
+                            ...chat,
+                            messages: [...chat.messages, {
+                              id: `m${Date.now()}`,
+                              senderId: 'user',
+                              text: `📎 Sent a file: ${file.name}`,
+                              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                            }]
+                          };
+                        }
+                        return chat;
+                      }));
+                    }
+                  }}
+                />
+                
+                {editingMessageId && (
+                  <div className="flex items-center justify-between bg-primary/5 px-4 py-2 rounded-xl mb-1 border-l-4 border-primary">
+                    <p className="text-xs font-bold text-primary uppercase tracking-widest">Editing Message</p>
+                    <button 
+                      onClick={() => {
+                        setEditingMessageId(null);
+                        setDrafts(prev => ({ ...prev, [activeChatId!]: '' }));
+                      }}
+                      className="p-1 hover:bg-primary/10 rounded-full transition-colors"
+                    >
+                      <X size={14} className="text-primary" />
+                    </button>
+                  </div>
+                )}
+                
+                <div className="flex gap-2 md:gap-4 w-full">
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => setIsAttachmentMenuOpen(!isAttachmentMenuOpen)}
+                      className="p-3 transition-all rounded-xl text-primary/40 hover:text-primary hover:bg-primary/5"
+                    >
+                      <Paperclip size={20} />
+                    </button>
+                    <AnimatePresence>
+                      {isAttachmentMenuOpen && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: 20, scale: 0.9 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          exit={{ opacity: 0, y: 20, scale: 0.9 }}
+                          className="absolute bottom-full left-4 mb-4 w-64 bg-white rounded-2xl shadow-xl border border-primary/5 p-3 z-50 overflow-hidden"
+                        >
+                          <div className="grid grid-cols-1 gap-1">
+                            {attachmentOptions.map((opt) => (
+                              <button 
+                                key={opt.label}
+                                onClick={() => {
+                                  setIsAttachmentMenuOpen(false);
+                                  if (opt.label === 'Document' || opt.label === 'Photos & videos') {
+                                    fileInputRef.current?.click();
+                                  }
+                                }}
+                                className="flex items-center gap-3 p-3 hover:bg-slate-50 rounded-xl transition-all group"
+                              >
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white shadow-sm ${opt.color} group-hover:scale-110 transition-transform`}>
+                                  <opt.icon size={14} />
+                                </div>
+                                <span className="text-sm font-bold text-on-surface/70 group-hover:text-primary">{opt.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+
+                  <div className="flex-1 relative">
+                    <input 
+                      type="text" 
+                      placeholder={editingMessageId ? "Edit your message..." : "Type a message..."}
+                      className="w-full bg-slate-50 border-none rounded-xl md:rounded-2xl px-5 md:px-6 py-3 md:py-3.5 shadow-inner focus:ring-2 ring-primary/20 outline-none text-sm md:text-base font-medium pr-12 text-on-surface"
+                      value={currentDraft}
+                      onChange={(e) => setDrafts(prev => ({ ...prev, [activeChatId!]: e.target.value }))}
+                      onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                    />
+                    <button 
+                      onClick={sendMessage}
+                      disabled={!currentDraft.trim()}
+                      className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg md:rounded-xl transition-all ${currentDraft.trim() ? 'text-primary hover:bg-primary/10' : 'text-primary/30 cursor-not-allowed'}`}
+                    >
+                      {editingMessageId ? <Check size={20} /> : <Send size={20} />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-4">
+              <div className="w-20 h-20 md:w-32 md:h-32 bg-primary/5 rounded-[2rem] flex items-center justify-center text-primary/20 shadow-inner">
+                <MessageSquare className="opacity-40" size={48} />
+              </div>
+              <div>
+                <h3 className="font-serif font-bold text-2xl text-primary tracking-tight italic">Your Inbox</h3>
+                <p className="text-primary/60 font-medium text-sm md:text-base max-w-xs mx-auto mt-2">Select a tutor from the list to start a conversation.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
