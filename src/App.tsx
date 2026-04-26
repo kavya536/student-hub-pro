@@ -30,6 +30,7 @@ import {
   Mic,
   UserCircle,
   BarChart2,
+  BarChart3,
   Edit2,
   Check,
   CheckCheck,
@@ -50,10 +51,18 @@ import {
   Trash2,
   Download,
   Quote,
-  Save
+  Save,
+  AlertTriangle,
+  Minus,
+  RotateCcw,
+  Briefcase,
+  FileCheck,
+  ShieldCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { io } from 'socket.io-client';
+
 import { 
   BarChart, 
   Bar, 
@@ -66,7 +75,11 @@ import {
   Line,
   Cell
 } from 'recharts';
-import { auth, db } from './firebase';
+import { auth, db, messaging } from './firebase';
+import { getToken, onMessage } from 'firebase/messaging';
+
+import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 import { 
   createUserWithEmailAndPassword, 
   onAuthStateChanged, 
@@ -76,13 +89,154 @@ import {
   signInWithRedirect,
   getRedirectResult
 } from 'firebase/auth';
-import { doc, setDoc, serverTimestamp, getDoc, collection, addDoc, query, where, getDocs, onSnapshot, orderBy, updateDoc, deleteDoc, limit, increment, arrayUnion } from 'firebase/firestore';
+import { onSnapshot, collection, query, where, doc, setDoc, addDoc, getDoc, updateDoc, serverTimestamp, getDocs, deleteDoc, orderBy, increment, arrayUnion, limit } from 'firebase/firestore';
+
+// Helper to format Firestore timestamp safely
+const formatTime = (ts: any) => {
+  if (!ts) return 'Just now';
+  // If it's a simple formatted time string (e.g. "10:30 AM"), return it.
+  // If it's an ISO string (contains T and Z), we want to format it properly below.
+  if (typeof ts === 'string' && ts.includes(':') && !ts.includes('T')) return ts;
+  
+  let date: Date;
+  if (ts?.seconds) date = new Date(ts.seconds * 1000);
+  else date = new Date(ts);
+  
+  if (isNaN(date.getTime())) return 'Just now';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+};
+
+const parseTime = (t: string) => {
+  const match = t.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!match) return 0;
+  let [_, h, m, ampm] = match;
+  let hours = parseInt(h);
+  if (ampm === 'PM' && hours < 12) hours += 12;
+  if (ampm === 'AM' && hours === 12) hours = 0;
+  return hours * 60 + parseInt(m);
+};
+
+const formatMins = (m: number) => {
+  let h = Math.floor(m / 60);
+  const mm = m % 60;
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return `${h}:${mm.toString().padStart(2, '0')} ${ampm}`;
+};
+
+const formatDateLabel = (d: any) => {
+  if (!d) return 'TODAY';
+  if (d === 'TODAY' || d === 'YESTERDAY') return d;
+  
+  let date: Date;
+  if (d?.seconds) date = new Date(d.seconds * 1000);
+  else date = new Date(d);
+
+  if (isNaN(date.getTime())) return 'TODAY';
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  const msgDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  
+  if (msgDate.getTime() === today.getTime()) return 'TODAY';
+  if (msgDate.getTime() === yesterday.getTime()) return 'YESTERDAY';
+  
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+};
+
+const notifIconMap = {
+  booking: <BookOpen className="w-4 h-4 text-primary" />,
+  message: <MessageSquare className="w-4 h-4 text-sky-500" />,
+  review:  <Star className="w-4 h-4 text-amber-500" />,
+  Enrollment: <BookOpen className="w-4 h-4 text-primary" />,
+  payment: <DollarSign className="w-4 h-4 text-emerald-500" />
+};
+
+const notifBgMap = {
+  booking: 'bg-primary/10',
+  message: 'bg-sky-50',
+  review:  'bg-amber-50',
+  Enrollment: 'bg-primary/10',
+  payment: 'bg-emerald-50'
+};
+
+const getPlanDefaults = (tier: 'free' | 'standard' | 'premium', category: StudentProfile['studentType'] = 'school'): SubscriptionPlan => {
+  const startDate = new Date();
+  const expiresAt = new Date();
+  expiresAt.setMonth(startDate.getMonth() + 3); // 3-month duration
+
+  let allowedSubjects = 1;
+  if (tier === 'standard') allowedSubjects = 3;
+  if (tier === 'premium') allowedSubjects = 8;
+
+  let cat: SubscriptionPlan['category'] = 'schools';
+  if (category === 'inter') cat = 'intermediate';
+  if (category === 'btech' || category === 'degree') cat = 'graduates';
+
+  return {
+    tier,
+    category: cat,
+    startDate: startDate.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    allowedSubjects,
+    status: 'active'
+  };
+};
+
+import { sendPlatformEmail } from './services/emailService';
+import { ShieldCheck as ShieldCheckIcon } from 'lucide-react';
+
+// Helper for pricing
+const getEffectivePrice = (tutorPrice: any) => {
+  const base = parseFloat(String(tutorPrice) || '0') || 0;
+  return Math.ceil(base * 1.17).toString();
+};
+
+// Helper to notify tutors when a student changes plans
+const notifyTutorsOfPlanUpdate = async (studentName: string, tier: string, bookings: Booking[]) => {
+  const activeTutorIds = Array.from(new Set(
+    bookings
+      .filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status))
+      .map(b => b.tutorId)
+  ));
+
+  const planName = tier === 'free' ? 'Explorer (Free)' : tier === 'standard' ? 'Scholar (Standard)' : 'Elite (Premium)';
+  const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
+
+  // Feature descriptions for each tier
+  const featureInfo = tier === 'free' 
+    ? 'Features: Single subject, One-on-One sessions, Platform fee applicable. No extra classes or refunds.'
+    : tier === 'standard'
+    ? 'Features: Up to 3 subjects, Extra doubt classes, Tutor notes, 20% refund policy, No platform fee.'
+    : 'Features: Up to 8 subjects, Extra classes, Premium tutor notes, Assignments & mock tests, Projects, 40% refund policy, No platform fee.';
+
+  for (const tutorId of activeTutorIds) {
+    try {
+      await addDoc(collection(db, 'tutor_notifications'), {
+        tutorId,
+        type: 'update',
+        title: 'Student Plan Updated',
+        description: `${studentName} has switched to the ${planName} Plan (${subjectLimit} subjects). ${featureInfo} Please ensure you cover these features for correct payment.`,
+        time: 'Just now',
+        read: false,
+        createdAt: serverTimestamp()
+      });
+    } catch (e) {
+      console.error(`Failed to notify tutor ${tutorId}:`, e);
+    }
+  }
+};
 
 // --- Types ---
 
-const cn = (...classes: any[]) => classes.filter(Boolean).join(' ');
+const cn = (...inputs: ClassValue[]) => {
+  return twMerge(clsx(inputs));
+};
 
-type View = 'dashboard' | 'find-tutors' | 'tutor-profile' | 'my-bookings' | 'payments' | 'chat' | 'reviews' | 'progress' | 'settings' | 'login' | 'register' | 'forgot-password' | 'live-class';
+type View = 'dashboard' | 'find-tutors' | 'tutor-profile' | 'my-bookings' | 'payments' | 'chat' | 'reviews' | 'progress' | 'notes' | 'settings' | 'login' | 'register' | 'forgot-password' | 'live-class' | 'blocked' | 'projects' | 'assignments';
 
 interface LearningGoal {
   id: string;
@@ -102,23 +256,36 @@ interface Grade {
   date: string;
 }
 
+interface SubscriptionPlan {
+  tier: 'free' | 'standard' | 'premium';
+  category?: 'schools' | 'intermediate' | 'graduates';
+  startDate: any;
+  expiresAt: any;
+  allowedSubjects: number;
+  status: 'active' | 'expired' | 'pending';
+}
+
 interface StudentProfile {
   id?: string;
   name: string;
   email: string;
-  password: string;
+  password?: string;
   mobile: string;
   class: string;
   board: string;
   studentType?: 'school' | 'inter' | 'btech' | 'degree';
+  category?: 'schools' | 'intermediate' | 'graduates';
   notifications: {
     reminders: boolean;
     messages: boolean;
     updates: boolean;
+    push: boolean;
   };
+  subscription?: SubscriptionPlan;
   totalSessions?: number;
   displayName?: string;
   photoURL?: string;
+  fcmTokens?: string[];
 }
 
 
@@ -129,11 +296,15 @@ interface Tutor {
   subjects: string[];
   experience: string;
   rating: number;
-  price: number;
+  price: number | string;
   monthlyPrice?: number;
+  upiId?: string;
   bio: string;
   reviews: Review[];
-  availability: string[];
+  availability: any[];
+  subjectsPricing?: { subject: string, price: number, type?: 'monthly' | 'course', durationDays?: number }[];
+  targetClasses?: string;
+  autoAvailability?: boolean;
 }
 
 interface Review {
@@ -155,7 +326,7 @@ interface Booking {
   date: string;
   time: string;
   duration: string;
-  status: 'pending' | 'confirmed' | 'cancelled' | 'completed' | 'rescheduled' | 'unpaid' | 'live';
+  status: 'pending' | 'confirmed' | 'cancelled' | 'completed' | 'rescheduled' | 'unpaid' | 'live' | 'pending_cancellation';
   isRescheduled?: boolean;
   attendance_status?: 'attended' | 'not_attended' | 'pending';
   studentPresent?: boolean;
@@ -164,6 +335,9 @@ interface Booking {
   topic?: string;
   tutorJoined?: boolean;
   studentJoined?: boolean;
+  tutorPresent?: boolean;
+  tutorJoinTime?: any;
+  tutorLeaveTime?: any;
   durationConducted?: number; // in minutes
   completedAt?: any;
   plan?: string;
@@ -172,6 +346,8 @@ interface Booking {
   reviewRating?: number;
   reviewComment?: string;
   paymentDeadline?: any;
+  studentClass?: string;
+  class?: string;
   paymentId?: string;
   orderId?: string;
   amount?: number;
@@ -190,13 +366,30 @@ interface Booking {
     }
   };
   startedAt?: any;
+  isSubscription?: boolean;
+  subscriptionStatus?: 'active' | 'expired' | 'cancelled';
+  nextBillingDate?: any;
+}
+
+interface Poll {
+  id: string;
+  tutorId: string;
+  tutorName?: string;
+  question: string;
+  topic?: string;
+  targetClass: string;
+  options: { text: string; votes: string[] }[];
+  allowMultiple: boolean;
+  status: 'active' | 'closed';
+  createdAt: any;
 }
 
 interface Message {
   id: string;
   senderId: string;
+  sender?: 'me' | 'tutor';
   text: string;
-  timestamp: string;
+  timestamp: any;
   edited?: boolean;
   date?: string;
 }
@@ -277,7 +470,7 @@ const MOCK_TUTORS: Tutor[] = [
     reviews: [
       { id: 'r1', studentName: 'Alex J.', rating: 5, comment: 'Amazing tutor! Helped me ace my finals.', date: '2024-03-15' }
     ],
-    availability: ['09:00 AM', '11:00 AM', '02:00 PM', '04:00 PM']
+    availability: []
   },
   {
     id: '2',
@@ -292,7 +485,7 @@ const MOCK_TUTORS: Tutor[] = [
     reviews: [
       { id: 'r2', studentName: 'Emma S.', rating: 4, comment: 'Very patient and knowledgeable.', date: '2024-03-10' }
     ],
-    availability: ['10:00 AM', '01:00 PM', '03:00 PM', '05:00 PM']
+    availability: []
   },
   {
     id: '3',
@@ -307,7 +500,7 @@ const MOCK_TUTORS: Tutor[] = [
     reviews: [
       { id: 'r3', studentName: 'Lucas M.', rating: 5, comment: 'Excellent focus on grammar.', date: '2024-03-05' }
     ],
-    availability: ['08:00 AM', '12:00 PM', '02:00 PM']
+    availability: []
   },
   {
     id: '4',
@@ -322,7 +515,7 @@ const MOCK_TUTORS: Tutor[] = [
     reviews: [
       { id: 'r4', studentName: 'Priya K.', rating: 5, comment: 'Very helpful with Hindi basics.', date: '2024-03-02' }
     ],
-    availability: ['10:00 AM', '04:00 PM']
+    availability: []
   },
   {
     id: '5',
@@ -337,7 +530,7 @@ const MOCK_TUTORS: Tutor[] = [
     reviews: [
       { id: 'r5', studentName: 'Tom H.', rating: 4, comment: 'Great English sessions.', date: '2024-03-01' }
     ],
-    availability: ['09:00 AM', '03:00 PM']
+    availability: []
   },
   {
     id: '6',
@@ -350,7 +543,7 @@ const MOCK_TUTORS: Tutor[] = [
     monthlyPrice: 25000,
     bio: 'Specialist in JEE preparation. I have helped hundreds of students get into top engineering colleges.',
     reviews: [],
-    availability: ['07:00 AM', '06:00 PM']
+    availability: []
   },
   {
     id: '7',
@@ -363,7 +556,7 @@ const MOCK_TUTORS: Tutor[] = [
     monthlyPrice: 7500,
     bio: 'Dedicated EAMCET coach focusing on Chemistry. I provide clear explanations and effective shortcut methods.',
     reviews: [],
-    availability: ['11:00 AM', '05:00 PM']
+    availability: []
   }
 ];
 
@@ -507,19 +700,19 @@ const Avatar = ({ src, size = 'md', mdSize, className = '', initials = '' }: { s
 const Modal = ({ isOpen, onClose, title, children }: { isOpen: boolean, onClose: () => void, title: string, children: React.ReactNode }) => {
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-primary/40 backdrop-blur-sm">
+    <div className="fixed inset-0 z-[200] flex items-start justify-center p-4 bg-black/60 backdrop-blur-md overflow-y-auto pt-10 md:pt-20">
       <motion.div 
-        initial={{ opacity: 0, scale: 0.95 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="bg-background rounded-[2rem] md:rounded-[3rem] w-full max-w-lg shadow-2xl overflow-hidden border border-primary/10"
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="bg-white rounded-[2rem] md:rounded-[2.5rem] w-full max-w-lg shadow-[0_50px_100px_-20px_rgba(0,0,0,0.5)] overflow-hidden border border-white/10 mb-20"
       >
-        <div className="p-6 md:p-8 border-b border-primary/5 flex items-center justify-between">
-          <h3 className="text-xl md:text-2xl font-serif font-bold italic">{title}</h3>
-          <button onClick={onClose} className="p-2 hover:bg-primary/5 rounded-full transition-colors">
-            <XCircle className="text-primary/30" size={24} />
+        <div className="p-6 md:p-8 border-b border-black/5 flex items-center justify-between bg-white/50 backdrop-blur-xl sticky top-0 z-10">
+          <h3 className="text-lg md:text-xl font-serif font-black italic text-on-surface">{title}</h3>
+          <button onClick={onClose} className="p-2 hover:bg-black/5 rounded-full transition-all active:scale-90">
+            <XCircle className="text-primary/20 hover:text-primary transition-colors" size={24} />
           </button>
         </div>
-        <div className="p-6 md:p-8 max-h-[80vh] overflow-y-auto custom-scrollbar">
+        <div className="p-6 md:p-8 max-h-[70vh] overflow-y-auto custom-scrollbar bg-slate-50/30">
           {children}
         </div>
       </motion.div>
@@ -565,1287 +758,370 @@ const getReputation = (id: string | number, realReviews: any[] = []) => {
   };
 };
 
-export default function App() {
-  const [view, setView] = useState<View>('login');
-  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
-  const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
-  const [currentUser, setCurrentUser] = useState<StudentProfile | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [authInitialized, setAuthInitialized] = useState(false);
-
-  // Scroll to top when view changes
-  useEffect(() => {
-    // Use setTimeout to ensure scroll happens after page transition
-    setTimeout(() => {
-      window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
-      // Also scroll the main content area if it exists
-      const mainElement = document.querySelector('main') || document.querySelector('.main-content') || document.body;
-      if (mainElement) {
-        mainElement.scrollTop = 0;
-      }
-    }, 100);
-  }, [view]);
-
-  useEffect(() => {
-    let isMounted = true;
-    let authTimeout: NodeJS.Timeout;
+const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView, setSelectedTutor, tutors, startSession, parseTime, currentUser, setCancelBooking, setIsCancelModalOpen, calculateRefund }: { 
+  bookings: Booking[], 
+  setBookings: (bookings: Booking[]) => void,
+  openChat: (tutorId: string) => void, 
+  onReschedule: (booking: Booking) => void,
+  setView: (view: View) => void,
+  setSelectedTutor: (tutor: Tutor | null) => void,
+  tutors: Tutor[],
+  startSession: (id: string) => void,
+  parseTime: (time: string) => number,
+  currentUser: StudentProfile | null,
+  setCancelBooking: (booking: Booking | null) => void,
+  setIsCancelModalOpen: (open: boolean) => void,
+  calculateRefund: (booking: Booking) => any
+}) => {
+    const [tab, setTab] = useState<'all' | 'confirmed' | 'pending' | 'completed' | 'cancel'>('all');
     
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!isMounted) return;
-      
-      console.log("Auth state changed:", user ? "User logged in" : "User logged out");
-      
-      // Clear any existing timeout
-      if (authTimeout) {
-        clearTimeout(authTimeout);
-      }
-      
-      try {
-        if (user) {
-          // Simple Firestore operation with timeout
-          const docRef = doc(db, 'students', user.uid);
-          
-          // Set timeout for the Firestore operation
-          const timeoutPromise = new Promise((_, reject) => {
-            authTimeout = setTimeout(() => reject(new Error('Firestore timeout')), 8000);
-          });
-          
-          try {
-            const docSnap = await Promise.race([getDoc(docRef), timeoutPromise]) as any;
-            clearTimeout(authTimeout);
-            
-            if (docSnap.exists) {
-              const userData = docSnap.data();
-              setCurrentUser({ id: user.uid, ...userData } as any);
-              console.log("Real student profile loaded:", userData.email);
-            } else {
-              console.log("No student profile found, using auth fallback for:", user.email);
-              setCurrentUser({
-                id: user.uid,
-                name: user.displayName || user.email?.split('@')[0] || 'User',
-                email: user.email || '',
-                mobile: user.phoneNumber || '',
-                class: '10',
-                board: 'CBSE',
-                notifications: { reminders: true, messages: true, updates: true }
-              } as any);
-            }
-            setView('dashboard');
-          } catch (firestoreError) {
-            console.error("Firestore error, using fallback:", firestoreError);
-            // Use auth fallback if Firestore fails
-            setCurrentUser({
-              id: user.uid,
-              name: user.displayName || user.email?.split('@')[0] || 'User',
-              email: user.email || '',
-              mobile: user.phoneNumber || '',
-              class: '10',
-              board: 'CBSE',
-              notifications: { reminders: true, messages: true, updates: true }
-            } as any);
-            setView('dashboard');
-          }
-        } else {
-          setView('login');
-          setCurrentUser(null);
-        }
-      } catch (err) {
-        console.error("Auth fetch error:", err);
-        if (isMounted) {
-          setView('login');
-          setCurrentUser(null);
-        }
-      } finally {
-        if (isMounted) {
-          setLoading(false);
-          setAuthInitialized(true);
-        }
-      }
+    const filteredBookings = bookings.filter(b => {
+      if (tab === 'all') return true;
+      if (tab === 'confirmed') return b.status === 'confirmed' && b.attendance_status !== 'attended';
+      if (tab === 'pending') return b.status === 'pending';
+      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2);
+      if (tab === 'cancel') return b.status === 'cancelled';
+      return true;
     });
-    
-    // Set a fallback timeout in case onAuthStateChanged doesn't fire
-    authTimeout = setTimeout(() => {
-      if (isMounted && loading) {
-        console.log("Auth initialization timeout, setting loading to false");
-        setLoading(false);
-        setAuthInitialized(true);
-        setView('login');
-      }
-    }, 15000); // 15 second fallback timeout
-    
-    return () => {
-      isMounted = false;
-      if (authTimeout) {
-        clearTimeout(authTimeout);
-      }
-      unsubscribe();
-    };
-  }, []);
 
-  // Additional safety check for loading state
-  useEffect(() => {
-    if (authInitialized && loading) {
-      console.log("Auth initialized but still loading, forcing loading to false");
-      setLoading(false);
-    }
-  }, [authInitialized, loading]);
+    return (
+      <div className="space-y-12">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 md:gap-8">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="flex bg-primary/5 p-1 rounded-xl md:p-1.5 md:rounded-2xl w-full sm:w-fit overflow-x-auto no-scrollbar"
+          >
+            {['all', 'confirmed', 'pending', 'completed', 'cancel'].map(t => (
+              <button 
+                key={t}
+                onClick={() => setTab(t as any)}
+                className={`flex-1 sm:flex-none px-4 md:px-8 py-2 md:py-3 rounded-lg md:rounded-xl text-[8px] md:text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${tab === t ? 'bg-primary text-background shadow-xl' : 'text-primary/40 hover:bg-primary/5'}`}
+              >
+                {t === 'cancel' ? 'Cancelled' : t}
+              </button>
+            ))}
+          </motion.div>
+        </div>
 
-  const [selectedTutor, setSelectedTutor] = useState<Tutor|null>(null);
-  const [tutors, setTutors] = useState<Tutor[]>([]);
-  const [bookings, setBookings] = useState<Booking[]>([]);
+        {tab === 'completed' && (
+          <motion.div 
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-primary/5 border border-primary/10 rounded-2xl p-6 md:p-8 flex items-center justify-between gap-6"
+          >
+            <div>
+              <h3 className="text-lg md:text-xl font-bold font-serif italic mb-1">Course Progress</h3>
+              <p className="text-[10px] md:text-xs text-primary/50 font-bold uppercase tracking-widest">Attendance Tracking</p>
+            </div>
+            <div className="flex items-end gap-3 text-primary">
+              <span className="text-3xl md:text-5xl font-black">{bookings.filter(b => (b.attendance_status === 'attended' || b.status === 'completed') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2)).length}</span>
+              <span className="text-lg md:text-xl font-bold mb-1 md:mb-2 opacity-50">/ {currentUser?.totalSessions || 30}</span>
+              <span className="text-[10px] md:text-xs font-bold mb-2 md:mb-3 opacity-50 uppercase tracking-widest ml-2">Sessions Ended</span>
+            </div>
+          </motion.div>
+        )}
 
-  // --- Real-time Data Sync ---
-  useEffect(() => {
-    // 1. Fetch APPROVED tutors only — real-time listener from 'users' collection
-    const tutorsQuery = query(
-      collection(db, 'users'), 
-      where('role', '==', 'tutor'),
-      where('status', '==', 'approved')
+        <div className="space-y-4 md:space-y-6">
+          {filteredBookings.length > 0 ? filteredBookings.map((booking, i) => (
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: i * 0.05 }}
+              key={booking.id} 
+              className="course-card p-6 md:p-8 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-12"
+            >
+              <div className="flex items-center gap-4 md:gap-8 min-w-[240px]">
+                <Avatar 
+                  src={((tutors || []).find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId))?.avatar || ''} 
+                  size="md" 
+                  mdSize="lg" 
+                  initials={(booking.tutorName || 'Tutor').charAt(0).toUpperCase()}
+                />
+                <div>
+                  <h4 className="font-bold text-lg md:text-xl truncate max-w-[160px]">{booking.tutorName}</h4>
+                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest">{booking.subject}</p>
+                </div>
+              </div>
+
+              <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-8 border-t md:border-t-0 md:border-l border-primary/5 pt-4 md:pt-0 md:pl-12">
+                <div className="flex items-center gap-3 text-primary/60">
+                  <div className="p-2 rounded-lg bg-accent/5 text-accent"><Calendar size={16} /></div>
+                  <div>
+                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Date</p>
+                    <p className="text-xs md:text-sm font-bold text-on-surface">{booking.date}</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 text-primary/60">
+                  <div>
+                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Time & Duration</p>
+                    <p className="text-xs md:text-sm font-bold text-on-surface whitespace-nowrap">
+                      {booking.status === 'completed' || booking.attendance_status === 'attended' ? (
+                        <span className="text-slate-500 italic opacity-60">Session Ended</span>
+                      ) : (
+                        (() => {
+                          const startMins = parseTime(booking.time);
+                          const durationStr = booking.duration ? booking.duration.toString().replace(/ Hours?| Hr/i, '') : '1';
+                          const duration = parseFloat(durationStr);
+                          const endMins = startMins + (duration * 60);
+                          
+                          const formatMinsLocal = (m: number) => {
+                            let h = Math.floor(m / 60);
+                            const mm = m % 60;
+                            const ampm = h >= 12 ? 'pm' : 'am';
+                            h = h % 12 || 12;
+                            return `${h}:${mm.toString().padStart(2, '0')}${ampm}`;
+                          };
+                          
+                          return `${formatMinsLocal(startMins)} - ${formatMinsLocal(endMins)}`;
+                        })()
+                      )}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col items-end gap-3 md:min-w-[200px] border-t md:border-t-0 border-primary/5 pt-4 md:pt-0">
+                <div className="flex items-center gap-2">
+                  <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
+                    booking.status === 'confirmed' ? 'bg-emerald-50 text-emerald-600' :
+                    booking.status === 'pending' ? 'bg-amber-50 text-amber-600' :
+                    booking.status === 'completed' ? 'bg-primary/5 text-primary/40' :
+                    booking.isRescheduled || booking.status === 'rescheduled' ? 'bg-blue-50 text-blue-600' :
+                    'bg-rose-50 text-rose-600'
+                  }`}>
+                    {booking.isRescheduled || booking.status === 'rescheduled' ? 'Rescheduled' : booking.status}
+                  </span>
+                  
+                    {((booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && booking.tutorJoined && booking.studentJoined && booking.topic) ? (
+                      <span className="px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center gap-1.5">
+                        <CheckCircle size={10} /> Attended
+                      </span>
+                    ) : (booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && (
+                      <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
+                        booking.attendance_status === 'attended' || booking.attendance_status === 'pending'
+                          ? 'bg-blue-50 text-blue-600' 
+                          : 'bg-red-50 text-red-600'
+                      }`}>
+                        {booking.attendance_status === 'not_attended' ? 'Not Attended' : 'Attended'}
+                      </span>
+                    )}
+                  </div>
+
+                  {booking.topic && (
+                    <div className="mt-2 text-[10px] font-bold text-on-surface/60 bg-primary/5 px-3 py-1.5 rounded-lg border border-primary/5 italic truncate max-w-[200px]">
+                      Topic: {booking.topic}
+                    </div>
+                  )}
+
+                  {booking.isSubscription && (
+                    <>
+                      <div className="mt-2 p-3 bg-primary/5 rounded-xl border border-primary/10 w-full min-w-[180px]">
+                        <div className="flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-2">
+                             <RefreshCw size={12} className={cn("text-primary", booking.subscriptionStatus === 'active' ? "animate-spin-slow" : "")} />
+                             <span className="text-[10px] font-bold uppercase tracking-widest text-primary/60">Subscription Active</span>
+                          </div>
+                          {booking.nextBillingDate && (
+                             <span className="text-[9px] font-black text-accent uppercase">Next Bill: {
+                               booking.nextBillingDate.seconds 
+                                 ? new Date(booking.nextBillingDate.seconds * 1000).toLocaleDateString()
+                                 : new Date(booking.nextBillingDate).toLocaleDateString()
+                             }</span>
+                          )}
+                        </div>
+                      </div>
+                    {(() => {
+                      if (!booking.isSubscription) return null;
+                      const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
+                      if (!paidAt) return null;
+
+                      const now = new Date();
+                      const startDay = paidAt.getDate();
+                      const currentDay = now.getDate();
+                      
+                      // Calculate 3-day window before renewal
+                      const daysUntilRenewal = (startDay - currentDay + 31) % 31;
+                      const isDue = daysUntilRenewal >= 1 && daysUntilRenewal <= 3;
+                      const isExpired = booking.subscriptionStatus === 'expired';
+
+                      if (booking.subscriptionStatus === 'active' && isDue) {
+                        return (
+                          <div className="flex flex-col gap-2 mt-2 px-3 py-2 border-l-2 border-amber-500 bg-amber-50 rounded-r-lg">
+                            <div className="flex items-center gap-2">
+                              <Bell size={10} className="text-amber-600 animate-bounce" />
+                              <span className="text-[8px] font-black text-amber-700 uppercase">Renewal Reminder: Upcoming Payment Due on {new Date(now.getFullYear(), now.getMonth(), startDay).toLocaleDateString()}</span>
+                            </div>
+                            <p className="text-[7px] font-medium text-amber-600 italic">Please complete payment before the {startDay}th to continue classes with {booking.tutorName}.</p>
+                          </div>
+                        );
+                      }
+                      
+                      if (isExpired) {
+                        return (
+                          <div className="flex items-center gap-2 mt-2 px-3 py-2 border-l-2 border-rose-500 bg-rose-50 rounded-r-lg">
+                            <XCircle size={10} className="text-rose-600" />
+                            <span className="text-[8px] font-black text-rose-700 uppercase">Subscription Expired: Join button disabled due to non-payment.</span>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div className="flex items-center gap-2 mt-2 px-3 py-1.5 border-l-2 border-emerald-500 bg-emerald-50 rounded-r-lg opacity-60">
+                          <CheckCircle size={10} className="text-emerald-500" />
+                          <span className="text-[8px] font-black text-emerald-700 uppercase">Payment Verified: You can continue your classes.</span>
+                        </div>
+                      );
+                    })()}
+                  </>
+                  )}
+
+                <div className="flex items-center gap-2">
+                  {booking.status === 'pending' && (
+                    <button 
+                      onClick={async () => {
+                        try {
+                          await updateDoc(doc(db, 'bookings', booking.id), { status: 'cancelled' });
+                          alert('Session cancelled successfully');
+                        } catch (e) {
+                          console.error("Error cancelling booking:", e);
+                        }
+                      }}
+                      className="px-4 py-2 bg-rose-50 text-rose-500 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all"
+                    >
+                      Cancel
+                    </button>
+                  )}
+
+                  {booking.status === 'pending_cancellation' && (
+                    <span className="px-6 py-2 bg-amber-50 text-amber-600 rounded-xl text-[10px] font-black uppercase tracking-widest border border-amber-100 flex items-center gap-2">
+                       <RefreshCw size={14} className="animate-spin-slow" /> Cancellation Pending
+                    </span>
+                  )}
+
+                  {booking.type === 'paid' && 
+                   (booking.status === 'confirmed' || booking.status === 'rescheduled') && 
+                   (booking as any).paidAt && 
+                   (() => {
+                      const refund = calculateRefund(booking);
+                      return refund.eligible || booking.isSubscription;
+                   })() && (
+                    <button 
+                      onClick={() => { setCancelBooking(booking); setIsCancelModalOpen(true); }}
+                      className="px-6 py-2 bg-rose-50 text-rose-500 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-rose-600 hover:text-white transition-all border border-rose-100 shadow-sm"
+                    >
+                      Request Booking Cancellation
+                    </button>
+                  )}
+
+                  {(booking.status === 'confirmed' || booking.status === 'live') && (() => {
+                    const now = new Date();
+                    const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+                    const isToday = booking.date === todayStr || booking.date === isoToday;
+                    
+                    // If not today, don't show Join button at all — past/future dates
+                    if (!isToday) {
+                      return (
+                        <span className="px-6 py-2 bg-slate-50 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest border border-slate-100">
+                          {booking.date} · {booking.time}
+                        </span>
+                      );
+                    }
+                    
+                    const sessionMins = parseTime(booking.time);
+                    const nowMins = now.getHours() * 60 + now.getMinutes();
+                    const diffMins = sessionMins - nowMins;
+                    
+                    const durationHrs = parseFloat(booking.duration || '1');
+                    const durationMins = durationHrs * 60;
+                    
+                    // Join Now only visible: 10 mins before start → until class end time
+                    const isInJoinWindow = diffMins <= 10 && nowMins <= (sessionMins + durationMins);
+                    const isCompleted = nowMins > (sessionMins + durationMins);
+                    const isSubscriptionExpired = booking.isSubscription && booking.subscriptionStatus === 'expired';
+                    
+                    if (isInJoinWindow || booking.status === 'live') {
+                      if (isSubscriptionExpired) {
+                        return (
+                          <div className="flex flex-col gap-2 w-full sm:w-auto">
+                            <button disabled className="px-6 py-2 bg-slate-100 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest cursor-not-allowed border border-slate-200 opacity-70">
+                              <Lock size={14} className="mr-1.5 inline" /> Payment Pending
+                            </button>
+                            <button 
+                              onClick={async () => {
+                                if (confirm('Are you sure you want to permanently cancel this expired subscription?')) {
+                                  try {
+                                    await updateDoc(doc(db, 'bookings', booking.id), { status: 'cancelled' });
+                                    alert('Subscription permanently cancelled.');
+                                  } catch (e) { console.error(e); }
+                                }
+                              }}
+                              className="text-[9px] font-black text-rose-500 uppercase tracking-widest hover:text-rose-600 transition-colors flex items-center justify-center gap-1.5"
+                            >
+                              <XCircle size={12} /> Permanently Cancel
+                            </button>
+                          </div>
+                        );
+                      }
+                      return (
+                        <button 
+                          onClick={() => startSession(booking.id)}
+                          className="px-6 py-2 bg-blue-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:scale-105 transition-transform shadow-lg shadow-blue-500/20 animate-pulse flex items-center justify-center gap-2"
+                        >
+                          <Video size={14} /> Join Now
+                        </button>
+                      );
+                    }
+                    if (isCompleted) {
+                      return (
+                        <button disabled className="px-6 py-2 bg-slate-100 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest cursor-not-allowed border border-slate-200 flex items-center justify-center gap-1.5 opacity-70">
+                          <CheckCircle size={14} /> Session Ended
+                        </button>
+                      );
+                    }
+                    // Before the 10 min window — show scheduled time
+                    return (
+                      <button disabled className="px-6 py-2 bg-primary/5 text-primary/30 rounded-xl text-[10px] font-bold uppercase tracking-widest cursor-not-allowed opacity-50">
+                        Starts at {booking.time}
+                      </button>
+                    );
+                  })()}
+
+                   {(booking.status === 'confirmed' || booking.status === 'pending') && (() => {
+                    const now = new Date();
+                    const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+                    const isToday = booking.date === todayStr || booking.date === isoToday;
+                    const sessionMins = parseTime(booking.time);
+                    const nowMins = now.getHours() * 60 + now.getMinutes();
+
+                    const hasStarted = isToday && nowMins >= sessionMins;
+                    const isPast = !isToday && new Date(booking.date) < new Date(isoToday);
+
+                    if (hasStarted || isPast) return null;
+                    
+                    return (
+                      <button 
+                        onClick={() => onReschedule(booking)}
+                        className="w-10 h-10 rounded-full bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-background transition-all"
+                        title="Reschedule"
+                      >
+                        <Calendar size={16} />
+                      </button>
+                    );
+                  })()}
+                </div>
+              </div>
+            </motion.div>
+          )) : (
+            <div className="text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
+              <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">No sessions found in {tab} view</p>
+            </div>
+          )}
+        </div>
+      </div>
     );
-    const unsubTutors = onSnapshot(tutorsQuery, (snap) => {
-      const tutorList = snap.docs.map(doc => {
-        const data = doc.data();
-        return {
-          id: doc.id,
-          name: data.name || data.displayName || 'Tutor',
-          subjects: data.subjects || [],
-          availability: data.availability || [],
-          rating: data.rating || 5.0,
-          price: data.price || 150,
-          classTaught: data.classTaught || '',
-          avatar: data.avatar || data.profileImage || '',
-          bio: data.bio || '',
-          experience: data.experience || 'Fresher',
-          reviews: data.reviews || []
-        };
-      });
-      setTutors(tutorList);
-    }, (err) => {
-      console.error("Error fetching tutors:", err);
-      setTutors([]);
-    });
-
-    return () => unsubTutors();
-  }, []);
-
-  // 2. Real-time bookings for current student — reflects admin confirm/cancel instantly
-  useEffect(() => {
-    if (!currentUser?.email) return;
-    console.log("Syncing bookings for:", currentUser.email);
-    const bQuery = query(collection(db, 'bookings'), where('studentEmail', '==', currentUser.email));
-    const unsubBookings = onSnapshot(bQuery, (snap) => {
-      const bookingList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Booking));
-      console.log(`Found ${bookingList.length} real bookings`);
-      // Merge with mock data to satisfy "previous all data with present"
-      setBookings(bookingList);
-    }, (err) => {
-      console.error("Error fetching bookings:", err);
-    });
-    return () => unsubBookings();
-  }, [currentUser?.email]);
-
-  const [chats, setChats] = useState<Chat[]>(MOCK_CHATS);
-  const [notifications, setNotifications] = useState<Notification[]>(MOCK_NOTIFICATIONS);
-  const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
-  const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
-  const [paymentStatus, setPaymentStatus] = useState<'idle' | 'processing' | 'success' | 'failed' | 'cancelled'>('idle');
-  const [paymentData, setPaymentData] = useState<{paymentId?: string, orderId?: string, status?: string}>({});
-  const [bookingFormData, setBookingFormData] = useState<any>(null);
-  const [bookingPlan, setBookingPlan] = useState<'hourly' | 'monthly'>('hourly');
-  const [bookingType, setBookingType] = useState<'demo' | 'paid'>('paid');
-  const [isNotifOpen, setIsNotifOpen] = useState(false);
-  const [activeChatId, setActiveChatId] = useState<string | null>(null);
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
-  const [reschedulingBooking, setReschedulingBooking] = useState<Booking | null>(null);
-  const [rescheduleDate, setRescheduleDate] = useState<string>('');
-  const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
-  const [bookingDuration, setBookingDuration] = useState('1');
-  const [bookingSelectedDate, setBookingSelectedDate] = useState<string>('');
-  const [rescheduleSuccess, setRescheduleSuccess] = useState(false);
-
-  const getEffectivePrice = (tutorPrice: any) => {
-    if (!currentUser) return parseFloat(String(tutorPrice) || '150') || 150;
-    if (currentUser.class === 'B.Tech') return 150; // Base hourly rate; technical courses are ₹3000 flat
-    const classNum = parseInt(currentUser.class);
-    if (!isNaN(classNum) && classNum >= 6 && classNum <= 10) return 160;
-    if (!isNaN(classNum) && classNum >= 1 && classNum <= 5) return 150;
-    return parseFloat(String(tutorPrice) || '150') || 150;
-  };
-
-  const calculateTotal = () => {
-    if (bookingType === 'demo') return 'Free First Demo Session';
-    
-    const rate = getEffectivePrice(selectedTutor?.price);
-    const dur = parseFloat(bookingDuration);
-
-    if (bookingPlan === 'yearly') {
-       // Yearly is paid monthly
-       if (currentUser?.class === 'B.Tech') return '₹4,000 / month';
-       return `₹${(rate * 15).toLocaleString()} / month`; // Discounted monthly rate for yearly commitment
-    }
-    
-    if (currentUser?.class === 'B.Tech' && bookingPlan.startsWith('course')) {
-      return '₹3,000'; // Flat course price for B.Tech technical courses
-    }
-
-    if (bookingPlan === 'course_45') return `₹${(rate * 45).toLocaleString()}`;
-    if (bookingPlan === 'course_60') return `₹${(rate * 60).toLocaleString()}`;
-    if (bookingPlan === 'hourly') return `₹${(rate * dur).toLocaleString()}`;
-    return `₹${(rate * 20).toLocaleString()}`;
-  };
-
-  // --- Real-time Attendance & Global Status Engine ---
-  useEffect(() => {
-    if (!bookings.length || !currentUser) return;
-
-    const engineInterval = setInterval(async () => {
-      const now = new Date();
-      const nowMins = now.getHours() * 60 + now.getMinutes();
-      const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-
-      bookings.forEach(async (b) => {
-        // Status updates only for confirmed or pending classes
-        if (b.status === 'confirmed' || b.status === 'pending') {
-          const isToday = b.date === todayStr || b.date === isoToday;
-          const bMins = parseTime(b.time);
-          const diff = bMins - nowMins;
-
-          // 1. 10min Notification Hook (Pre-class)
-          if (isToday && diff === 10) {
-            const notifId = `rem_${b.id}`;
-            const alreadyExists = notifications.some(n => n.id === notifId);
-            if (!alreadyExists) {
-              setNotifications(prev => [{
-                id: notifId,
-                title: 'Class Starts in 10m!',
-                message: `Your session for ${b.subject} with ${b.tutorName} starts soon. The Join button is now enabled.`,
-                time: 'Just now',
-                type: 'booking',
-                read: false,
-                link: 'dashboard'
-              }, ...prev]);
-            }
-          }
-
-          // 2. Cancellation/Completion Logic (60 mins after start time)
-          if (isToday && nowMins > (bMins + 60)) {
-            const bRef = doc(db, 'bookings', b.id);
-            // ONLY if both were inside class at some point
-            if (b.studentPresent && b.tutorPresent) {
-              await updateDoc(bRef, { 
-                status: 'completed', 
-                attendance_status: 'attended',
-                completedAt: serverTimestamp() 
-              });
-            } else if (b.status !== 'cancelled') {
-              // Mark as cancelled if time passed and attendance failed
-              await updateDoc(bRef, { 
-                status: 'cancelled', 
-                attendance_status: 'not_attended' 
-              });
-            }
-          }
-          
-          // 3. Post-Time Auto-Cancel for Pending sessions
-          if (isToday && nowMins > bMins && b.status === 'pending') {
-             await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled' });
-          }
-
-          // 4. Automatic Cancellation for Unpaid Bookings (30 min timeout)
-          if (b.status === 'unpaid' && b.paymentDeadline) {
-            const deadline = b.paymentDeadline.seconds ? new Date(b.paymentDeadline.seconds * 1000) : new Date(b.paymentDeadline);
-            if (now > deadline) {
-               await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled', cancellationReason: 'Payment Timeout' });
-            }
-          }
-        }
-      });
-    }, 60000); // Audit every minute
-
-    return () => clearInterval(engineInterval);
-  }, [bookings, currentUser, notifications]);
-
-  // --- Live Class States ---
-  const [sessionStartTime, setSessionStartTime] = useState<Date | null>(null);
-  const [sessionTimer, setSessionTimer] = useState("00:00:00");
-  const [isMicOn, setIsMicOn] = useState(true);
-  const [isCamOn, setIsCamOn] = useState(true);
-  const [isLiveChatOpen, setIsLiveChatOpen] = useState(false);
-  const [sessionStatus, setSessionStatus] = useState<'waiting' | 'connecting' | 'live' | 'disconnected'>('waiting');
-  const [liveMessages, setLiveMessages] = useState<{id: string, sender: string, text: string, time: string}[]>([]);
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const localVideoRef = useRef<HTMLVideoElement>(null);
-  const screenStreamRef = useRef<MediaStream | null>(null);
-  const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
-
-  const handleScreenShare = async () => {
-    if (isScreenSharing) {
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach(track => track.stop());
-        screenStreamRef.current = null;
-      }
-      setIsScreenSharing(false);
-      setIsCamOn(false);
-      setTimeout(() => setIsCamOn(true), 100);
-    } else {
-      try {
-        const stream = await (navigator.mediaDevices as any).getDisplayMedia({ video: true });
-        screenStreamRef.current = stream;
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
-        setIsScreenSharing(true);
-        stream.getVideoTracks()[0].onended = () => {
-          setIsScreenSharing(false);
-          setIsCamOn(true);
-        };
-      } catch (err) {
-        console.error("Error sharing screen:", err);
-      }
-    }
-  };
-
-  const startSession = async (bookingId: string) => {
-    const booking = bookings.find(b => b.id === bookingId);
-    if (!booking || !currentUser?.email) return;
-
-    // 🔐 VALIDATE ENTRY 🔐
-    const isParticipant = booking.participants?.includes(currentUser.email) || booking.studentEmail === currentUser.email;
-    if (!isParticipant) {
-      alert("⛔ Access Denied: You are not a registered participant for this session.");
-      return;
-    }
-
-    setView('live-class');
-    setSessionStatus('connecting');
-    setActiveMeetingId(bookingId);
-    
-    // Track attendance start
-    const emailKey = currentUser.email.replace(/\./g, '_');
-    try {
-      if (booking.isGroup) {
-        await updateDoc(doc(db, 'bookings', bookingId), {
-          [`participantData.${emailKey}.joinTime`]: serverTimestamp(),
-          [`participantData.${emailKey}.status`]: 'pending',
-          studentJoined: true // Legacy flag compatibility
-        });
-      } else {
-        await updateDoc(doc(db, 'bookings', bookingId), {
-          studentJoinTime: serverTimestamp(),
-          studentPresent: true,
-          studentJoined: true,
-          attendance_status: 'pending'
-        });
-      }
-    } catch (e) {
-      console.error("Error updating attendance:", e);
-    }
-    
-    (window as any).lastMuteSignal = Date.now();
-    
-    const sessionRef = doc(db, 'live_sessions', bookingId);
-    const unsub = onSnapshot(doc(db, 'bookings', bookingId), (snap) => {
-      if (!snap.exists()) return;
-      const data = snap.data();
-      
-      // Sync with status from booking
-      if (data.status === 'live' && (sessionStatus === 'waiting' || sessionStatus === 'connecting')) {
-        setSessionStatus('live');
-        if (data.startedAt) {
-          const startedAt = data.startedAt.seconds ? new Date(data.startedAt.seconds * 1000) : new Date(data.startedAt);
-          setSessionStartTime(startedAt);
-        } else {
-          setSessionStartTime(new Date());
-        }
-      }
-      
-      if (data.status === 'completed') {
-        endSession();
-        return;
-      }
-    });
-
-    const reactUnsub = onSnapshot(collection(db, `live_sessions/${bookingId}/reactions`), (snap) => {
-      snap.docChanges().forEach(change => {
-        if (change.type === 'added') {
-          const reaction = change.doc.data();
-          handleSendLiveMessage(`[REACTION]: ${reaction.emoji}`, true);
-        }
-      });
-    });
-
-    const msgUnsub = onSnapshot(query(collection(db, `live_sessions/${bookingId}/messages`), orderBy('timestamp', 'asc')), (snap) => {
-      const msgs = snap.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        time: doc.data().timestamp?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '...'
-      })) as any[];
-      setLiveMessages(msgs);
-    });
-
-    setTimeout(() => {
-      setSessionStatus(prev => {
-        const currentBooking = bookings.find(b => b.id === bookingId);
-        if (currentBooking?.status === 'live') return 'live';
-        return prev === 'connecting' ? 'waiting' : prev;
-      });
-    }, 2000);
-
-    return () => {
-      unsub();
-      reactUnsub();
-      msgUnsub();
-    };
-  };
-
-  useEffect(() => {
-    let stream: MediaStream | null = null;
-    const startCamera = async () => {
-      try {
-        if (isCamOn && view === 'live-class' && sessionStatus === 'live') {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: isMicOn });
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = stream;
-          }
-        } else {
-          if (stream) {
-            stream.getTracks().forEach(track => track.stop());
-          }
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = null;
-          }
-        }
-      } catch (err) {
-        console.error("Error accessing camera:", err);
-      }
-    };
-    startCamera();
-    return () => {
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, [isCamOn, isMicOn, view, sessionStatus]);
-
-  useEffect(() => {
-    let interval: any;
-    if (sessionStatus === 'live' && sessionStartTime) {
-      interval = setInterval(() => {
-        const diff = Math.floor((new Date().getTime() - sessionStartTime.getTime()) / 1000);
-        const h = Math.floor(diff / 3600).toString().padStart(2, '0');
-        const m = Math.floor((diff % 3600) / 60).toString().padStart(2, '0');
-        const s = (diff % 60).toString().padStart(2, '0');
-        setSessionTimer(`${h}:${m}:${s}`);
-      }, 1000);
-    }
-    return () => clearInterval(interval);
-  }, [sessionStatus, sessionStartTime]);
-
-  const endSession = async () => {
-    if (activeMeetingId && currentUser?.email) {
-      try {
-        const bookingRef = doc(db, 'bookings', activeMeetingId);
-        const bookingSnap = await getDoc(bookingRef);
-        const bookingData = bookingSnap.data() as Booking;
-        
-        let duration = 0;
-        const now = new Date();
-        const emailKey = currentUser.email.replace(/\./g, '_');
-
-        if (bookingData.isGroup && bookingData.participantData && bookingData.participantData[emailKey]) {
-          const joinTime = bookingData.participantData[emailKey].joinTime?.toDate() || new Date();
-          duration = Math.floor((now.getTime() - joinTime.getTime()) / 60000);
-          
-          await updateDoc(bookingRef, {
-            [`participantData.${emailKey}.leaveTime`]: serverTimestamp(),
-            [`participantData.${emailKey}.status`]: duration >= 12 ? 'attended' : 'not_attended',
-            studentPresent: false
-          });
-        } else {
-          const joinTime = bookingData.studentJoinTime?.toDate() || new Date();
-          duration = Math.floor((now.getTime() - joinTime.getTime()) / 60000);
-          
-          await updateDoc(bookingRef, {
-            studentPresent: false,
-            studentLeaveTime: serverTimestamp(),
-            attendance_status: duration >= 12 ? 'attended' : 'not_attended'
-          });
-        }
-      } catch (e) {
-        console.error("Error updating leave time:", e);
-      }
-    }
-    setSessionStatus('disconnected');
-    setSessionStartTime(null);
-    setSessionTimer("00:00:00");
-    setTimeout(() => {
-      setActiveMeetingId(null);
-      setView('dashboard');
-    }, 2000);
-  };
-
-  useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (activeMeetingId) {
-        updateDoc(doc(db, 'bookings', activeMeetingId), {
-          studentPresent: false,
-          studentLeaveTime: new Date() // Use client date as fallback
-        });
-      }
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [activeMeetingId]);
-
-  const handleSendLiveMessage = async (text: string, isReaction: boolean = false) => {
-    if (!text.trim() || !activeMeetingId) return;
-    
-    if (isReaction) {
-      const newMessage = {
-        id: Date.now().toString(),
-        sender: 'System',
-        text,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-      setLiveMessages(prev => [...prev.filter(m => m.text !== text), newMessage]);
-      return;
-    }
-
-    await addDoc(collection(db, `live_sessions/${activeMeetingId}/messages`), {
-      sender: currentUser?.name || 'Student',
-      senderId: currentUser?.id,
-      text,
-      timestamp: serverTimestamp()
-    });
-  };  const openChat = async (tutorId: string) => {
-    if (!currentUser?.email) return;
-
-    const studentEmailKey = currentUser.email.replace(/\./g, '_');
-    const chatId = `${tutorId}_${studentEmailKey}`;
-    
-    // Ensure chat document exists in 'whatsapp'
-    const chatRef = doc(db, 'whatsapp', chatId);
-    const chatSnap = await getDoc(chatRef);
-    
-    if (!chatSnap.exists()) {
-      const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
-      const initialMsg = 'Hi! I am interested in your classes.';
-      
-      await setDoc(chatRef, {
-        tutorId: tutorId,
-        tutorName: tutor?.name || 'Tutor',
-        tutorAvatar: tutor?.avatar || '',
-        studentEmail: currentUser.email,
-        studentName: currentUser.name || 'Student',
-        lastMessage: initialMsg,
-        lastMessageTime: new Date().toISOString(),
-        timestamp: serverTimestamp(),
-        studentUnreadCount: 0,
-        tutorUnreadCount: 1
-      });
-
-      // Add actual message record so it's not empty
-      await addDoc(collection(chatRef, 'messages'), {
-        senderId: currentUser.email,
-        text: initialMsg,
-        timestamp: serverTimestamp(),
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        date: 'TODAY',
-        deletedBy: []
-      });
-    }
-
-    setActiveChatId(chatId);
-    setView('chat');
-  };
-
-
-
-  const processPayment = (upiOption: string) => {
-    if (!selectedTutor || !bookingFormData) return;
-    
-    setPaymentStatus('processing');
-    
-    // Generate UPI Intent deep link for the authentic mobile flow
-    const durationStr = bookingFormData.duration ? bookingFormData.duration.toString().replace(/ Hours?/, '') : '1';
-    const durationNum = parseFloat(durationStr) || 1;
-    
-    // Dynamic Calculation: Use class-aware effective price
-    const hourlyRate = getEffectivePrice(selectedTutor.price);
-    let amount = '0';
-    if (bookingFormData.type === 'demo') {
-      amount = '0';
-    } else if (currentUser?.class === 'B.Tech' && (bookingFormData.plan || bookingPlan).startsWith('course')) {
-      amount = '3000';
-    } else if ((bookingFormData.plan || bookingPlan) === 'hourly') {
-      amount = (hourlyRate * durationNum).toFixed(2);
-    } else if ((bookingFormData.plan || bookingPlan) === 'course_45') {
-      amount = (hourlyRate * 45).toFixed(2);
-    } else if ((bookingFormData.plan || bookingPlan) === 'course_60') {
-      amount = (hourlyRate * 60).toFixed(2);
-    } else {
-      // Monthly: 20 sessions
-      amount = (hourlyRate * 20).toFixed(2);
-    }
-    const vpa = 'rzp@hdfcbank';
-    const name = encodeURIComponent('Scholar Platform');
-    
-    let deepLink = '';
-    if (upiOption === 'PhonePe') {
-      deepLink = `phonepe://pay?pa=${vpa}&pn=${name}&am=${amount}&cu=INR`;
-    } else if (upiOption === 'Google Pay') {
-      deepLink = `tez://upi/pay?pa=${vpa}&pn=${name}&am=${amount}&cu=INR`;
-    } else if (upiOption === 'Paytm') {
-      deepLink = `paytmmp://pay?pa=${vpa}&pn=${name}&am=${amount}&cu=INR`;
-    } else {
-      deepLink = `upi://pay?pa=${vpa}&pn=${name}&am=${amount}&cu=INR`;
-    }
-    
-    // Attempt to open the installed app (if on mobile, this prompts the user to open PhonePe/GPay)
-    try {
-      if (deepLink && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
-        window.location.href = deepLink;
-      } else if (deepLink) {
-        console.warn('Deep link redirection skipped on desktop: ', deepLink);
-      }
-    } catch (err) {
-      console.error('Redirection failed:', err);
-    }
-    
-    // Simulate Razorpay checkout process webhook callback from background
-    setTimeout(async () => {
-      // Simulate success
-      const paymentId = 'pay_' + Math.random().toString(36).substr(2, 9);
-      const orderId = 'order_' + Math.random().toString(36).substr(2, 9);
-      
-      setPaymentData({ paymentId, orderId, status: 'success' });
-      setPaymentStatus('success');
-
-      if (bookingFormData?.id) {
-        // Update the 'unpaid' booking to 'pending' (for Admin/Tutor review)
-        await updateDoc(doc(db, 'bookings', bookingFormData.id), {
-          status: 'pending',
-          paymentId: paymentId,
-          orderId: orderId,
-          amount: parseFloat(amount),
-          paidAt: serverTimestamp()
-        });
-
-        // Notify admin of completed payment
-        await addDoc(collection(db, 'admin_notifications'), {
-          type: 'Payment Success',
-          title: 'Enrollment Confirmed',
-          message: `${currentUser?.name} paid ₹${amount} for ${bookingFormData.subject}. Booking ID: ${bookingFormData.id}`,
-          bookingId: bookingFormData.id,
-          time: serverTimestamp(),
-          read: false
-        });
-      }
-      
-      setNotifications([{
-        id: `n${Date.now()}`,
-        title: 'Payment Successful',
-        message: `Your booking with ${selectedTutor.name} is confirmed.`,
-        time: 'Just now',
-        type: 'booking',
-        read: false,
-        link: 'my-bookings'
-      }, ...notifications]);
-
-      // 2. Automated welcome chat message
-      const studentEmailKey = currentUser?.email?.replace(/\./g, '_');
-      if (studentEmailKey && selectedTutor) {
-        const chatId = `${selectedTutor.id}_${studentEmailKey}`;
-        const chatRef = doc(db, 'whatsapp', chatId);
-        const autoMsg = `Hi ${selectedTutor.name}, I have just booked a ${bookingFormData.subject} session for ${bookingFormData.date} at ${bookingFormData.time}. Looking forward to it!`;
-        
-        await setDoc(chatRef, {
-          tutorId: selectedTutor.id,
-          tutorName: selectedTutor.name,
-          tutorAvatar: selectedTutor.avatar || '',
-          studentEmail: currentUser?.email,
-          studentName: currentUser?.name || 'Student',
-          lastMessage: autoMsg,
-          lastMessageTime: new Date().toISOString(),
-          timestamp: serverTimestamp(),
-          tutorUnreadCount: increment(1)
-        }, { merge: true });
-
-        await addDoc(collection(chatRef, 'messages'), {
-          senderId: currentUser?.email,
-          text: autoMsg,
-          timestamp: serverTimestamp(),
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          date: 'TODAY',
-          deletedBy: []
-        });
-      }
-
-      // Close modal after success
-      setTimeout(() => {
-        setIsPaymentModalOpen(false);
-        setView('my-bookings');
-      }, 2500);
-
-    }, 4500);
-  };
-
-  const cancelPayment = () => {
-    setPaymentStatus('cancelled');
-    setTimeout(() => {
-      setIsPaymentModalOpen(false);
-      setIsBookingModalOpen(true); // Bring user back to booking modal
-    }, 1500);
-  };
-
-
-  // --- REAL-TIME CHAT SYNC (Rename to whatsapp) ---
-  useEffect(() => {
-    if (!currentUser?.email) return;
-    console.log("Syncing chats for:", currentUser.email);
-
-    // Listen to chats where user is participant
-    const cQuery = query(collection(db, 'whatsapp'), where('studentEmail', '==', currentUser.email));
-    const unsubChats = onSnapshot(cQuery, (snap) => {
-      setChats(prev => {
-        const chatList = snap.docs.map(d => {
-          const data = d.data();
-          const existing = prev.find(p => p.id === d.id);
-          // Use the timestamp to determine a smart date label
-          const getSmartDate = (dateVal: any) => {
-            if (!dateVal) return 'Active';
-            let d: Date;
-            if (dateVal.seconds) d = new Date(dateVal.seconds * 1000);
-            else d = new Date(dateVal);
-
-            if (isNaN(d.getTime())) return 'Active';
-
-            const now = new Date();
-            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-            const yesterday = new Date(today);
-            yesterday.setDate(yesterday.getDate() - 1);
-
-            const msgDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-
-            if (msgDate.getTime() === today.getTime()) {
-              return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            }
-            if (msgDate.getTime() === yesterday.getTime()) return 'YESTERDAY';
-            
-            return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-          };
-
-          return {
-            id: d.id,
-            tutorId: data.tutorId,
-            tutorName: data.tutorName,
-            avatar: data.tutorAvatar || '',
-            lastMessage: data.lastMessage || 'No messages yet',
-            time: getSmartDate(data.timestamp || data.lastMessageTime),
-            unreadCount: data.studentUnreadCount || 0,
-            tutorUnreadCount: data.tutorUnreadCount || 0,
-            timestamp: data.timestamp,
-            messages: existing?.messages || []
-          } as any;
-        });
-
-        const sortedChats = chatList.sort((a, b) => {
-          const timeA = a.timestamp?.seconds || 0;
-          const timeB = b.timestamp?.seconds || 0;
-          return timeB - timeA;
-        });
-        console.log(`Synced ${sortedChats.length} real chats`);
-        // Merge with mock chats, but only keep mock chats for tutors we DON'T have a real chat for
-        const filteredMockChats = MOCK_CHATS.filter(mock => !sortedChats.some(real => real.tutorId === mock.tutorId));
-        return [...filteredMockChats, ...sortedChats];
-      });
-    }, (err) => {
-      console.error("Chat sync error:", err);
-    });
-
-    return () => unsubChats();
-  }, [currentUser?.email]);
-
-  // Sync messages for active chat
-  useEffect(() => {
-    if (!activeChatId || !currentUser?.email) return;
-
-    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
-    
-    const q = query(
-      collection(db, `whatsapp/${chatId}/messages`), 
-      orderBy('timestamp', 'asc')
-    );
-
-    const unsubMsgs = onSnapshot(q, (snap) => {
-      const msgs = snap.docs.map(d => {
-        const data = d.data();
-        return {
-          id: d.id,
-          ...data,
-          // 'me' if student sent it, otherwise 'tutor'
-          sender: data.senderId === currentUser.email ? 'me' : 'tutor'
-        };
-      }).filter((m: any) => !m.deletedBy?.includes(currentUser.email));
-
-      setChats(prev => prev.map(c => {
-        const cId = c.id || `${(c as any).tutorId}_${currentUser.email.replace(/\./g, '_')}`;
-        return cId === chatId ? { ...c, messages: msgs } : c;
-      }));
-      
-      // Mark as read
-      const chatDocRef = doc(db, 'whatsapp', chatId);
-      setDoc(chatDocRef, { studentUnreadCount: 0 }, { merge: true });
-    });
-
-    return () => unsubMsgs();
-  }, [activeChatId, currentUser?.email]);
-
-  const baseSendMessage = async (payload: any) => {
-    if (!activeChatId || !currentUser?.email) return;
-    // chatId format: tutorId_studentEmailKey
-    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
-    
-    // Extract tutorId from chatId (everything before the first _)
-    const tutorId = chatId.split('_')[0];
-    const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
-    
-    const chatRef = doc(db, 'whatsapp', chatId);
-    const msgCol = collection(chatRef, 'messages');
-
-    const now = new Date();
-    const msg = {
-      senderId: currentUser.email,
-      timestamp: serverTimestamp(),
-      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      date: now.toDateString(), // Store real date so 'Yesterday' works
-      deletedBy: [],
-      ...payload
-    };
-
-    // Write message first
-    if (payload.editId) {
-      // Editing an existing message
-      const msgRef = doc(db, `whatsapp/${chatId}/messages`, payload.editId);
-      await updateDoc(msgRef, { text: payload.text, edited: true });
-    } else {
-      await addDoc(msgCol, msg);
-    }
-
-    // Always update the chat document with full identity so tutor can find it
-    await setDoc(chatRef, {
-      tutorId: tutorId,
-      tutorName: tutor?.name || 'Tutor',
-      tutorAvatar: tutor?.avatar || '',
-      studentEmail: currentUser.email,
-      studentName: currentUser.name || 'Student',
-      lastMessage: payload.text || (payload.type === 'poll' ? '📊 Poll' : '📎 Attachment'),
-      lastMessageTime: now.toISOString(),
-      timestamp: serverTimestamp(),
-      tutorUnreadCount: increment(1),
-      studentUnreadCount: 0
-    }, { merge: true });
-  };
-
-  const sendMessage = async () => {
-    const chatId = activeChatId;
-    if (!chatId || !currentUser?.email) return;
-
-    const currentDraft = drafts[chatId] || '';
-    if (!currentDraft.trim()) return;
-
-    if (editingMessageId) {
-      // Edit existing message
-      await baseSendMessage({ text: currentDraft.trim(), editId: editingMessageId });
-    } else {
-      await baseSendMessage({ text: currentDraft.trim() });
-    }
-    setDrafts(prev => ({ ...prev, [chatId]: '' }));
-    setEditingMessageId(null);
-  };
-
-  const deleteMessage = async (msgId: string, everyone: boolean) => {
-    if (!activeChatId || !currentUser) return;
-    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
-    const msgRef = doc(db, `whatsapp/${chatId}/messages`, msgId);
-
-    if (everyone) {
-      // Delete for Everyone
-      await updateDoc(msgRef, {
-        text: '🚫 This message was deleted',
-        deletedForEveryone: true
-      });
-    } else {
-      // Delete for Me
-      await updateDoc(msgRef, {
-        deletedBy: arrayUnion(currentUser.email)
-      });
-    }
-  };
-
-  // --- Dynamic Availability ---
-  const [tutorBookings, setTutorBookings] = useState<any[]>([]);
-  const [availableSlots, setAvailableSlots] = useState<any[]>([]);
-
-  useEffect(() => {
-    if (!selectedTutor) return;
-    
-    const unsub = onSnapshot(query(collection(db, 'bookings'), where('tutorId', '==', selectedTutor.id)), (snap) => {
-      setTutorBookings(snap.docs.map(d => d.data()));
-    });
-    return () => unsub();
-  }, [selectedTutor]);
-
-  useEffect(() => {
-    if (!currentUser?.email) return;
-    const q = query(
-      collection(db, 'notifications'), 
-      where('studentEmail', '==', currentUser.email)
-    );
-    const unsub = onSnapshot(q, (snap) => {
-      const data = snap.docs.map(d => ({ id: d.id, ...d.data() })) as Notification[];
-      setNotifications(data.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()));
-    });
-    return () => unsub();
-  }, [currentUser]);
-
-  useEffect(() => {
-    if (!selectedTutor || !tutorBookings) return;
-    
-    const WORKING_START = 9;
-    const WORKING_END = 20;
-    const dateStr = new Date().toISOString().split('T')[0]; // Simple today view
-
-    const booked = tutorBookings
-      .filter(b => b.date === dateStr && b.status !== 'cancelled')
-      .map(b => {
-        const s = parseTime(b.time);
-        const d = (parseFloat(b.duration) * 60) || 60;
-        return { start: s, end: s + d };
-      });
-
-    const isSunday = new Date().getDay() === 0;
-    if (isSunday) {
-      setAvailableSlots([]);
-      return;
-    }
-
-    const slots = [];
-    for (let m = WORKING_START * 60; m <= WORKING_END * 60 - 60; m += 30) {
-      if (!booked.some(r => m < r.end && m + 60 > r.start)) {
-        slots.push({ start: formatMins(m), end: formatMins(m+60), label: '1 Hour' });
-      }
-    }
-    setAvailableSlots(slots);
-  }, [selectedTutor, tutorBookings]);
-
-  // --- Reschedule Availability ---
-  useEffect(() => {
-    if (!reschedulingBooking) {
-      setRescheduleDate('');
-      setRescheduleSlots([]);
-      return;
-    }
-    
-    const initialDate = rescheduleDate || reschedulingBooking.date;
-    if (!rescheduleDate) setRescheduleDate(initialDate);
-
-    const tutorId = reschedulingBooking.tutorId;
-    const studentEmail = reschedulingBooking.studentEmail;
-    const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
-    
-    if (!tutor) return;
-
-    // Rule 0: No classes on Sunday
-    const isSunday = new Date(initialDate).getDay() === 0;
-    if (isSunday) {
-      setRescheduleSlots([]);
-      return;
-    }
-
-    const now = new Date();
-    const isToday = initialDate === now.toISOString().split('T')[0];
-
-    // Find the student's NEXT confirmed class to set a hard deadline
-    const studentBookings = bookings
-      .filter(b => b.studentEmail === studentEmail && b.id !== reschedulingBooking.id && b.status === 'confirmed')
-      .sort((a, b) => new Date(`${a.date} ${a.time}`).getTime() - new Date(`${b.date} ${b.time}`).getTime());
-    
-    // Find the first booking that happens AFTER the original class date or right now
-    const nextClass = studentBookings.find(b => new Date(`${b.date} ${b.time}`) > now);
-    const deadlineTime = nextClass ? new Date(`${nextClass.date} ${nextClass.time}`).getTime() : null;
-
-    // Filter tutor bookings for conflicts
-    const booked = bookings
-      .filter(b => b.tutorId === tutorId && b.date === initialDate && b.status !== 'cancelled' && b.id !== reschedulingBooking.id)
-      .map(b => {
-        const s = parseTime(b.time);
-        const durStr = b.duration ? b.duration.toString().replace(/ Hours?/, '') : '1';
-        const d = (parseFloat(durStr) * 60) || 60;
-        return { start: s, end: s + d };
-      });
-
-    const slots: string[] = [];
-    // Convert tutor's manual slots to time strings for the selected date
-    const getDayName = (dateStr: string) => {
-      const date = new Date(dateStr);
-      return date.toLocaleDateString('en-US', { weekday: 'long' });
-    };
-    
-    const selectedDay = getDayName(initialDate);
-    const baseAvailability = (tutor.availability && tutor.availability.length > 0)
-      ? tutor.availability
-          .filter((slot: any) => {
-            // Legacy format support: ["09:00 AM", ...]
-            if (typeof slot === 'string') return true;
-            // New format support: [{ day, date?, start, end, ... }]
-            if (!slot || typeof slot !== 'object') return false;
-            if (slot.date) return slot.date === initialDate;
-            if (slot.day) return slot.day === selectedDay;
-            return false;
-          })
-          .map((slot: any) => typeof slot === 'string' ? slot : (slot.start || ''))
-          .filter((time: string) => !!time)
-      : [];
-
-    baseAvailability.forEach(slot => {
-      const slotStartMins = parseTime(slot);
-      const slotEndMins = slotStartMins + 60;
-      const slotDateTime = new Date(`${initialDate} ${slot}`).getTime();
-
-      // Rule 1: Must be in the future (if today)
-      if (isToday) {
-        const minTime = now.getTime() + (60 * 60 * 1000); // At least 1 hour from now
-        if (slotDateTime < minTime) return;
-      }
-
-      // Rule 2: Must be BEFORE the next class
-      if (deadlineTime && slotDateTime >= deadlineTime) return;
-
-      // Rule 3: Must not conflict with tutor's other bookings
-      if (!booked.some(r => slotStartMins < r.end && slotEndMins > r.start)) {
-        slots.push(slot);
-      }
-    });
-
-    setRescheduleSlots(slots);
-  }, [reschedulingBooking, rescheduleDate, bookings, tutors]);
-
-  function parseTime(t: string) {
-    const match = t.match(/(\d+):(\d+)\s*(AM|PM)/i);
-    if (!match) return 0;
-    let [_, h, m, ampm] = match;
-    let hours = parseInt(h);
-    if (ampm === 'PM' && hours < 12) hours += 12;
-    if (ampm === 'AM' && hours === 12) hours = 0;
-    return hours * 60 + parseInt(m);
-  }
-
-  function formatMins(m: number) {
-    let h = Math.floor(m / 60);
-    const mm = m % 60;
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    h = h % 12 || 12;
-    return `${h}:${mm.toString().padStart(2, '0')} ${ampm}`;
-  }
-
-  const handleBooking = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const type = bookingType;
-    if (!selectedTutor || !currentUser) return;
-    
-    const form = e.target as HTMLFormElement;
-    const subject = (form.elements.namedItem('subject') as HTMLSelectElement)?.value || (bookingFormData?.subject || 'General');
-    const date = (form.elements.namedItem('date') as HTMLInputElement)?.value || (bookingFormData?.date || '');
-    const time = (form.elements.namedItem('time') as HTMLSelectElement)?.value || (bookingFormData?.time || '');
-    const duration = (form.elements.namedItem('duration') as HTMLSelectElement)?.value || (bookingFormData?.duration || '1 Hour');
-    const plan = (form.elements.namedItem('plan') as HTMLSelectElement)?.value as 'hourly' | 'monthly' || 'hourly';
-
-    // ⚡ PREVENT DUPLICATE BOOKINGS ⚡
-    const isDuplicate = bookings.some(b => 
-      b.tutorId === selectedTutor.id && 
-      b.studentEmail === currentUser.email && 
-      b.date === date && 
-      b.time === time &&
-      b.status !== 'cancelled'
-    );
-
-    if (isDuplicate) {
-      alert(`⚠️ You already have a session booked for this exact time (${date} at ${time}). Please choose another slot or subject.`);
-      return;
-    }
-
-    const isGroup = (form.elements.namedItem('isGroup') as HTMLInputElement)?.value === 'true';
-
-    // ⚡ CHECK FOR EXISTING GROUP SESSION ⚡
-    const existingGroup = bookings.find(b => 
-      b.tutorId === selectedTutor.id && 
-      b.date === date && 
-      b.time === time &&
-      b.isGroup === true &&
-      b.status !== 'cancelled'
-    );
-
-    if (isGroup && existingGroup) {
-      if (existingGroup.participants?.includes(currentUser.email)) {
-        alert("🚨 You are already enrolled in this group session.");
-        setIsBookingModalOpen(false);
-        return;
-      }
-      if (existingGroup.participantCount && existingGroup.participantCount >= 5) {
-        alert("🚨 This group session is now full. Please choose another slot.");
-        setIsBookingModalOpen(false);
-        return;
-      }
-    }
-
-    if (type === 'demo') {
-      const hasExistingDemo = bookings.some(b => 
-        b.tutorId === selectedTutor.id && 
-        b.studentEmail === currentUser.email && 
-        b.type === 'demo' &&
-        b.status !== 'cancelled'
-      );
-
-      if (hasExistingDemo) {
-        alert("🚨 You have already booked a demo with this tutor. Please proceed to book a full course or wait for your session.");
-        setIsBookingModalOpen(false);
-        return;
-      }
-
-      if (isGroup && existingGroup) {
-        // Join existing group demo
-        await updateDoc(doc(db, 'bookings', existingGroup.id), {
-          participants: arrayUnion(currentUser.email),
-          participantCount: increment(1),
-          [`participantData.${currentUser.email.replace(/\./g, '_')}`]: {
-            name: currentUser.name,
-            joinTime: null,
-            leaveTime: null,
-            status: 'pending'
-          }
-        });
-      } else {
-        // Create new demo (1-on-1 or new Group)
-        const bookingData = {
-          tutorId: selectedTutor.id,
-          tutorName: selectedTutor.name,
-          studentId: currentUser.email,
-          studentName: currentUser.name,
-          studentEmail: currentUser.email,
-          studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
-          subject,
-          date,
-          time,
-          duration,
-          status: 'pending',
-          type: 'demo',
-          amount: 0,
-          createdAt: serverTimestamp(),
-          isGroup,
-          maxParticipants: isGroup ? 5 : 1,
-          participantCount: 1,
-          participants: [currentUser.email],
-          participantData: {
-            [currentUser.email.replace(/\./g, '_')]: {
-              name: currentUser.name,
-              joinTime: null,
-              leaveTime: null,
-              status: 'pending'
-            }
-          }
-        };
-        await addDoc(collection(db, 'bookings'), bookingData);
-      }
-      
-      // Notify Tutor
-      await addDoc(collection(db, 'tutor_notifications'), {
-        tutorId: selectedTutor.id,
-        type: 'booking',
-        title: isGroup ? 'New Group Participant' : 'New Demo Requested',
-        description: `${currentUser.name} joined ${isGroup ? 'the group' : 'a demo'} session for ${subject} on ${date}.`,
-        time: 'Just now',
-        read: false
-      });
-
-      setIsBookingModalOpen(false);
-      setView('my-bookings');
-    } else {
-      // Paid sessions
-      if (isGroup && existingGroup) {
-        // For now, even if joining a group, we create a reference for payment
-        // But the shared document is what matters for the live class.
-        // We'll update the shared document after payment success.
-        const paymentRefData = {
-          isJoiningGroup: true,
-          groupId: existingGroup.id,
-          tutorId: selectedTutor.id,
-          tutorName: selectedTutor.name,
-          studentId: currentUser.email,
-          studentName: currentUser.name,
-          studentEmail: currentUser.email,
-          subject,
-          date,
-          time,
-          duration,
-          plan,
-          status: 'unpaid',
-          type: 'paid',
-          amount: 0,
-          createdAt: serverTimestamp(),
-          isGroup: true
-        };
-        const docRef = await addDoc(collection(db, 'bookings'), paymentRefData);
-        setBookingFormData({ ...paymentRefData, id: docRef.id });
-      } else {
-        const bookingData = {
-          tutorId: selectedTutor.id,
-          tutorName: selectedTutor.name,
-          studentId: currentUser.email,
-          studentName: currentUser.name,
-          studentEmail: currentUser.email,
-          studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
-          subject,
-          date,
-          time,
-          duration,
-          plan,
-          status: 'unpaid',
-          type: 'paid',
-          amount: 0,
-          createdAt: serverTimestamp(),
-          isGroup,
-          maxParticipants: isGroup ? 5 : 1,
-          participantCount: 1,
-          participants: [currentUser.email]
-        };
-        const docRef = await addDoc(collection(db, 'bookings'), bookingData);
-        setBookingFormData({ ...bookingData, id: docRef.id });
-      }
-      
-      setIsBookingModalOpen(false);
-      setIsPaymentModalOpen(true);
-      setPaymentStatus('idle');
-    }
-  };
-
-  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-
-  const handleLogout = async () => {
-    setShowLogoutConfirm(true);
-  };
-
-  const confirmLogout = async () => {
-    await signOut(auth);
-    setView('login');
-    setCurrentUser(null);
-    setShowLogoutConfirm(false);
-  };
-
-  const cancelLogout = () => {
-    setShowLogoutConfirm(false);
   };
 
 const LoginView = ({ setView, setCurrentUser }: { 
@@ -2114,11 +1390,12 @@ const RegisterView = ({ setView, setCurrentUser }: {
       setView('dashboard');
       
       // Notify Backend to send Welcome Email
-      fetch('http://localhost:5001/api/register-student', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ studentId: uid })
-      }).catch(err => console.error("Welcome Email Trigger Failed:", err));
+      try {
+        sendPlatformEmail(
+          { name: formData.name, email: formData.email }, 
+          'student_register'
+        );
+      } catch(e) { console.warn("Welcome email error:", e) }
     } catch (err: any) {
       console.error("Student Registration Error:", err);
       if (err.code === 'permission-denied') {
@@ -2231,21 +1508,538 @@ const RegisterView = ({ setView, setCurrentUser }: {
     );
   };
 
+const NotesView = ({ currentUser, bookings, currentTier, setView }: { currentUser: StudentProfile | null, bookings: Booking[], currentTier: string, setView: (view: View) => void }) => {
+  const [notes, setNotes] = useState<any[]>([]);
+  const [polls, setPolls] = useState<Poll[]>([]);
+  const [notesLoading, setNotesLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
+  const [voterNames, setVoterNames] = useState<Record<string, string>>({});
+  const [selectedVoters, setSelectedVoters] = useState<{ pollId: string, optionIndex: number } | null>(null);
+  const [viewingDoc, setViewingDoc] = useState<any>(null);
+  const [zoomScale, setZoomScale] = useState(1);
 
+  const formatDateLabel = (ts: any) => {
+    if (!ts) return '';
+    const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+    return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  };
 
-  const markNotifRead = async (id: string) => {
-    setNotifications(notifications.map(n => n.id === id ? { ...n, read: true } : n));
+  // Enrolled subjects for filtering (confirmed, completed, or pending)
+  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => b.subject.toLowerCase())));
+  const studentEmailKey = currentUser?.email?.replace(/\./g, '_') || '';
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    // Listen to Notes - targets specific class & subject
+    const qNotes = query(collection(db, 'notes'), orderBy('createdAt', 'desc'));
+    const unsubscribeNotes = onSnapshot(qNotes, (snapshot) => {
+      const allNotes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const bookingClasses = Array.from(new Set(bookings.map(b => normalize(b.studentClass || b.class || ''))));
+      const profileClass = normalize(currentUser.class);
+      const studentClasses = Array.from(new Set([profileClass, ...bookingClasses].filter(Boolean)));
+      
+      const normalizedEnrolled = enrolledSubjects.map(normalize);
+
+      const filtered = allNotes.filter((n: any) => {
+        const target = n.targetClass || n.class || '';
+        const normTarget = normalize(target);
+        
+        // Match logic: If note has no specific target class, show to all.
+        // Otherwise, match against the student's known classes (profile + bookings).
+        const matchesClass = !target || 
+                           studentClasses.some(c => c === normTarget) ||
+                           (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
+                           (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
+                           // Add logic for numbered classes (e.g. "10th" vs "10")
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget));
+        
+        // Subject filter: Show all for class if no bookings yet, else refine.
+        const matchesSubject = enrolledSubjects.length === 0 || 
+                             !n.subject || 
+                             normalizedEnrolled.includes(normalize(n.subject)) ||
+                             normalizedEnrolled.some(enrolled => normalize(n.subject).includes(enrolled) || enrolled.includes(normalize(n.subject)));
+        
+        return matchesClass && matchesSubject;
+      });
+      setNotes(filtered);
+      setNotesLoading(false);
+    });
+
+    // Listen to Polls - targets specific class
+    const qPolls = query(collection(db, 'polls'), orderBy('createdAt', 'desc'));
+    const unsubscribePolls = onSnapshot(qPolls, (snapshot) => {
+      const allPolls = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Poll));
+      
+      const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const bookingClasses = Array.from(new Set(bookings.map(b => normalize(b.studentClass || b.class || ''))));
+      const profileClass = normalize(currentUser.class);
+      const studentClasses = Array.from(new Set([profileClass, ...bookingClasses].filter(Boolean)));
+
+      const filtered = allPolls.filter((p) => {
+        const target = p.targetClass || '';
+        const normTarget = normalize(target);
+        
+        const matchesClass = !target || 
+                           studentClasses.some(c => c === normTarget) ||
+                           (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
+                           (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget));
+        return matchesClass;
+      });
+      setPolls(filtered);
+    });
+
+    return () => {
+      unsubscribeNotes();
+      unsubscribePolls();
+    };
+  }, [currentUser?.id, currentUser?.class, enrolledSubjects.join(',')]);
+
+  const handleVote = async (pollId: string, optionIndex: number) => {
+    if (!currentUser?.email) return;
+    const pollRef = doc(db, 'polls', pollId);
+    const pollSnap = await getDoc(pollRef);
+    if (!pollSnap.exists()) return;
+
+    const data = pollSnap.data() as Poll;
+    const newOptions = [...data.options.map(o => ({ ...o, votes: [...o.votes] }))];
+    const voterId = currentUser.id || studentEmailKey; // Prefer student UID
+
+    const isAlreadyVoted = newOptions[optionIndex].votes.includes(voterId);
+    const userSelections = newOptions.filter(o => o.votes.includes(voterId)).length;
+
+    if (data.allowMultiple) {
+      if (isAlreadyVoted) {
+        // Prevent unselecting last option
+        if (userSelections > 1) {
+          newOptions[optionIndex].votes = newOptions[optionIndex].votes.filter(id => id !== voterId);
+        }
+      } else {
+        newOptions[optionIndex].votes.push(voterId);
+      }
+    } else {
+      if (isAlreadyVoted) return; 
+      newOptions.forEach(opt => {
+        opt.votes = opt.votes.filter(id => id !== voterId);
+      });
+      newOptions[optionIndex].votes.push(voterId);
+    }
+
+    await updateDoc(pollRef, { options: newOptions });
+
+    // Notify Tutor via tutor_notifications
     try {
-      const notifRef = doc(db, 'notifications', id);
-      await updateDoc(notifRef, { read: true });
+      await addDoc(collection(db, 'tutor_notifications'), {
+        tutorId: data.tutorId,
+        type: 'update',
+        title: 'New Poll Reaction 📊',
+        message: `${currentUser.name || 'A student'} reacted to your poll: "${data.question.substring(0, 30)}..."`,
+        createdAt: serverTimestamp(),
+        read: false,
+        link: 'notes',
+        pollId: pollId
+      });
     } catch (e) {
-      console.error('Error marking notification read:', e);
+      console.error("Failed to notify tutor:", e);
     }
   };
 
-  // --- View Components ---
+  const openVotersModal = async (pollId: string, optionIndex: number, voters: string[]) => {
+    setSelectedVoters({ pollId, optionIndex });
+    const missing = voters.filter(id => !voterNames[id]);
+    if (missing.length > 0) {
+      const newNames = { ...voterNames };
+      for (const id of missing) {
+        try {
+          // Priority 1: Check students/users collections by ID
+          let sDoc = await getDoc(doc(db, 'students', id));
+          if (!sDoc.exists()) sDoc = await getDoc(doc(db, 'users', id));
+          
+          if (sDoc.exists()) {
+             const data = sDoc.data() || {};
+             newNames[id] = data.name || data.fullName || 'Student Participant';
+          } else if (id.includes('_') || id.includes('@')) {
+             // Priority 2: Deep Query by email if ID is an email-key or raw email
+             const email = id.includes('@') ? id : id.replace(/_/g, '.');
+             const q = query(collection(db, 'students'), where('email', '==', email));
+             const snap = await getDocs(q);
+             if (!snap.empty) {
+                newNames[id] = snap.docs[0].data().name || 'Student Participant';
+             } else {
+                newNames[id] = 'Student Participant';
+             }
+          } else {
+             newNames[id] = 'Student Participant';
+          }
+        } catch (e) {
+          newNames[id] = 'Student';
+        }
+      }
+      setVoterNames(newNames);
+    }
+  };
 
-const ForgotPasswordView = ({ setView }: { setView: (view: View) => void }) => {
+  if (notesLoading) return <div className="p-20 text-center"><RefreshCw className="animate-spin inline text-primary" size={32} /></div>;
+
+  const allItems = [...notes.map(n => ({ ...n, itemType: 'note' })), ...polls.map(p => ({ ...p, itemType: 'poll' }))];
+  const uniqueDates = Array.from(new Set(allItems.map(i => formatDateLabel(i.createdAt)).filter(Boolean)));
+  const uniqueTopics = Array.from(new Set(allItems.map(i => i.topic).filter(Boolean)));
+
+  const filteredNotes = notes.filter(n => {
+    const dMatch = !selectedDate || formatDateLabel(n.createdAt) === selectedDate;
+    const tMatch = !selectedTopic || n.topic === selectedTopic;
+    return dMatch && tMatch;
+  });
+
+  const filteredPolls = polls.filter(p => {
+    const dMatch = !selectedDate || formatDateLabel(p.createdAt) === selectedDate;
+    const tMatch = !selectedTopic || p.topic === selectedTopic;
+    return dMatch && tMatch;
+  });
+
+  const ItemsContainer = () => (
+    <div className="max-w-7xl mx-auto px-4 md:px-8 space-y-12 pb-20 overflow-x-hidden">
+      {/* Date Filter Bar */}
+      <div className="flex items-center gap-3 overflow-x-auto pb-6 scrollbar-hide">
+        <button 
+          onClick={() => setSelectedDate(null)}
+          className={cn(
+            "px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+            selectedDate === null ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40 hover:border-primary/20 shadow-sm"
+          )}
+        >
+          All Timeline
+        </button>
+        {uniqueDates.map(date => (
+          <button 
+            key={date}
+            onClick={() => setSelectedDate(date)}
+            className={cn(
+              "px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+              selectedDate === date ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40 hover:border-primary/20 shadow-sm"
+            )}
+          >
+            {date}
+          </button>
+        ))}
+      </div>
+
+      {uniqueTopics.length > 0 && (
+         <div className="flex items-center gap-2 overflow-x-auto pb-4">
+            {uniqueTopics.map(topic => (
+              <button 
+                key={topic}
+                onClick={() => setSelectedTopic(selectedTopic === topic ? null : topic)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider transition-all whitespace-nowrap border",
+                  selectedTopic === topic ? "bg-secondary text-white border-secondary" : "bg-secondary/5 text-secondary border-secondary/10"
+                )}
+              >
+                {topic}
+              </button>
+            ))}
+         </div>
+      )}
+      <section className="space-y-8">
+        <h3 className="text-xl font-serif font-black italic flex items-center gap-3">
+          <Book className="text-primary" size={24} /> Subject Materials
+        </h3>
+         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {filteredNotes.length === 0 ? (
+            <div className="col-span-full py-20 text-center bg-white/40 rounded-[3rem] border border-dashed border-primary/10">
+              <FileText size={32} className="mx-auto text-primary/10 mb-4" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-primary/30">No materials matched for this selection</p>
+            </div>
+          ) : filteredNotes.map(note => (
+            <motion.div 
+              key={note.id} 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="p-6 bg-white rounded-[2.5rem] border border-black/5 hover:shadow-2xl transition-all group flex flex-col h-full"
+            >
+              <div className="flex items-start justify-between">
+                <div className="w-14 h-14 bg-primary/5 rounded-[1.5rem] flex items-center justify-center text-primary group-hover:scale-110 transition-transform overflow-hidden border border-primary/10">
+                   {note.fileType?.startsWith('image/') ? (
+                     <img src={note.fileData} className="w-full h-full object-cover" alt="" />
+                   ) : (
+                     <FileText size={28} />
+                   )}
+                </div>
+                <div className="flex flex-col items-end gap-1">
+                   <div className="px-3 py-1 bg-slate-50 rounded-full border border-black/5">
+                      <span className="text-[8px] font-black uppercase text-primary/40 tracking-tighter">
+                         {note.fileType?.split('/')[1]?.toUpperCase() || 'DOC'}
+                      </span>
+                   </div>
+                </div>
+              </div>
+
+              <div className="mt-8 flex-1">
+                <h4 className="font-bold text-lg leading-snug group-hover:text-primary transition-colors line-clamp-2">{note.fileName}</h4>
+                <div className="flex items-center gap-2 mt-2">
+                   {note.topic && <span className="bg-emerald-50 text-emerald-600 text-[8px] font-black px-1.5 py-0.5 rounded uppercase border border-emerald-100">{note.topic}</span>}
+                   <span className="text-[10px] font-black uppercase tracking-[0.15em] text-primary/30">{note.subject}</span>
+                   <span className="w-1 h-1 bg-primary/20 rounded-full" />
+                   <span className="text-[10px] font-bold text-primary/40">Shared by {note.tutorName}</span>
+                </div>
+              </div>
+
+              <div className="mt-8 pt-6 border-t border-black/5 flex flex-col gap-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <button 
+                      onClick={() => setViewingDoc(note)}
+                      className="py-4 bg-primary/5 hover:bg-primary text-primary hover:text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-primary/10"
+                    >
+                       <Eye size={16} /> View
+                    </button>
+                    <a 
+                      href={note.fileData} 
+                      download={note.fileName}
+                      className="py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 shadow-xl shadow-slate-900/10 hover:scale-[1.02]"
+                    >
+                       <Download size={16} /> Save
+                    </a>
+                  </div>
+                  
+                  <div className="flex items-center justify-between px-2 pt-2">
+                     <div className="flex items-center gap-2">
+                        <div className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-[8px] font-bold border border-white">{note.tutorName?.charAt(0)}</div>
+                        <span className="text-[9px] font-black text-primary/20 uppercase">{formatTime(note.createdAt)}</span>
+                     </div>
+                     <span className="text-[7px] font-black text-primary/40 uppercase tracking-tighter px-1.5 py-0.5 border border-primary/5 rounded-sm">
+                        Secured Document
+                     </span>
+                  </div>
+               </div>
+            </motion.div>
+          ))}
+        </div>
+      </section>
+
+      <section className="space-y-8">
+        <h3 className="text-xl font-serif font-black italic flex items-center gap-3">
+          <BarChart3 className="text-secondary" size={24} /> Active Polls
+        </h3>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {filteredPolls.length === 0 ? (
+            <div className="col-span-full py-20 text-center bg-white/40 rounded-[3rem] border border-dashed border-primary/10">
+              <Smile size={32} className="mx-auto text-primary/10 mb-4" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-primary/30">No polls matched for this selection</p>
+            </div>
+          ) : filteredPolls.map(poll => {
+            const allVotesArray = poll.options?.flatMap(o => o.votes || []) || [];
+            const uniqueVoters = Array.from(new Set(allVotesArray));
+            const totalUniqueVoters = uniqueVoters.length;
+            const hasVoted = uniqueVoters.includes(currentUser?.id || '') || uniqueVoters.includes(studentEmailKey);
+
+            return (
+              <motion.div 
+                key={poll.id} 
+                className="p-5 bg-white rounded-[1.5rem] border border-black/5 shadow-sm hover:shadow-xl transition-all"
+              >
+                <div className="mb-4">
+                  <div className="flex items-center justify-between mb-3">
+                     <div className="flex items-center gap-2">
+                        <span className="text-[8px] font-black text-secondary uppercase tracking-widest bg-secondary/5 px-3 py-1 rounded-full border border-secondary/10">Active Poll</span>
+                        {poll.topic && <span className="text-[8px] font-black text-primary/40 uppercase tracking-widest border border-black/5 px-2 py-1 rounded-full">{poll.topic}</span>}
+                     </div>
+                     <span className="text-[8px] font-bold text-primary/20 uppercase tracking-widest">{formatTime(poll.createdAt)}</span>
+                  </div>
+                  <h4 className="text-base font-bold text-on-surface leading-tight">{poll.question}</h4>
+                </div>
+
+                <div className="space-y-3">
+                  {poll.options.map((option, idx: number) => {
+                    const optionVoters = option.votes || [];
+                    const percentage = totalUniqueVoters > 0 ? Math.round((optionVoters.length / totalUniqueVoters) * 100) : 0;
+                    const isSelected = optionVoters.includes(currentUser?.id || studentEmailKey);
+
+                    return (
+                      <div key={idx} className="space-y-2">
+                        <button 
+                          onClick={() => handleVote(poll.id, idx)}
+                          className={cn(
+                            "w-full p-2.5 px-4 rounded-xl border transition-all relative overflow-hidden group text-left",
+                            isSelected ? "bg-primary border-primary text-background shadow-lg shadow-primary/20 scale-[1.01]" : "bg-white border-black/5 hover:border-primary/20 hover:bg-primary/5"
+                          )}
+                        >
+                          <div className="relative z-10 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              {isSelected ? <CheckCircle size={18} /> : <Circle size={18} className="text-primary/10 group-hover:text-primary/30" />}
+                              <span className="text-sm font-bold">{option.text}</span>
+                            </div>
+                            <span className={cn("text-sm font-black italic", isSelected ? "opacity-80" : "text-primary/30")}>{percentage}%</span>
+                          </div>
+                          <motion.div initial={{ width: 0 }} animate={{ width: `${percentage}%` }} className={cn("absolute left-0 top-0 bottom-0 opacity-10", isSelected ? "bg-white" : "bg-primary")} />
+                        </button>
+                      
+                        <div className="flex items-center justify-between px-2">
+                           <div className="flex -space-x-1.5">
+                              {optionVoters.slice(0, 5).map((vUid, i) => (
+                                <div 
+                                  key={i} 
+                                  onClick={() => openVotersModal(poll.id, idx, optionVoters)}
+                                  className="w-6 h-6 rounded-full bg-slate-100 border-2 border-white flex items-center justify-center text-[8px] font-bold text-primary cursor-pointer hover:z-10 hover:scale-110 transition-all"
+                                >
+                                  {voterNames[vUid]?.charAt(0) || 'S'}
+                                </div>
+                              ))}
+                              {optionVoters.length > 5 && (
+                                <button onClick={() => openVotersModal(poll.id, idx, optionVoters)} className="w-6 h-6 rounded-full bg-slate-50 border-2 border-white flex items-center justify-center text-[8px] font-black text-primary/30">+{optionVoters.length - 5}</button>
+                              )}
+                           </div>
+                           <span className="text-[9px] font-black text-primary/20 uppercase tracking-tighter">{optionVoters.length} responses</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="mt-5 pt-4 border-t border-black/5 flex items-center justify-between">
+                   <div className="flex items-center gap-2 text-[8px] font-black text-primary/40 uppercase tracking-widest">
+                     <Users size={12} /> {totalUniqueVoters} Students Participated
+                   </div>
+                   <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-600 px-2.5 py-1 rounded-full">
+                     <span className="w-1 h-1 bg-emerald-500 rounded-full animate-pulse" />
+                     <span className="text-[8px] font-black uppercase tracking-tighter">Live Result</span>
+                   </div>
+                </div>
+              </motion.div>
+            );
+          })}
+        </div>
+      </section>
+
+      <Modal isOpen={!!selectedVoters} onClose={() => setSelectedVoters(null)} title="Voter Profiles">
+        {selectedVoters && (() => {
+          const poll = polls.find(p => p.id === selectedVoters.pollId);
+          if (!poll) return null;
+          const optionVoters = poll.options[selectedVoters.optionIndex].votes || [];
+          return (
+            <div className="space-y-4">
+              <div className="p-6 bg-primary/5 rounded-[2rem] border border-primary/10">
+                <p className="text-[10px] font-black text-primary/30 uppercase tracking-[0.2em] mb-2">Option Selected</p>
+                <p className="text-xl font-bold italic text-primary">"{poll.options[selectedVoters.optionIndex].text}"</p>
+              </div>
+              <div className="grid grid-cols-1 gap-2">
+                {optionVoters.map((vUid, i) => (
+                  <div key={i} className="flex items-center justify-between p-4 bg-white rounded-2xl border border-black/5 hover:border-primary/20 transition-all">
+                     <div className="flex items-center gap-3">
+                       <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center text-xs font-black text-primary">{voterNames[vUid]?.charAt(0) || 'S'}</div>
+                       <span className="font-bold text-on-surface">{voterNames[vUid] || 'Scholar User'}</span>
+                     </div>
+                     {(vUid === currentUser?.id || vUid === studentEmailKey) && <span className="bg-primary text-background text-[8px] font-black uppercase px-2 py-1 rounded-md">You</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      {/* FULL SCREEN VIEWER - TRUE FULLSCREEN */}
+      <AnimatePresence>
+        {viewingDoc && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black">
+             <motion.div 
+               initial={{ opacity: 0 }}
+               animate={{ opacity: 1 }}
+               exit={{ opacity: 0 }}
+               className="relative w-full h-full flex flex-col items-center justify-center"
+             >
+                {/* Compact Exit Button */}
+                <button 
+                  onClick={() => { setViewingDoc(null); setZoomScale(0.9); }} 
+                  className="fixed top-4 right-4 z-[110] bg-white/5 hover:bg-white/10 backdrop-blur-md p-2.5 rounded-full text-white/70 hover:text-white transition-all border border-white/10"
+                >
+                   <X size={20} />
+                </button>
+
+                {/* ZOOM CONTROLS - COMPACT */}
+                <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[110] flex items-center gap-2 bg-white/10 backdrop-blur-xl px-4 py-2 rounded-2xl border border-white/10 shadow-2xl">
+                   <button 
+                     onClick={() => setZoomScale(prev => Math.max(0.1, prev - 0.1))}
+                     className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"
+                   >
+                      <Minus size={20} />
+                   </button>
+                   <div className="w-12 text-center">
+                      <span className="text-white font-black text-[10px] uppercase tracking-widest">{Math.round(zoomScale * 100)}%</span>
+                   </div>
+                   <button 
+                     onClick={() => setZoomScale(prev => Math.min(3, prev + 0.1))}
+                     className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"
+                   >
+                      <Plus size={20} />
+                   </button>
+                </div>
+
+                {/* Content Area - Occupies Entire Screen */}
+                <div className="flex-1 w-full h-full bg-[#0a0a0b] overflow-auto custom-scrollbar flex items-center justify-center p-2">
+                   <motion.div 
+                     animate={{ scale: zoomScale }}
+                     transition={{ type: "spring", stiffness: 300, damping: 30 }}
+                     className="origin-center flex items-center justify-center"
+                   >
+                      {viewingDoc.fileType?.startsWith('image/') ? (
+                        <img 
+                          src={viewingDoc.fileData} 
+                          className="max-w-[96vw] max-h-[96vh] object-contain shadow-[0_0_100px_rgba(0,0,0,0.5)] border border-white/10 rounded-md" 
+                          alt={viewingDoc.fileName} 
+                        />
+                      ) : (
+                        <div className="w-[96vw] h-[96vh] bg-white rounded-md shadow-2xl overflow-hidden border border-white/10">
+                           <iframe 
+                             src={`${viewingDoc.fileData}#toolbar=0&view=FitH`} 
+                             className="w-full h-full border-none"
+                             title="PDF Viewer"
+                           />
+                        </div>
+                      )}
+                   </motion.div>
+                </div>
+                
+                {/* Discrete Security Watermark */}
+                <div className="fixed bottom-6 right-6 opacity-10 pointer-events-none select-none z-[110]">
+                   <p className="text-[10px] font-black uppercase tracking-[0.5em] text-white">SCHOLAR PRIVATE CONTENT • {viewingDoc.fileName}</p>
+                </div>
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+
+  // 🔒 Feature Gating Logic (Step 2 Implementation)
+  if (currentTier === 'free') {
+    return (
+      <div className="min-h-[70vh] flex flex-col items-center justify-center p-10 text-center animate-in fade-in slide-in-from-bottom-10 duration-700">
+        <div className="w-24 h-24 bg-primary/5 rounded-[2.5rem] flex items-center justify-center mb-8 relative">
+           <FileText size={40} className="text-primary/20" />
+           <Lock size={20} className="absolute -top-1 -right-1 text-rose-500" />
+        </div>
+        <h2 className="text-3xl font-serif font-black italic text-slate-800 mb-4 tracking-tight">Academic Notes Locked</h2>
+        <p className="max-w-md text-slate-500 font-medium leading-relaxed mb-10">
+          Get unlimited access to premium tutor notes, subject materials, and curriculum guides by upgrading to Scholar Standard or Elite.
+        </p>
+        <button 
+          onClick={() => setView('settings')}
+          className="px-10 py-5 bg-primary text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-2xl shadow-primary/20 hover:scale-105 active:scale-95 transition-all"
+        >
+          Explore Pricing Plans
+        </button>
+      </div>
+    );
+  }
+
+  return <ItemsContainer />;
+};
+
+function ForgotPasswordView({ setView }: { setView: (view: View) => void }) {
     const [email, setEmail] = useState('');
     const [step, setStep] = useState<'email' | 'reset'>('email');
     const [newPassword, setNewPassword] = useState('');
@@ -2279,7 +2073,7 @@ const ForgotPasswordView = ({ setView }: { setView: (view: View) => void }) => {
       }
     };
 
-    const handleReset = (e: React.FormEvent) => {
+    const handleReset = async (e: React.FormEvent) => {
       e.preventDefault();
       if (newPassword !== confirmPassword) {
         setError("Passwords do not match.");
@@ -2288,12 +2082,21 @@ const ForgotPasswordView = ({ setView }: { setView: (view: View) => void }) => {
       
       const passRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#])[A-Za-z\d@$!%*?&#]{8,}$/;
       if (!passRegex.test(newPassword)) {
-        setError("Password must be 8+ chars with uppercase, lowercase, numbers, and symbols.");
+        setError("Invalid format.");
         return;
       }
 
-      setSuccess("✅ Password updated successfully! Redirecting to login...");
-      setTimeout(() => setView('login'), 2000);
+      setIsLoading(true);
+      try {
+        // Here we would normally call confirmPasswordReset(auth, oobCode, newPassword)
+        // Since we are simulating a custom flow for the user's demo:
+        setSuccess("✅ Password updated successfully! Redirecting to login...");
+        setTimeout(() => setView('login'), 2000);
+      } catch (err: any) {
+        setError(err.message || "Failed to update password.");
+      } finally {
+        setIsLoading(false);
+      }
     };
 
     return (
@@ -2343,8 +2146,12 @@ const ForgotPasswordView = ({ setView }: { setView: (view: View) => void }) => {
                   <input type="password" required className="input-field pl-12" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
                 </div>
               </div>
-              <button type="submit" className="w-full bg-primary text-background py-4 rounded-2xl font-bold hover:scale-[1.02] transition-all shadow-lg shadow-primary/20">
-                Update & Sign In
+              <button 
+                type="submit" 
+                disabled={isLoading || !newPassword || newPassword !== confirmPassword}
+                className="w-full bg-primary text-background py-4 rounded-2xl font-bold hover:scale-[1.02] transition-all bg-primary disabled:opacity-50 disabled:grayscale disabled:scale-100 shadow-lg shadow-primary/20"
+              >
+                {isLoading ? 'Updating...' : 'Update & Sign In'}
               </button>
             </form>
           )}
@@ -2357,14 +2164,16 @@ const ForgotPasswordView = ({ setView }: { setView: (view: View) => void }) => {
     );
   };
 
-const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, handleLogout, currentUser, chats }: { 
+const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, handleLogout, currentUser, chats, currentTier, effectiveSubscription }: { 
   view: View, 
   setView: (view: View) => void, 
   isMobileSidebarOpen: boolean, 
   setIsMobileSidebarOpen: (open: boolean) => void, 
   handleLogout: () => void, 
   currentUser: StudentProfile | null, 
-  chats: Chat[] 
+  chats: Chat[],
+  currentTier: string,
+  effectiveSubscription: { isExpired: boolean }
 }) => (
   <>
     {/* Mobile Overlay */}
@@ -2385,13 +2194,13 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
       isMobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
       view === 'chat' ? 'md:hidden' : ''
     )}>
-      <div className="flex items-center justify-between mb-12">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-background rounded-full flex items-center justify-center">
+      <div className="flex items-center justify-between mb-6">
+        <a href="http://localhost:5173" className="flex items-center gap-3 group">
+          <div className="w-10 h-10 bg-background rounded-full flex items-center justify-center group-hover:scale-105 transition-transform">
             <GraduationCap className="text-primary" size={24} />
           </div>
-          <span className="font-serif text-2xl font-bold italic">Scholar</span>
-        </div>
+          <span className="font-serif text-2xl font-bold italic group-hover:text-white transition-colors">Scholar</span>
+        </a>
         <button 
           onClick={() => setIsMobileSidebarOpen(false)}
           className="md:hidden p-2 text-background/60 hover:text-background"
@@ -2400,13 +2209,20 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
         </button>
       </div>
 
-      <nav className="flex-1 space-y-1">
+      <nav className="sidebar-nav-container overflow-visible">
         {[
           { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard },
           { id: 'find-tutors', name: 'Find Tutors', icon: Search },
           { id: 'my-bookings', name: 'My Bookings', icon: Calendar },
           { id: 'payments', name: 'Payments', icon: DollarSign },
           { id: 'progress', name: 'Progress', icon: BarChart2 },
+          ...(currentTier !== 'free' ? [
+            { id: 'notes', name: 'Notes', icon: FileText },
+          ] : []),
+          ...(currentTier === 'premium' ? [
+            { id: 'assignments', name: 'Assignments', icon: FileCheck },
+            { id: 'projects', name: 'Projects', icon: Briefcase },
+          ] : []),
           { id: 'chat', name: 'Chat', icon: MessageSquare, badge: chats.filter(c => c.unreadCount > 0).length },
           { id: 'reviews', name: 'Reviews', icon: Star },
           { id: 'settings', name: 'My Profile', icon: Settings },
@@ -2429,7 +2245,7 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
               view === item.id ? "sidebar-item-active" : ""
             )}
           >
-            <item.icon size={20} className={cn(view === item.id ? "text-primary" : "text-white/40")} />
+            <item.icon size={20} className={cn(view === item.id ? "text-primary" : "text-on-surface/50")} />
             <span className="flex-1 text-left">{item.name}</span>
             {item.badge && item.badge > 0 && (
               <span className="bg-primary text-background text-[10px] font-black px-2 py-0.5 rounded-full shadow-lg shadow-primary/20">{item.badge}</span>
@@ -2438,14 +2254,28 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
         ))}
       </nav>
 
-      <div className="mt-auto pt-8 border-t border-white/10">
-        <div className="flex items-center gap-3 px-4 py-2">
-          <div className="w-8 h-8 rounded-full bg-background/20 flex items-center justify-center text-[10px] font-bold">
-            {currentUser?.email?.substring(0, 2)?.toUpperCase() || 'ST'}
+      <div className="mt-auto px-4 py-6 border-t border-gray-100">
+        <div className="flex flex-col overflow-hidden">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[8px] text-on-surface-variant font-black uppercase tracking-widest">Active Plan</span>
+            <span className={cn(
+              "px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-tighter shadow-sm",
+              currentTier === 'premium' ? "bg-amber-400 text-white shadow-amber-200" :
+              currentTier === 'standard' ? "bg-blue-500 text-white shadow-blue-200" :
+              "bg-slate-300 text-on-surface/60"
+            )}>
+              {currentTier === 'free' ? (effectiveSubscription.isExpired ? 'Trial Ended' : 'Free') : currentTier.toUpperCase()}
+            </span>
           </div>
-          <div className="flex flex-col overflow-hidden">
-            <span className="text-xs font-medium truncate">{currentUser?.email || 'Student Account'}</span>
-            <span className="text-[10px] text-background/40 uppercase tracking-wider">Student Account</span>
+          <div className="w-full bg-slate-100 h-1 rounded-full overflow-hidden">
+             <div 
+               className={cn(
+                 "h-full transition-all duration-1000",
+                 currentTier === 'premium' ? "bg-amber-400 w-full" :
+                 currentTier === 'standard' ? "bg-blue-500 w-2/3" :
+                 "bg-slate-300 w-1/3"
+               )}
+             />
           </div>
         </div>
       </div>
@@ -2453,7 +2283,7 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
   </>
 );
 
-const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, notifications, markNotifRead, setView, currentUser, handleLogout }: {
+const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, notifications, markNotifRead, setView, currentUser, handleLogout, notifBgMap, notifIconMap, formatTime }: {
   view: View,
   setIsMobileSidebarOpen: (open: boolean) => void,
   isNotifOpen: boolean,
@@ -2462,7 +2292,10 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
   markNotifRead: (id: string) => void,
   setView: (view: View) => void,
   currentUser: StudentProfile | null,
-  handleLogout: () => void
+  handleLogout: () => void,
+  notifBgMap: any,
+  notifIconMap: any,
+  formatTime: any
 }) => {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   
@@ -2510,11 +2343,19 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
                       setView(n.link as View);
                       setIsNotifOpen(false);
                     }}
-                    className={`w-full p-4 md:p-6 text-left hover:bg-primary/5 transition-colors border-b border-primary/5 last:border-0 ${!n.read ? 'bg-primary/5' : ''}`}
+                    className={`w-full p-4 md:p-6 text-left hover:bg-primary/5 transition-colors border-b border-primary/5 last:border-0 flex items-start gap-3 ${!n.read ? 'bg-primary/5' : ''}`}
                   >
-                    <p className="text-xs md:text-sm font-bold text-on-surface">{n.title}</p>
-                    <p className="text-[10px] md:text-xs text-on-surface-variant mt-1">{n.message}</p>
-                    <p className="text-[9px] md:text-[10px] text-on-surface-variant opacity-40 mt-2 font-bold uppercase tracking-widest">{n.time}</p>
+                    <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 mt-0.5 ${notifBgMap[n.type as keyof typeof notifBgMap] || 'bg-primary/10'}`}>
+                      {notifIconMap[n.type as keyof typeof notifIconMap] || <Bell size={14} className="text-primary" />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs md:text-sm font-bold text-on-surface">{n.title}</p>
+                      <p className="text-[10px] md:text-xs text-on-surface-variant mt-1">{n.message}</p>
+                      <div className="flex items-center gap-1.5 mt-2">
+                        <Clock size={10} className="text-on-surface-variant opacity-40" />
+                        <p className="text-[9px] md:text-[10px] text-on-surface-variant opacity-40 font-bold uppercase tracking-widest">{formatTime(n.time)}</p>
+                      </div>
+                    </div>
                   </button>
                 )) : (
                   <div className="p-8 text-center text-primary/30 font-bold uppercase tracking-widest text-xs">No notifications</div>
@@ -2533,8 +2374,8 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
           className="flex items-center gap-3 hover:bg-primary/5 p-2 rounded-2xl transition-all"
         >
           <div className="text-right hidden sm:block">
-            <p className="text-sm font-bold">{currentUser?.name || 'Alex Johnson'}</p>
-            <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest">{currentUser?.class ? `Class ${currentUser.class}` : 'Senior Student'}</p>
+            <p className="text-xs font-bold">{currentUser?.name || 'Alex Johnson'}</p>
+            <p className="text-[9px] font-black text-primary/30 uppercase tracking-[0.15em]">{currentUser?.class ? `Grade ${currentUser.class}` : 'Scholar Student'}</p>
           </div>
           <Avatar src="" initials={currentUser?.name?.charAt(0) || 'S'} />
         </motion.button>
@@ -2568,881 +2409,7 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
 );
 };
 
-const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onReschedule, tutors }: { 
-  setView: (view: View) => void, 
-  bookings: Booking[], 
-  setSelectedTutor: (tutor: Tutor | null) => void, 
-  openChat: (tutorId: string) => void, 
-  onReschedule: (booking: Booking) => void,
-  tutors: Tutor[]
-}) => (
-    <div className="space-y-10 md:space-y-12">
-      <div className="grid grid-cols-3 gap-4 md:gap-8">
-        {[
-          { label: 'Upcoming Sessions', value: bookings.filter(b => b.status === 'confirmed' && b.attendance_status !== 'attended').length, color: 'text-on-surface', span: 'col-span-1' },
-          { label: 'Completed Classes', value: bookings.filter(b => (b.status === 'completed' || b.attendance_status === 'attended')).length, color: 'text-on-surface', span: 'col-span-1' },
-          { label: 'Tutors Enrolled', value: new Set(bookings.map(b => b.tutorId)).size, color: 'text-on-surface', span: 'col-span-1' }
-        ].map((stat, i) => (
-          <motion.div 
-            key={stat.label}
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: i * 0.1 }}
-            whileHover={{ scale: 1.02, backgroundColor: 'rgba(255, 255, 255, 0.6)' }}
-            className={`p-4 sm:p-6 lg:p-8 bg-white/40 backdrop-blur-md rounded-3xl shadow-sm transition-all cursor-default ${stat.span}`}
-          >
-            <p className="text-[7px] md:text-[10px] font-extrabold uppercase tracking-widest text-on-surface mb-1 md:mb-2">{stat.label}</p>
-            <p className={`text-2xl md:text-5xl font-serif font-black tracking-tighter ${stat.color}`}>{stat.value}</p>
-          </motion.div>
-        ))}
-      </div>
-
-      <section>
-        <div className="flex items-center justify-between mb-6 md:mb-8">
-          <h3 className="text-xl md:text-2xl font-serif font-bold italic">Upcoming Sessions</h3>
-          <button onClick={() => setView('my-bookings')} className="px-3 py-1 bg-accent/10 text-accent text-[9px] font-extrabold uppercase tracking-widest rounded-lg hover:bg-accent hover:text-white transition-all shadow-sm">View All</button>
-        </div>
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.3 }}
-          className="space-y-4"
-        >
-          {(() => {
-            const now = new Date();
-            const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-            const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-            
-            const tomorrow = new Date(now);
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            const tomorrowStr = tomorrow.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-            const isoTomorrow = tomorrow.getFullYear() + '-' + String(tomorrow.getMonth() + 1).padStart(2, '0') + '-' + String(tomorrow.getDate()).padStart(2, '0');
-
-            const filtered = bookings.filter(b => {
-              const isConfirmed = b.status === 'confirmed' || b.status === 'pending';
-              const isToday = b.date === todayStr || b.date === isoToday;
-              const isTomorrow = b.date === tomorrowStr || b.date === isoTomorrow;
-              return isConfirmed && (isToday || isTomorrow);
-            });
-
-            if (filtered.length === 0) return (
-              <div className="text-center py-12 md:py-20 bg-white/20 rounded-[2rem] border border-dashed border-primary/10 w-full">
-                <p className="text-primary/30 font-bold uppercase tracking-widest text-[10px]">No sessions for today or tomorrow</p>
-                <button onClick={() => setView('find-tutors')} className="text-accent font-bold text-xs mt-4 hover:underline uppercase tracking-tighter">Find a tutor</button>
-              </div>
-            );
-
-            return filtered.map((booking, i) => (
-                <motion.div 
-                  key={booking.id} 
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.4 + (i * 0.1) }}
-                  className="course-card flex-col md:flex-row gap-4 md:gap-8 p-4 md:p-8"
-                >
-                <div className="flex items-center gap-4 md:gap-8 w-full md:w-auto">
-                  <Avatar 
-                    src={((tutors || []).find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId))?.avatar || ''} 
-                    size="md" mdSize="lg" 
-                    initials={(booking.tutorName || 'Tutor').charAt(0).toUpperCase()}
-                  />
-                  <div 
-                    className="cursor-pointer flex-1"
-                    onClick={() => {
-                      setSelectedTutor((tutors || []).find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId) || null);
-                      setView('tutor-profile');
-                    }}
-                  >
-                    <h4 className="text-lg md:text-xl font-bold">{booking.tutorName}</h4>
-                    <div className="flex flex-wrap items-center gap-3 md:gap-4 mt-1">
-                      <span className="flex items-center gap-1 text-[9px] md:text-[10px] font-bold text-on-surface/80">
-                        <BookOpen size={10} /> {booking.subject}
-                      </span>
-                      <span className="flex items-center gap-1 text-[9px] md:text-[10px] font-bold text-on-surface/80">
-                        <Clock size={10} /> {booking.time}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-                <div className="flex items-center justify-between md:justify-end gap-6 w-full md:w-auto pt-4 md:pt-0 border-t md:border-t-0 border-primary/5">
-                  <div className="text-left md:text-right">
-                    <p className="text-xs md:text-sm font-bold">{booking.date}</p>
-                    <p className="text-[9px] md:text-[10px] font-bold text-on-surface/60 uppercase tracking-widest">Scheduled Session</p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                     <button 
-                       onClick={() => openChat(booking.tutorId)}
-                       className="w-10 h-10 rounded-full border border-primary/10 flex items-center justify-center hover:bg-primary hover:text-background transition-all"
-                       title="Message"
-                     >
-                       <MessageSquare size={18} />
-                     </button>
-                     {booking.status === 'confirmed' && (() => {
-                        const now = new Date();
-                        const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                        const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                        const isToday = booking.date === todayStr || booking.date === isoToday;
-                        const sessionMins = parseTime(booking.time);
-                        const nowMins = now.getHours() * 60 + now.getMinutes();
-                        const diffMins = sessionMins - nowMins;
-                        const isActive = (isToday && diffMins <= 10 && diffMins >= -60) || booking.status === 'live';
-
-                        return isActive ? (
-                          <button 
-                            onClick={() => startSession(booking.id)}
-                            className="px-6 py-2 bg-blue-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:scale-105 transition-transform shadow-lg shadow-blue-500/20 animate-pulse"
-                          >
-                            Join Class
-                          </button>
-                        ) : (
-                          <button 
-                            disabled
-                            className="px-6 py-2 bg-primary/10 text-primary/40 rounded-xl text-[10px] font-bold uppercase tracking-widest cursor-not-allowed opacity-50"
-                          >
-                            {isToday && diffMins > 10 ? 'Session Not Started' : booking.time}
-                          </button>
-                        );
-                     })()}
-                      {(() => {
-                        const now = new Date();
-                        const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                        const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                        const isToday = booking.date === todayStr || booking.date === isoToday;
-                        const sessionMins = parseTime(booking.time);
-                        const nowMins = now.getHours() * 60 + now.getMinutes();
-                        const hasStarted = isToday && nowMins >= sessionMins;
-                        const isPast = !isToday && new Date(booking.date) < new Date(isoToday);
-                        if (hasStarted || isPast) return null;
-
-                        return (
-                          <button 
-                            onClick={() => onReschedule(booking)}
-                            className="w-10 h-10 rounded-full border border-primary/10 flex items-center justify-center hover:bg-primary hover:text-background transition-all"
-                            title="Reschedule Session"
-                          >
-                            <Calendar size={18} />
-                          </button>
-                        );
-                      })()}
-                   </div>
-                </div>
-              </motion.div>
-            ));
-          })()}
-        </motion.div>
-      </section>
-
-      <section>
-        <div className="flex items-center justify-between mb-6 md:mb-8">
-          <h3 className="text-xl md:text-2xl font-serif font-bold italic">My Active Tutors</h3>
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
-          {(() => {
-            const bookedTutorIds = Array.from(new Set(bookings.map(b => b.tutorId)));
-            const activeTutors = tutors.filter(t => bookedTutorIds.includes(t.id));
-
-            if (activeTutors.length === 0) return (
-              <div className="col-span-1 sm:col-span-2 lg:col-span-3 text-center py-12 bg-white/10 rounded-[2rem] border border-dashed border-primary/5">
-                <p className="text-primary/30 font-bold uppercase tracking-widest text-[10px]">Your personal tutors list will appear here after your first booking</p>
-              </div>
-            );
-
-            return activeTutors.map((tutor, i) => (
-              <motion.div 
-                key={tutor.id}
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.1 * i }}
-                onClick={() => setSelectedTutor(tutor)}
-                className="p-5 bg-white/40 backdrop-blur-md rounded-3xl shadow-sm border border-primary/5 cursor-pointer hover:shadow-lg transition-all group"
-              >
-                <div className="flex items-center gap-4">
-                  <Avatar initials={(tutor.name || 'T')[0]} size="md" className="group-hover:scale-105 transition-transform" />
-                  <div className="min-w-0 flex-1">
-                    <h4 className="font-bold text-sm text-on-surface truncate group-hover:text-primary transition-colors">{tutor.name}</h4>
-                    <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-0.5">
-                      {bookings.filter(b => b.tutorId === tutor.id).length} Active Sessions
-                    </p>
-                  </div>
-                  <MessageSquare size={16} className="text-primary/30 hover:text-primary cursor-pointer" onClick={(e) => { e.stopPropagation(); openChat(tutor.id); }} />
-                </div>
-              </motion.div>
-            ));
-          })()}
-        </div>
-      </section>
-
-      <section>
-        <div className="flex items-center justify-between mb-8">
-          <h3 className="text-2xl font-serif font-bold italic">Learning Progress</h3>
-          <button onClick={() => setView('progress')} className="px-3 py-1 bg-accent/10 text-accent text-[9px] font-extrabold uppercase tracking-widest rounded-lg hover:bg-accent hover:text-white transition-all shadow-sm">View Tracker</button>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          {(() => {
-            const activeBookings = bookings.filter(b => b.status !== 'cancelled');
-            const bookedSubjects = Array.from(new Set(activeBookings.map(b => b.subject)));
-            
-            return bookedSubjects.length > 0 ? bookedSubjects.map((sub, i) => {
-              const subSessions = bookings.filter(b => b.subject === sub);
-              const attendedCount = subSessions.filter(b => b.status === 'completed' || b.attendance_status === 'attended').length;
-              
-              // Dynamic Target: 45 for course_45, 60 for course_60, 20 for monthly, 1 for demo/hourly
-              const latestBooking = subSessions.length > 0 ? subSessions[0] : null;
-              const planLimit = latestBooking?.plan === 'course_45' ? 45 : latestBooking?.plan === 'course_60' ? 60 : latestBooking?.plan === 'monthly' ? 20 : 1;
-              const progress = Math.min(Math.round((attendedCount / planLimit) * 100) + 10, 100); // +10% base for registration
-              
-              return (
-                <motion.div 
-                  key={sub}
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.5 + (i * 0.1) }}
-                  className="p-8 bg-white/40 backdrop-blur-md rounded-[2.5rem] shadow-sm border border-primary/5"
-                >
-                  <div className="flex items-center justify-between mb-4">
-                    <span className="font-bold text-base md:text-lg">{sub}</span>
-                    <span className="text-xs font-bold text-primary">{progress}%</span>
-                  </div>
-                  <div className="h-2 bg-primary/5 rounded-full overflow-hidden">
-                    <motion.div 
-                      initial={{ width: 0 }}
-                      animate={{ width: `${progress}%` }}
-                      className="h-full bg-primary"
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between">
-                    <p className="text-[9px] font-bold uppercase tracking-widest text-primary/30">
-                      {attendedCount} / {planLimit} Sessions Attended
-                    </p>
-                    <span className="text-[8px] font-black bg-primary/10 text-primary px-2 py-0.5 rounded-full uppercase">
-                      {latestBooking?.plan || 'Active'}
-                    </span>
-                  </div>
-                </motion.div>
-              );
-            }) : (
-              <div className="col-span-2 p-12 text-center bg-primary/5 rounded-[2.5rem] border border-dashed border-primary/10">
-                <p className="text-sm font-bold text-primary/40 uppercase tracking-widest">No active courses found. Your learning progress will appear here after booking.</p>
-              </div>
-            );
-          })()}
-        </div>
-      </section>
-    </div>
-  );
-
-const FindTutorsView = ({ setView, setSelectedTutor, tutors }: { 
-  setView: (view: View) => void, 
-  setSelectedTutor: (tutor: Tutor | null) => void,
-  tutors: Tutor[]
-}) => {
-    const [search, setSearch] = useState('');
-    const [subject, setSubject] = useState('All');
-    const [maxPrice, setMaxPrice] = useState(5000); // Increased default to 5000 to show our ₹150+ tutors by default
-    const [minRating, setMinRating] = useState(0);
-    
-    const filteredTutors = tutors.filter(t => {
-      const matchesSearch = search === '' || (t.name || '').toLowerCase().includes(search.toLowerCase());
-      const subjects = t.subjects || [];
-      const matchesSubject = subject === 'All' || subjects.includes(subject);
-      
-      const effectivePrice = getEffectivePrice(t.price);
-      const matchesPrice = effectivePrice <= maxPrice;
-      
-      const matchesRating = (t.rating === undefined || t.rating === null) || t.rating >= minRating;
-      
-      return matchesSearch && matchesSubject && matchesPrice && matchesRating;
-    });
-
-    return (
-    <div className="space-y-8 md:space-y-12">
-      <motion.div 
-        initial={{ opacity: 0, y: -20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6"
-      >
-        <div className="col-span-2 lg:col-span-2 relative">
-          <input 
-            type="text" 
-            placeholder="Search by tutor name..." 
-            className="input-field pr-16"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-          <Search className="absolute right-6 top-1/2 -translate-y-1/2 text-primary/20" size={20} />
-        </div>
-        <select 
-          className="input-field"
-          value={subject}
-          onChange={(e) => setSubject(e.target.value)}
-        >
-          <option value="All">All Subjects</option>
-          {currentUser?.class === 'B.Tech' ? (
-            <>
-              <option value="M1">Engineering Mathematics – M1</option>
-              <option value="M2">Engineering Mathematics – M2</option>
-              <option value="M3">Engineering Mathematics – M3</option>
-              <option value="Engineering Graphics">Engineering Graphics</option>
-              <option value="C Programming">C Programming</option>
-              <option value="C++">C++ (Object Oriented)</option>
-              <option value="Java">Java Programming</option>
-              <option value="Python">Python Programming</option>
-              <option value="SQL">SQL / Database Management</option>
-              <option value="PLSQL">PL/SQL (Oracle)</option>
-              <option value="C#">C# (.NET)</option>
-              <option value="Data Structures">Data Structures & Algorithms</option>
-              <option value="DBMS">DBMS (Database Systems)</option>
-              <option value="Operating Systems">Operating Systems</option>
-              <option value="Computer Networks">Computer Networks</option>
-              <option value="Web Development">Web Development (HTML/CSS/JS)</option>
-              <option value="React">React.js / Frontend Dev</option>
-              <option value="Node.js">Node.js / Backend Dev</option>
-              <option value="AI/ML">Artificial Intelligence / ML</option>
-              <option value="Cloud Computing">Cloud Computing (AWS/Azure)</option>
-              <option value="Software Engineering">Software Engineering</option>
-              <option value="English for Engineers">English for Engineers</option>
-            </>
-          ) : (
-            <>
-              <option value="Mathematics">Mathematics</option>
-              <option value="Physics">Physics</option>
-              <option value="Computer Science">Computer Science</option>
-              <option value="Chemistry">Chemistry</option>
-              <option value="Biology">Biology</option>
-              <option value="English">English</option>
-              <option value="Telugu">Telugu</option>
-              <option value="Hindi">Hindi</option>
-              <option value="Spanish">Spanish</option>
-              <option value="EAMCET">EAMCET (State Entrance)</option>
-              <option value="JEE">JEE (Engineering Entrance)</option>
-            </>
-          )}
-        </select>
-        <div className="flex gap-4">
-          <select 
-            className="input-field flex-1"
-            value={maxPrice}
-            onChange={(e) => setMaxPrice(Number(e.target.value))}
-          >
-            <option value="5000">Max Price (All)</option>
-            <option value="200">₹200</option>
-            <option value="500">₹500</option>
-            <option value="1000">₹1000</option>
-          </select>
-          <select 
-            className="input-field flex-1"
-            value={minRating}
-            onChange={(e) => setMinRating(Number(e.target.value))}
-          >
-            <option value="0">Min Rating</option>
-            <option value="4">4.0+</option>
-            <option value="4.5">4.5+</option>
-            <option value="4.8">4.8+</option>
-          </select>
-        </div>
-      </motion.div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6">
-          {filteredTutors.length > 0 ? filteredTutors.map(tutor => (
-            <motion.div 
-              key={tutor.id} 
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="bg-white rounded-2xl md:rounded-3xl p-4 md:p-6 atelier-card-shadow flex flex-col hover:scale-[1.01] transition-all border border-primary/5 min-h-[400px]"
-            >
-              <div className="flex items-start justify-between mb-4 md:mb-6">
-                <Avatar src={tutor.avatar} size="md" mdSize="lg" initials={(tutor.name || '??').substring(0, 2).toUpperCase()} />
-                <div className="flex flex-col items-end">
-                  <span className="text-secondary text-sm md:text-lg font-black">₹{getEffectivePrice(tutor.price)}/hr</span>
-                  <p className="text-[8px] font-black uppercase tracking-widest text-primary/30 mt-0.5">Starting Price</p>
-                </div>
-              </div>
-              
-              <div className="flex-1 min-w-0">
-                <h3 className="text-lg md:text-xl font-serif font-bold italic text-on-surface mb-2 leading-tight truncate">{tutor.name}</h3>
-                <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
-                  {(tutor as any).subjects?.slice(0, 2).map((s: string) => (
-                    <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
-                  ))}
-                  <span className="pill-tag bg-accent/5 text-accent/70 !text-[8px]">{(tutor as any).experience || 'Expert'} Exp</span>
-                </div>
-                <p className="text-primary/60 text-[10px] md:text-xs leading-relaxed mb-4 line-clamp-2">{(tutor as any).bio}</p>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <div className="flex gap-2">
-                  {(() => {
-                    const hasAttendedDemo = bookings.some(b => b.tutorId === tutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                    const hasBookedDemo = bookings.some(b => b.tutorId === tutor.id && b.type === 'demo' && b.status !== 'cancelled');
-
-                    if (!hasBookedDemo) {
-                      return (
-                        <button 
-                          onClick={() => { setSelectedTutor(tutor); setBookingType('demo'); setIsBookingModalOpen(true); }}
-                          className="flex-1 bg-accent/10 text-accent py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-accent hover:text-white transition-all text-center"
-                        >
-                          Book Free Demo
-                        </button>
-                      );
-                    } else {
-                      return (
-                        <button 
-                          onClick={() => { setSelectedTutor(tutor); setBookingType('paid'); setIsBookingModalOpen(true); setBookingPlan('monthly'); setBookingDuration('1'); }}
-                          className="flex-1 bg-primary text-background py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:scale-[1.02] active:scale-[0.98] transition-all"
-                        >
-                          {hasAttendedDemo ? 'Pay for Next Session' : 'Enroll Now'}
-                        </button>
-                      );
-                    }
-                  })()}
-                </div>
-                <button 
-                  onClick={() => openChat(tutor.id)}
-                  className="w-full flex items-center justify-center gap-2 border border-primary/10 text-primary py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-primary/5 transition-all"
-                >
-                  <MessageSquare size={14} /> Chat with Tutor
-                </button>
-              </div>
-              
-              <div className="mt-4 md:mt-6 pt-4 border-t border-primary/5 flex items-center justify-between">
-                <div className="flex items-center gap-1.5 text-primary/40 font-bold uppercase tracking-widest text-[8px]">
-                  <CheckCircle2 size={10} className="text-emerald-500" />
-                  Verified
-                </div>
-                <div className="flex items-center gap-1 text-accent font-black px-2 py-1 rounded-full border border-accent/10">
-                  <Star size={12} fill="currentColor" />
-                  <span className="text-xs md:text-sm">{getReputation(tutor.id, tutor.reviews || []).rating.toFixed(1)}</span>
-                </div>
-              </div>
-            </motion.div>
-          )) : (
-            <div className="col-span-full text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
-              <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">No tutors found</p>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openChat }: { 
-  selectedTutor: Tutor | null, 
-  setView: (view: View) => void, 
-  setIsBookingModalOpen: (open: boolean) => void,
-  openChat: (tutorId: string) => void
-}) => {
-  if (!selectedTutor) return <div className="text-center py-20 font-bold opacity-20 uppercase tracking-widest">Tutor not found</div>;
-    return (
-      <motion.div 
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        className="max-w-5xl mx-auto space-y-12"
-      >
-        <button onClick={() => setView('find-tutors')} className="flex items-center gap-3 text-primary/40 font-bold uppercase tracking-widest text-xs hover:text-primary transition-colors">
-          <ArrowLeft size={16} /> Back to Search
-        </button>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 md:gap-16">
-          <div className="lg:col-span-2 space-y-8 md:space-y-16">
-            <section className="flex flex-col sm:flex-row gap-8 md:gap-12 items-center sm:items-start text-center sm:text-left">
-              <Avatar src={selectedTutor.avatar} size="lg" mdSize="xl" className="w-32 h-32 md:w-40 md:h-40" />
-              <div className="flex-1 space-y-4 md:space-y-6">
-                <div>
-                  <h1 className="text-3xl md:text-5xl font-serif font-bold italic tracking-tight">{selectedTutor.name}</h1>
-                  <div className="flex flex-wrap items-center justify-center sm:justify-start gap-4 md:gap-6 mt-3 md:mt-4">
-                    <div className="flex items-center gap-2 text-accent font-bold">
-                      <Star size={16} fill="currentColor" /> {selectedTutor.rating}
-                    </div>
-                    {selectedTutor.experience !== 'Fresher' && (
-                      <>
-                        <span className="hidden sm:inline text-primary/10">|</span>
-                        <span className="text-primary/40 text-[10px] md:text-xs font-bold uppercase tracking-widest">{selectedTutor.experience} Experience</span>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
-                  <div>
-                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Subjects</p>
-                    <div className="flex flex-wrap justify-center sm:justify-start gap-2">
-                      {selectedTutor.subjects.map(s => (
-                        <span key={s} className="pill-tag text-[8px] md:text-[9px]">{s}</span>
-                      ))}
-                    </div>
-                  </div>
-                  <div>
-                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Next Available</p>
-                    <p className="text-xs md:text-sm font-bold">
-                      {(() => {
-                        if (!selectedTutor?.availability || selectedTutor.availability.length === 0) return 'Flexible';
-                        const now = new Date();
-                        const currentMins = now.getHours() * 60 + now.getMinutes();
-                        const futureToday = selectedTutor.availability
-                          .map(time => ({ time, mins: parseTime(time) }))
-                          .filter(slot => slot.mins > currentMins + 60)
-                          .sort((a, b) => a.mins - b.mins);
-                        if (futureToday.length > 0) return `${futureToday[0].time} Today`;
-                        const sorted = [...selectedTutor.availability].sort((a, b) => parseTime(a) - parseTime(b));
-                        return sorted.length > 0 ? `${sorted[0]} Tomorrow` : 'No availability';
-                      })()}
-                    </p>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest">About the Tutor</p>
-                  <p className="text-primary/70 leading-relaxed text-base md:text-lg font-medium">{selectedTutor.bio}</p>
-                </div>
-              </div>
-            </section>
-
-            <section>
-              <div className="bg-primary p-6 md:p-10 rounded-[2rem] md:rounded-[3rem] text-background mb-8 md:mb-12 shadow-2xl relative overflow-hidden group">
-                <div className="absolute top-0 right-0 w-32 h-32 md:w-64 md:h-64 bg-white/5 rounded-full -mr-16 -mt-16 group-hover:scale-110 transition-transform duration-700" />
-                <div className="relative z-10">
-                  <p className="text-background/40 text-[9px] md:text-[10px] font-bold uppercase tracking-[0.2em] mb-4 md:mb-6">Overall Student Satisfaction</p>
-                  <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 md:gap-0">
-                    <div>
-                      <div className="flex items-baseline gap-2 mb-2">
-                        <span className="text-5xl md:text-7xl font-serif font-black italic tracking-tighter">
-                          {getReputation(selectedTutor.id, selectedTutor.reviews || []).rating.toFixed(1)} / 5.0
-                        </span>
-                      </div>
-                      <p className="text-background/50 text-[10px] md:text-xs font-medium">
-                        Based on {getReputation(selectedTutor.id, selectedTutor.reviews || []).count} total reviews
-                      </p>
-                    </div>
-                    <div className="flex flex-col items-end gap-3">
-                      <div className="flex text-amber-300 gap-1 tooltip" title="Excellent Rating">
-                        {[1, 2, 3, 4, 5].map((i) => (
-                          <Star key={i} size={20} fill={i <= Math.round(getMockRating(selectedTutor.id)) ? "currentColor" : "none"} strokeWidth={2.5} />
-                        ))}
-                      </div>
-                      <div className="px-4 py-2 bg-white/10 rounded-full border border-white/10">
-                        <p className="text-[8px] md:text-[9px] font-black uppercase tracking-[0.15em] text-white">Next review prompt in 2 weeks</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <h3 className="text-xl md:text-2xl font-serif font-bold italic mb-6 md:mb-8">Feedback Stream</h3>
-              <div className="space-y-6 md:space-y-8">
-                {(selectedTutor.reviews || []).length > 0 ? (selectedTutor.reviews || []).map(review => (
-                  <div key={review.id} className="p-6 md:p-8 bg-white/40 backdrop-blur-md rounded-[1.5rem] md:rounded-[2rem] border border-primary/5">
-                    <div className="flex items-center justify-between mb-3 md:mb-4">
-                      <div className="flex items-center gap-3">
-                        <Avatar src="" size="sm" initials={review.studentName?.charAt(0) || 'S'} />
-                        <h5 className="font-bold text-base md:text-lg text-black">{review.studentName}</h5>
-                      </div>
-                      <span className="text-[9px] md:text-[10px] font-bold text-black/40 uppercase tracking-widest">{review.date}</span>
-                    </div>
-                    <div className="flex items-center gap-1 text-amber-400 mb-3 md:mb-4">
-                      {[...Array(5)].map((_, i) => (
-                        <Star key={i} size={12} fill={i < review.rating ? 'currentColor' : 'none'} />
-                      ))}
-                    </div>
-                    <p className="text-black italic font-medium text-sm md:text-base">"{review.comment}"</p>
-                  </div>
-                )) : (
-                  <div className="py-12 md:py-16 bg-white/20 rounded-[2rem] border-2 border-dashed border-primary/5 text-center">
-                    <Quote size={32} className="mx-auto text-primary/10 mb-4" />
-                    <p className="text-primary/30 font-bold uppercase tracking-widest text-[10px] md:text-xs">Incoming Feedback from {getMockCount(selectedTutor.id)}+ Students</p>
-                  </div>
-                )}
-              </div>
-            </section>
-          </div>
-
-          <div className="space-y-6 md:space-y-8">
-            <section className="p-8 md:p-10 bg-primary text-background rounded-[2rem] md:rounded-[3rem] shadow-2xl">
-              <p className="text-background/50 text-[9px] md:text-[10px] font-bold uppercase tracking-widest mb-2">Investment</p>
-              <div className="flex items-baseline gap-2">
-                <span className="text-4xl md:text-5xl font-serif font-bold italic">₹{getEffectivePrice(selectedTutor.price)}</span>
-                <span className="text-background/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/ hour</span>
-              </div>
-              <div className="flex flex-col gap-4 mt-6 md:mt-8">
-                {(() => {
-                  const hasAttendedDemo = bookings.some(b => b.tutorId === selectedTutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                  const hasBookedDemo = bookings.some(b => b.tutorId === selectedTutor.id && b.type === 'demo' && b.status !== 'cancelled');
-
-                  if (!hasBookedDemo) {
-                    return (
-                      <button 
-                        onClick={() => { setBookingType('demo'); setIsBookingModalOpen(true); }}
-                        className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
-                      >
-                        Book Free Demo
-                      </button>
-                    );
-                  } else {
-                    return (
-                      <button 
-                        onClick={() => { setBookingType('paid'); setBookingDuration('1'); setIsBookingModalOpen(true); }}
-                        className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
-                      >
-                        {hasAttendedDemo ? 'Complete Enrollment' : 'Become a Paid Student'}
-                      </button>
-                    );
-                  }
-                })()}
-              </div>
-              <button 
-                onClick={() => openChat(selectedTutor.id)}
-                className="w-full mt-3 md:mt-4 bg-primary/10 text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-primary/20 transition-all border border-background/10 text-sm md:text-base"
-              >
-                Message Tutor
-              </button>
-            </section>
-
-            <section className="p-8 md:p-10 bg-white/40 backdrop-blur-md rounded-[2rem] md:rounded-[3rem] border border-primary/5">
-              <h3 className="text-base md:text-lg font-bold mb-4 md:mb-6">Availability</h3>
-              <div className="grid grid-cols-2 gap-2 md:gap-3">
-                {selectedTutor.availability.map(time => (
-                  <button key={time} className="py-2 md:py-3 px-3 md:px-4 rounded-lg md:rounded-xl border border-primary/10 text-[9px] md:text-[10px] font-bold uppercase tracking-widest hover:bg-primary hover:text-background transition-all">
-                    {time}
-                  </button>
-                ))}
-              </div>
-              <p className="text-[9px] md:text-[10px] text-primary/30 mt-4 md:mt-6 text-center font-bold uppercase tracking-widest">All times are local</p>
-            </section>
-          </div>
-        </div>
-      </motion.div>
-    );
-  };
-
-const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView, setSelectedTutor, tutors, startSession, parseTime }: { 
-  bookings: Booking[], 
-  setBookings: (bookings: Booking[]) => void,
-  openChat: (tutorId: string) => void, 
-  onReschedule: (booking: Booking) => void,
-  setView: (view: View) => void,
-  setSelectedTutor: (tutor: Tutor | null) => void,
-  tutors: Tutor[],
-  startSession: (id: string) => void,
-  parseTime: (time: string) => number
-}) => {
-    const [tab, setTab] = useState<'all' | 'confirmed' | 'pending' | 'completed' | 'cancel'>('all');
-    
-    const filteredBookings = bookings.filter(b => {
-      if (tab === 'all') return true;
-      if (tab === 'confirmed') return b.status === 'confirmed' && b.attendance_status !== 'attended';
-      if (tab === 'pending') return b.status === 'pending';
-      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2);
-      if (tab === 'cancel') return b.status === 'cancelled';
-      return true;
-    });
-
-    return (
-      <div className="space-y-12">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 md:gap-8">
-          <motion.div 
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="flex bg-primary/5 p-1 rounded-xl md:p-1.5 md:rounded-2xl w-full sm:w-fit overflow-x-auto no-scrollbar"
-          >
-            {['all', 'confirmed', 'pending', 'completed', 'cancel'].map(t => (
-              <button 
-                key={t}
-                onClick={() => setTab(t as any)}
-                className={`flex-1 sm:flex-none px-4 md:px-8 py-2 md:py-3 rounded-lg md:rounded-xl text-[8px] md:text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${tab === t ? 'bg-primary text-background shadow-xl' : 'text-primary/40 hover:bg-primary/5'}`}
-              >
-                {t === 'cancel' ? 'Cancelled' : t}
-              </button>
-            ))}
-          </motion.div>
-        </div>
-
-        {tab === 'completed' && (
-          <motion.div 
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-primary/5 border border-primary/10 rounded-2xl p-6 md:p-8 flex items-center justify-between gap-6"
-          >
-            <div>
-              <h3 className="text-lg md:text-xl font-bold font-serif italic mb-1">Course Progress</h3>
-              <p className="text-[10px] md:text-xs text-primary/50 font-bold uppercase tracking-widest">Attendance Tracking</p>
-            </div>
-            <div className="flex items-end gap-3 text-primary">
-              <span className="text-3xl md:text-5xl font-black">{bookings.filter(b => (b.attendance_status === 'attended' || b.status === 'completed') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2)).length}</span>
-              <span className="text-lg md:text-xl font-bold mb-1 md:mb-2 opacity-50">/ {currentUser?.totalSessions || 30}</span>
-              <span className="text-[10px] md:text-xs font-bold mb-2 md:mb-3 opacity-50 uppercase tracking-widest ml-2">Sessions Ended</span>
-            </div>
-          </motion.div>
-        )}
-
-        <div className="space-y-4 md:space-y-6">
-          {filteredBookings.length > 0 ? filteredBookings.map((booking, i) => (
-            <motion.div 
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: i * 0.05 }}
-              key={booking.id} 
-              className="course-card p-6 md:p-8 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-12"
-            >
-              <div className="flex items-center gap-4 md:gap-8 min-w-[240px]">
-                <Avatar 
-                  src={((tutors || []).find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId))?.avatar || ''} 
-                  size="md" 
-                  mdSize="lg" 
-                  initials={(booking.tutorName || 'Tutor').charAt(0).toUpperCase()}
-                />
-                <div>
-                  <h4 className="font-bold text-lg md:text-xl truncate max-w-[160px]">{booking.tutorName}</h4>
-                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest">{booking.subject}</p>
-                </div>
-              </div>
-
-              <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-8 border-t md:border-t-0 md:border-l border-primary/5 pt-4 md:pt-0 md:pl-12">
-                <div className="flex items-center gap-3 text-primary/60">
-                  <div className="p-2 rounded-lg bg-accent/5 text-accent"><Calendar size={16} /></div>
-                  <div>
-                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Date</p>
-                    <p className="text-xs md:text-sm font-bold text-on-surface">{booking.date}</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 text-primary/60">
-                  <div className="p-2 rounded-lg bg-accent/5 text-accent"><Clock size={16} /></div>
-                  <div>
-                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Time & Duration</p>
-                    <p className="text-xs md:text-sm font-bold text-on-surface">
-                      {booking.status === 'completed' || booking.attendance_status === 'attended' ? (
-                        <span className="text-slate-500 italic opacity-60">Session Ended</span>
-                      ) : (
-                        `${booking.time} • ${booking.duration && booking.duration.toLowerCase().includes('hr') ? booking.duration : `${booking.duration || '1'} Hr`}`
-                      )}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex flex-col items-end gap-3 md:min-w-[200px] border-t md:border-t-0 border-primary/5 pt-4 md:pt-0">
-                <div className="flex items-center gap-2">
-                  <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
-                    booking.status === 'confirmed' ? 'bg-emerald-50 text-emerald-600' :
-                    booking.status === 'pending' ? 'bg-amber-50 text-amber-600' :
-                    booking.status === 'completed' ? 'bg-primary/5 text-primary/40' :
-                    booking.isRescheduled || booking.status === 'rescheduled' ? 'bg-blue-50 text-blue-600' :
-                    'bg-rose-50 text-rose-600'
-                  }`}>
-                    {booking.isRescheduled || booking.status === 'rescheduled' ? 'Rescheduled' : booking.status}
-                  </span>
-                  
-                    {((booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && booking.tutorJoined && booking.studentJoined && booking.topic) ? (
-                      <span className="px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center gap-1.5">
-                        <CheckCircle size={10} /> Attended
-                      </span>
-                    ) : (booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && (
-                      <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
-                        booking.attendance_status === 'attended' || booking.attendance_status === 'pending'
-                          ? 'bg-blue-50 text-blue-600' 
-                          : 'bg-red-50 text-red-600'
-                      }`}>
-                        {booking.attendance_status === 'not_attended' ? 'Not Attended' : 'Attended'}
-                      </span>
-                    )}
-                  </div>
-
-                  {booking.topic && (
-                    <div className="mt-2 text-[10px] font-bold text-on-surface/60 bg-primary/5 px-3 py-1.5 rounded-lg border border-primary/5 italic truncate max-w-[200px]">
-                      Topic: {booking.topic}
-                    </div>
-                  )}
-
-                <div className="flex items-center gap-2">
-                  {booking.status === 'pending' && (
-                    <button 
-                      onClick={async () => {
-                        try {
-                          await updateDoc(doc(db, 'bookings', booking.id), { status: 'cancelled' });
-                          alert('Session cancelled successfully');
-                        } catch (e) {
-                          console.error("Error cancelling booking:", e);
-                        }
-                      }}
-                      className="px-4 py-2 bg-rose-50 text-rose-500 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all"
-                    >
-                      Cancel
-                    </button>
-                  )}
-
-                  {booking.status === 'confirmed' && (() => {
-                    const now = new Date();
-                    const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                    const isToday = booking.date === todayStr || booking.date === isoToday;
-                    
-                    const sessionMins = parseTime(booking.time);
-                    const nowMins = now.getHours() * 60 + now.getMinutes();
-                    const diffMins = sessionMins - nowMins;
-                    
-                    const durationHrs = parseFloat(booking.duration || '1');
-                    const durationMins = durationHrs * 60;
-                    
-                    const isActive = (isToday && diffMins <= 10 && diffMins >= -(durationMins)) || booking.status === 'live';
-                    const isCompleted = isToday && diffMins < -(durationMins);
-                    
-                    if (isActive) {
-                      return (
-                        <button 
-                          onClick={() => startSession(booking.id)}
-                          className="px-6 py-2 bg-blue-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:scale-105 transition-transform shadow-lg shadow-blue-500/20 animate-pulse flex items-center justify-center gap-2"
-                        >
-                          <Video size={14} /> Join Now
-                        </button>
-                      );
-                    }
-                    if (isCompleted) {
-                      return (
-                        <button disabled className="px-6 py-2 bg-slate-100 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest cursor-not-allowed border border-slate-200 flex items-center justify-center gap-1.5 opacity-70">
-                          <CheckCircle size={14} /> Session Ended
-                        </button>
-                      );
-                    }
-                    return (
-                      <button disabled className="px-6 py-2 bg-primary/5 text-primary/30 rounded-xl text-[10px] font-bold uppercase tracking-widest cursor-not-allowed opacity-50">
-                        {isToday && diffMins > 10 ? 'Session Not Started' : booking.time}
-                      </button>
-                    );
-                  })()}
-
-                   {(booking.status === 'confirmed' || booking.status === 'pending') && (() => {
-                    const now = new Date();
-                    const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                    const isToday = booking.date === todayStr || booking.date === isoToday;
-                    const sessionMins = parseTime(booking.time);
-                    const nowMins = now.getHours() * 60 + now.getMinutes();
-
-                    const hasStarted = isToday && nowMins >= sessionMins;
-                    const isPast = !isToday && new Date(booking.date) < new Date(isoToday);
-
-                    if (hasStarted || isPast) return null;
-                    
-                    return (
-                      <button 
-                        onClick={() => onReschedule(booking)}
-                        className="w-10 h-10 rounded-full bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-background transition-all"
-                        title="Reschedule"
-                      >
-                        <Calendar size={16} />
-                      </button>
-                    );
-                  })()}
-                </div>
-              </div>
-            </motion.div>
-          )) : (
-            <div className="text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
-              <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">No sessions found in {tab} view</p>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-const ProgressTrackerView = ({ setView, bookings }: { setView: (view: View) => void, bookings: Booking[] }) => {
+function ProgressTrackerView({ setView, bookings }: { setView: (view: View) => void, bookings: Booking[] }) {
     const activeBookings = bookings.filter(b => b.status !== 'cancelled');
     const bookedSubjects = Array.from(new Set(activeBookings.map(b => b.subject)));
     const attendedSessions = bookings.filter(b => b.attendance_status === 'attended');
@@ -3457,8 +2424,11 @@ const ProgressTrackerView = ({ setView, bookings }: { setView: (view: View) => v
       const subSessions = bookings.filter(b => b.subject === sub);
       const attended = subSessions.filter(b => b.attendance_status === 'attended').length;
       const latest = subSessions.length > 0 ? subSessions[0] : null;
-      const limit = latest?.plan === 'course_45' ? 45 : latest?.plan === 'course_60' ? 60 : latest?.plan === 'monthly' ? 20 : 1;
-      const progress = Math.min(Math.round((attended / limit) * 100) + 10, 100);
+      const limit = latest?.plan === 'course_45' ? 45 : 
+                    latest?.plan === 'course_60' ? 60 : 
+                    latest?.plan === 'monthly' ? 26 : 
+                    (latest?.plan === 'subscription' || latest?.plan === 'course') ? 78 : 12;
+      const progress = Math.min(Math.round((attended / limit) * 100), 100);
       
       return {
         id: sub,
@@ -3673,7 +2643,7 @@ const ProgressTrackerView = ({ setView, bookings }: { setView: (view: View) => v
     );
   };
 
-const ReviewsView = ({ bookings, tutors, currentUser }: { bookings: Booking[], tutors: Tutor[], currentUser: StudentProfile | null }) => {
+function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation }: { bookings: Booking[], tutors: Tutor[], currentUser: StudentProfile | null, setBookings: any, getReputation: any }) {
     const [reviewedIds, setReviewedIds] = useState<string[]>(() => {
       const saved = localStorage.getItem('scholar_reviewed_ids');
       return saved ? JSON.parse(saved) : [];
@@ -3901,14 +2871,30 @@ const ReviewsView = ({ bookings, tutors, currentUser }: { bookings: Booking[], t
                                 setBookings(prev => prev.map(b => b.id === bId ? { ...b, reviewSubmitted: true, reviewRating: reviewForm.rating, reviewComment: reviewForm.comment } : b));
                                 setReviewedIds(prev => [...prev, bId]);
                                 localStorage.setItem('scholar_reviewed_ids', JSON.stringify([...reviewedIds, bId]));
-                              } else {
-                                await updateDoc(doc(db, 'bookings', bId), {
-                                  reviewSubmitted: true,
-                                  reviewRating: reviewForm.rating,
-                                  reviewComment: reviewForm.comment,
-                                  reviewedAt: serverTimestamp()
+                              }
+
+                              // Notify Admin and Tutor about the new review
+                              const booking = bookings.find(b => b.id === bId);
+                              if (booking) {
+                                await addDoc(collection(db, 'admin_notifications'), {
+                                  type: 'Review Received',
+                                  title: 'New Tutor Review',
+                                  message: `${currentUser?.name} rated ${booking.tutorName} ${reviewForm.rating}/5 stars.`,
+                                  time: serverTimestamp(),
+                                  read: false
+                                });
+
+                                await addDoc(collection(db, 'tutor_notifications'), {
+                                  tutorId: booking.tutorId,
+                                  type: 'update',
+                                  title: 'New Feedback Received',
+                                  description: `You received a ${reviewForm.rating}-star review from ${currentUser?.name}.`,
+                                  time: 'Just now',
+                                  read: false,
+                                  createdAt: serverTimestamp()
                                 });
                               }
+
                               setReviewForm({ bookingId: null, rating: 0, comment: '' });
                             } catch (e) {
                                console.error(e);
@@ -4013,7 +2999,7 @@ const ReviewsView = ({ bookings, tutors, currentUser }: { bookings: Booking[], t
     );
   };
 
-const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view: View) => void, currentUser: StudentProfile | null, setCurrentUser: (user: StudentProfile | null) => void }) => {
+function SettingsView({ setView, currentUser, setCurrentUser, currentTier, bookings, notifyTutorsOfPlanUpdate, effectiveSubscription }: { setView: (view: View) => void, currentUser: StudentProfile | null, setCurrentUser: (user: StudentProfile | null) => void, currentTier: string, bookings: Booking[], notifyTutorsOfPlanUpdate: any, effectiveSubscription: any }) {
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [pwdStatus, setPwdStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState('');
@@ -4024,13 +3010,18 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
     mobile: currentUser?.mobile || '',
     class: currentUser?.class || '',
     board: currentUser?.board || '',
-    email: currentUser?.email || ''
+    email: currentUser?.email || '',
+    photoURL: currentUser?.photoURL || ''
   });
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   const [prefState, setPrefState] = useState({
     reminders: currentUser?.notifications?.reminders ?? true,
     messages: currentUser?.notifications?.messages ?? true,
-    updates: currentUser?.notifications?.updates ?? true
+    updates: currentUser?.notifications?.updates ?? true,
+    push: currentUser?.notifications?.push ?? true
   });
 
   const [passwords, setPasswords] = useState({
@@ -4051,12 +3042,14 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
         mobile: currentUser.mobile || '',
         class: currentUser.class || '',
         board: currentUser.board || '',
-        email: currentUser.email || ''
+        email: currentUser.email || '',
+        photoURL: currentUser.photoURL || ''
       });
       setPrefState({
         reminders: currentUser.notifications?.reminders ?? true,
         messages: currentUser.notifications?.messages ?? true,
-        updates: currentUser.notifications?.updates ?? true
+        updates: currentUser.notifications?.updates ?? true,
+        push: currentUser.notifications?.push ?? true
       });
     }
   }, [currentUser?.email]);
@@ -4065,37 +3058,88 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
+  const handlePhotoClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 2 * 1024 * 1024) {
+        alert("Image should be less than 2MB");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64String = reader.result as string;
+        setPreviewUrl(base64String);
+        setFormData(prev => ({ ...prev, photoURL: base64String }));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
   const handleSaveProfile = async () => {
-    if (!auth.currentUser) return;
+    // Determine the ID to use (Real UID or test email as ID)
+    const userId = auth.currentUser?.uid || currentUser?.id || (currentUser?.email === 'test@eduqra.com' ? 'test_user_id' : null);
+    
+    if (!userId && currentUser?.email !== 'test@eduqra.com') {
+      alert("Session expired. Please log in again.");
+      setView('login');
+      return;
+    }
+
+    if (!formData.name.trim() || !formData.mobile.trim()) {
+      setStatus('error');
+      alert("please fill in your name and mobile number");
+      setTimeout(() => setStatus('idle'), 3000);
+      return;
+    }
+
     setStatus('saving');
     setIsSaving(true);
     
     try {
-      const userRef = doc(db, 'students', auth.currentUser.uid);
       const updatedData = {
         name: formData.name,
         mobile: formData.mobile,
         class: formData.class,
-        board: formData.board
+        board: formData.board,
+        photoURL: formData.photoURL
       };
-      await setDoc(userRef, updatedData, { merge: true });
+
+      // Only attempt Firestore write if NOT a mock user without a real UID
+      if (userId && userId !== 'test_user_id') {
+        const userRef = doc(db, 'students', userId);
+        await setDoc(userRef, updatedData, { merge: true });
+      } else {
+        console.log("Mock User Update: Changes applied locally.");
+      }
+
+      // Always update local state
       setCurrentUser({ ...currentUser, ...updatedData } as any);
       setStatus('success');
       setTimeout(() => setStatus('idle'), 2000);
     } catch (e) {
       console.error('Save failed:', e);
       setStatus('error');
+      alert("Failed to save changes. Please check your connection.");
     } finally {
       setIsSaving(false);
     }
   };
 
   const handleSavePrefs = async () => {
-    if (!auth.currentUser) return;
+    const uid = auth.currentUser?.uid || currentUser?.id;
+    if (!uid) {
+      alert("You must be logged in to save preferences.");
+      return;
+    }
+    
     setStatus('saving');
     
     try {
-      const userRef = doc(db, 'students', auth.currentUser.uid);
+      const userRef = doc(db, 'students', uid);
       await setDoc(userRef, { notifications: prefState }, { merge: true });
       setCurrentUser({ ...currentUser!, notifications: prefState });
       setStatus('success');
@@ -4103,12 +3147,19 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
     } catch (e) {
       console.error('Error updating preferences:', e);
       setStatus('error');
+      alert("Failed to save preferences. Please try again.");
     }
   };
 
   const handleUpdatePassword = async () => {
     const { updatePassword, EmailAuthProvider, reauthenticateWithCredential } = await import('firebase/auth');
     if (!auth.currentUser || !auth.currentUser.email) return;
+
+    if (!passwords.current || !passwords.new || !passwords.confirm) {
+      setErrorMessage("All fields are required");
+      setPwdStatus('error');
+      return;
+    }
 
     if (passwords.new !== passwords.confirm) {
       setErrorMessage("Passwords do not match");
@@ -4134,8 +3185,13 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
       setTimeout(() => setPwdStatus('idle'), 3000);
     } catch (e: any) {
       console.error('Password update failed:', e);
-      setErrorMessage(e.message || "Failed to update password. Check current password.");
+      const msg = e.code === 'auth/wrong-password' ? "Current password is incorrect" : (e.message || "Failed to update password");
+      setErrorMessage(msg);
       setPwdStatus('error');
+      setTimeout(() => {
+        setPwdStatus('idle');
+        setErrorMessage('');
+      }, 5000);
     }
   };
 
@@ -4143,17 +3199,35 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
     <motion.div 
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className="max-w-3xl mx-auto space-y-12"
+      className="max-w-lg mx-auto space-y-6"
     >
       {/* Profile Section */}
-      <section className="p-6 md:p-10 bg-white/40 backdrop-blur-md rounded-[2rem] md:rounded-[3rem] border border-primary/5 space-y-8 md:space-y-10 shadow-2xl">
+      <section className="p-5 md:p-8 bg-white/40 backdrop-blur-md rounded-[2rem] border border-primary/5 space-y-6 md:space-y-7 shadow-2xl">
         <h3 className="text-xl md:text-2xl font-serif font-bold italic">My Profile</h3>
-        <div className="flex flex-col sm:flex-row items-center gap-6 md:gap-8 pb-8 md:pb-10 border-b border-primary/5">
-          <Avatar src={currentUser?.photoURL} initials={currentUser?.name?.charAt(0) || 'S'} size="lg" mdSize="xl" className="w-24 h-24 md:w-32 md:h-32" />
-          <button className="text-[10px] font-bold uppercase tracking-widest text-accent hover:underline">Change Photo</button>
+        <div className="flex flex-col sm:flex-row items-center gap-6 md:gap-8 pb-6 md:pb-8 border-b border-primary/5">
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            onChange={handleFileChange} 
+            accept="image/*" 
+            className="hidden" 
+          />
+          <Avatar 
+            src={previewUrl || currentUser?.photoURL} 
+            initials={currentUser?.name?.charAt(0) || 'S'} 
+            size="md" mdSize="lg" 
+            className="w-20 h-20 md:w-24 md:h-24" 
+          />
+          <button 
+            type="button"
+            onClick={handlePhotoClick}
+            className="text-[10px] font-bold uppercase tracking-widest text-accent hover:underline"
+          >
+            Change Photo
+          </button>
         </div>
         
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 md:gap-8">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 md:gap-6">
           <div className="space-y-3">
             <label className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Full Name</label>
             <input 
@@ -4174,7 +3248,7 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
           </div>
         </div>
         
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 md:gap-8">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 md:gap-6">
           <div className="space-y-3">
             <label className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Class</label>
             <input 
@@ -4209,27 +3283,34 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
           />
         </div>
 
-        <div className="pt-8 border-t border-primary/5 flex items-center gap-4">
+        <div className="pt-6 border-t border-primary/5 flex items-center gap-4">
           <Button 
-             className="rounded-full px-12 py-4 shadow-xl shadow-primary/20 flex items-center gap-2"
+             className={`rounded-full px-12 py-4 shadow-xl transition-all duration-300 flex items-center gap-2 ${status === 'success' ? 'bg-green-500 hover:bg-green-600' : 'shadow-primary/20'}`}
              onClick={handleSaveProfile}
-             disabled={isSaving}
+             disabled={isSaving || status === 'success'}
           >
-            <Save size={16} />
-            Update Profile
+            {status === 'saving' ? (
+              <RefreshCw size={16} className="animate-spin" />
+            ) : status === 'success' ? (
+              <Check size={16} />
+            ) : (
+              <Save size={16} />
+            )}
+            {status === 'saving' ? 'Updating...' : status === 'success' ? 'Profile Updated' : 'Update Profile'}
           </Button>
-          {status === 'success' && <span className="text-green-500 text-[10px] font-black uppercase tracking-widest">Saved Successfully!</span>}
+          {status === 'error' && <span className="text-red-500 text-[10px] font-black uppercase tracking-widest">Update Failed!</span>}
         </div>
       </section>
 
       {/* Notifications Section */}
-      <section className="p-6 md:p-10 bg-white/40 backdrop-blur-md rounded-[2rem] md:rounded-[3rem] border border-primary/5 space-y-6 md:space-y-8 shadow-xl">
+      <section className="p-5 md:p-8 bg-white/40 backdrop-blur-md rounded-[2rem] border border-primary/5 space-y-5 md:space-y-6 shadow-xl">
         <h3 className="text-xl md:text-2xl font-serif font-bold italic">Notification Preferences</h3>
         <div className="space-y-4">
           {[
             { id: 'reminders', label: 'Booking Reminders', desc: 'Get notified about upcoming sessions' },
             { id: 'messages', label: 'New Messages', desc: 'Receive alerts when tutors message you' },
-            { id: 'updates', label: 'Platform Updates', desc: 'Stay informed about new features and tutors' }
+            { id: 'updates', label: 'Platform Updates', desc: 'Stay informed about new features and tutors' },
+            { id: 'push', label: 'Push Notifications', desc: 'Receive background alerts in browser' }
           ].map((pref) => (
             <div key={pref.id} className="flex items-center justify-between p-4 md:p-6 bg-white/40 rounded-xl md:rounded-2xl border border-primary/5">
               <div className="pr-4">
@@ -4238,11 +3319,15 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
               </div>
               <button 
                 onClick={() => setPrefState(prev => ({ ...prev, [pref.id]: !prev[pref.id as keyof typeof prefState] }))}
-                className={`w-10 h-5 md:w-12 md:h-6 rounded-full transition-colors relative shrink-0 ${prefState[pref.id as keyof typeof prefState] ? 'bg-primary' : 'bg-primary/10'}`}
+                className={`w-12 h-6 md:w-14 md:h-7 rounded-full transition-all duration-300 relative shrink-0 ${prefState[pref.id as keyof typeof prefState] ? 'bg-primary' : 'bg-[#D1D5DB]'}`}
               >
                 <motion.div 
-                  animate={{ x: prefState[pref.id as keyof typeof prefState] ? 'calc(100% - 1.25rem)' : '0.25rem' }}
-                  className="absolute top-0.5 md:top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                  initial={false}
+                  transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                  animate={{ 
+                    x: prefState[pref.id as keyof typeof prefState] ? (window.innerWidth < 768 ? '1.5rem' : '1.75rem') : '0.25rem' 
+                  }}
+                  className="absolute top-1 w-4 h-4 md:w-5 md:h-5 bg-white rounded-full shadow-sm"
                 />
               </button>
             </div>
@@ -4255,14 +3340,14 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
             disabled={status === 'saving'}
           >
             <Save size={14} className="mr-2" />
-            Save Preferences
+            Save Button
           </Button>
           {status === 'success' && <span className="text-green-500 text-[10px] font-black uppercase tracking-widest">Saved!</span>}
         </div>
       </section>
 
       {/* Security Section */}
-      <section className="p-6 md:p-10 bg-white/40 backdrop-blur-md rounded-[2rem] md:rounded-[3rem] border border-primary/5 space-y-6 md:space-y-8 shadow-xl">
+      <section className="p-5 md:p-8 bg-white/40 backdrop-blur-md rounded-[2rem] border border-primary/5 space-y-5 md:space-y-6 shadow-xl">
         <h3 className="text-xl md:text-2xl font-serif font-bold italic">Security & Password</h3>
         <div className="space-y-6">
           <div className="space-y-3">
@@ -4281,7 +3366,7 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
             </div>
           </div>
           
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <div className="space-y-3">
               <label className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">New Password</label>
               <div className="relative">
@@ -4316,204 +3401,3194 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
         </div>
         
         {errorMessage && (
-          <p className="text-red-500 text-[10px] font-bold uppercase tracking-widest ml-1">{errorMessage}</p>
+          <p className="text-red-500 text-[11px] font-medium ml-1 animate-in fade-in slide-in-from-top-1">{errorMessage}</p>
         )}
 
         <div className="pt-4 flex items-center gap-4">
           <Button 
-            className="w-full sm:w-auto px-10 py-4 rounded-2xl text-[10px] uppercase shadow-lg shadow-primary/10"
+            className={`w-full sm:w-auto px-12 py-4 rounded-2xl text-[10px] uppercase tracking-[0.2em] shadow-lg transition-all duration-300 ${pwdStatus === 'success' ? 'bg-green-500 hover:bg-green-600' : 'shadow-primary/10'}`}
             onClick={handleUpdatePassword}
-            disabled={pwdStatus === 'saving'}
+            disabled={pwdStatus === 'saving' || pwdStatus === 'success'}
           >
-            {pwdStatus === 'saving' ? <RefreshCw size={14} className="animate-spin mr-2" /> : <Lock size={14} className="mr-2" />}
-            Update Password
+            {pwdStatus === 'saving' ? (
+              <span className="opacity-70 animate-pulse">Updating...</span>
+            ) : pwdStatus === 'success' ? (
+              <>
+                <Check size={14} className="mr-2" />
+                Password Updated
+              </>
+            ) : (
+              <>
+                <Lock size={14} className="mr-2" />
+                Update Password
+              </>
+            )}
           </Button>
-          {pwdStatus === 'success' && <span className="text-green-500 text-[10px] font-black uppercase tracking-widest">Success!</span>}
         </div>
       </section>
-    </motion.div>
+
+      {/* Subscription Section */}
+      <section id="subscription-plans" className="p-5 md:p-8 bg-gradient-to-br from-slate-900 to-slate-800 rounded-[2rem] space-y-8 shadow-2xl relative overflow-hidden">
+         <div className="absolute top-0 right-0 w-64 h-64 bg-primary/10 rounded-full blur-3xl -mr-32 -mt-32"></div>
+         
+         <div className="relative z-10">
+            <h3 className="text-xl md:text-2xl font-serif font-bold italic text-white flex items-center gap-3">
+               <ShieldCheck className="text-primary" /> Select Your Plan
+            </h3>
+            <p className="text-xs text-slate-400 mt-2">Choose the right academic tier for your goals. All paid plans are valid for 3 months.</p>
+         </div>
+
+         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 relative z-10">
+            {(() => {
+               const cat = currentUser?.category || 'schools';
+               const plans = cat === 'schools' ? [
+                 { 
+                   tier: 'free', name: 'Basic', price: '0', 
+                   desc: 'Perfect for getting started with a single focal subject.',
+                   features: ['Single Subject Access', 'One-on-One Sessions', 'Monthly Payment Cycle', 'Platform Fee Applicable', 'No Added Extra Classes', 'Assignment Support']
+                 },
+                 { 
+                   tier: 'standard', name: 'Scholar', price: '599', 
+                   desc: 'Comprehensive support for multiple core subjects.',
+                   features: ['Up to 3 Subjects', 'One-on-One Sessions', '20% Refund Policy (10 days prior)*', 'Extra Doubt Classes', 'Tutor Notes Available', 'No Platform Fee', 'Assignments & Mock Tests']
+                 },
+                 { 
+                   tier: 'premium', name: 'Elite', price: '899', 
+                   desc: 'The ultimate academic package for complete mastery.',
+                   features: ['One-on-One Sessions', 'Up to 8 Subjects', '40% Refund Policy (10 days prior)*', 'Extra Classes Available', 'Premium Tutor Notes', 'Assignments & Mock Tests', 'No Platform Fee']
+                 }
+               ] : [
+                 { 
+                   tier: 'free', name: 'Explorer', price: '0', 
+                   desc: 'Foundational support for a specific subject.',
+                   features: ['1 Tutor Only', 'Limited Notes', 'Standard Doubt Portal Access', 'Assignments & Mock Tests (X)', 'Projects (X)']
+                 },
+                 { 
+                   tier: 'standard', name: 'Achiever', price: '599', 
+                   desc: 'Balanced support with projects and strategies.',
+                   features: ['Up to 3 Subjects', 'Projects (Coming Soon)', 'Entrance Exam Strategy (X)', 'Tutor Notes (Limited)', 'Advanced Doubt Portal']
+                 },
+                 { 
+                   tier: 'premium', name: 'Grandmaster', price: '899', 
+                   desc: 'Full-scale academic and project excellence.',
+                   features: ['Up to 8 Subjects', 'Extra Doubt Classes', 'Projects Assistance', 'Premium Tutor Notes', 'Entrance Exam Strategy Access']
+                 }
+               ];
+
+               return plans.map((p) => {
+                 const isCurrent = currentTier === p.tier;
+                 return (
+                   <div key={p.tier} className={cn(
+                     "p-6 rounded-[2rem] border transition-all flex flex-col h-full",
+                     isCurrent ? "bg-white border-primary shadow-xl scale-[1.02]" : "bg-white/5 border-white/10 hover:border-white/20"
+                   )}>
+                      <div className="mb-6">
+                         <p className={cn("text-[9px] font-black uppercase tracking-widest mb-1", isCurrent ? "text-primary" : "text-white/40")}>{p.name}</p>
+                         <div className="flex items-baseline gap-1">
+                            <span className={cn("text-2xl font-black", isCurrent ? "text-slate-900" : "text-white")}>₹{p.price}</span>
+                            <span className={cn("text-[10px] font-bold", isCurrent ? "text-slate-400" : "text-white/20")}>/ 3 months</span>
+                         </div>
+                         <p className={cn("text-[10px] font-medium leading-relaxed mt-4", isCurrent ? "text-slate-500" : "text-white/40")}>{p.desc}</p>
+                      </div>
+
+                      <div className="space-y-3 flex-1">
+                         {p.features.map((f, idx) => (
+                           <div key={idx} className="flex items-start gap-2">
+                              {f.includes('(X)') ? <X size={12} className="text-rose-400 shrink-0 mt-0.5" /> : <CheckCircle2 size={12} className={cn("shrink-0 mt-0.5", isCurrent ? "text-primary" : "text-emerald-400")} />}
+                              <span className={cn("text-[10px] font-bold", isCurrent ? "text-slate-600" : "text-white/60")}>{f.replace(' (X)', '')}</span>
+                           </div>
+                         ))}
+                      </div>
+
+                      <button 
+                        disabled={isCurrent}
+                        onClick={async () => {
+                           if (p.tier === 'free') {
+                             alert("You are already on the Free Plan. To cancel your paid plan, contact support.");
+                             return;
+                           }
+                           const subEnd = new Date();
+                           subEnd.setMonth(subEnd.getMonth() + 3);
+                           const subLimit = p.tier === 'free' ? 1 : p.tier === 'standard' ? 3 : 8;
+                           const updatedSub: SubscriptionPlan = {
+                             tier: p.tier as any,
+                             status: 'active',
+                             startDate: new Date().toISOString(),
+                             expiresAt: subEnd.toISOString(),
+                             allowedSubjects: subLimit
+                           };
+                           const uid = auth.currentUser?.uid || currentUser?.id;
+                           if (uid && uid !== 'test_user_id') {
+                             await updateDoc(doc(db, 'students', uid), { subscription: updatedSub });
+                           }
+                           setCurrentUser({ ...currentUser!, subscription: updatedSub });
+                           
+                           // 🔔 NOTIFY TUTORS
+                           notifyTutorsOfPlanUpdate(currentUser?.name || 'Student', updatedSub.tier, bookings);
+                           alert(`Congratulations! You have upgraded to ${p.name}. Your features are now unlocked.`);
+                           setView('dashboard');
+                        }}
+                        className={cn(
+                          "w-full py-3.5 rounded-xl font-black text-[9px] uppercase tracking-widest transition-all mt-8",
+                          isCurrent ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-primary text-white hover:scale-105"
+                        )}
+                      >
+                         {isCurrent ? 'Current Plan' : p.tier === 'free' ? 'Start for Free' : `Get ${p.name}`}
+                      </button>
+                   </div>
+                 );
+               });
+            })()}
+          </div>
+       </section>
+     </motion.div>
+   );
+ };
+
+const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onReschedule, tutors, currentUser, parseTime, currentTier }: { 
+  setView: (view: View) => void, 
+  bookings: Booking[], 
+  setSelectedTutor: (tutor: Tutor | null) => void, 
+  openChat: (tutorId: string, tutorName: string, avatar: string) => void, 
+  onReschedule: (booking: Booking) => void,
+  tutors: Tutor[],
+  currentUser: StudentProfile | null,
+  parseTime: (time: string) => number,
+  currentTier: 'free' | 'standard' | 'premium'
+}) => {
+  const tier = currentTier;
+  const category = currentUser?.category || (currentUser?.class === 'B.Tech' ? 'graduates' : 'schools');
+
+  const getFeatures = () => {
+    const list: { name: string; status: 'v' | 'x' }[] = [];
+
+    if (category === 'graduates') {
+      // Graduates & Colleges
+      if (tier === 'free') {
+        list.push({ name: 'Single Specialization', status: 'v' });
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: 'Industry Insights', status: 'v' });
+        list.push({ name: 'Platform Fee Applies', status: 'v' });
+        list.push({ name: 'Refunds', status: 'x' });
+        list.push({ name: 'Group Sessions', status: 'v' });
+        list.push({ name: 'Internship Leads', status: 'x' });
+      } else if (tier === 'standard') {
+        list.push({ name: 'Up to 3 Specialized Subjects', status: 'v' });
+        list.push({ name: 'One-on-One Mentoring', status: 'v' });
+        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Extra Lab Sessions', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'Group Sessions', status: 'v' });
+        list.push({ name: 'Limited Tutor Notes', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
+        list.push({ name: 'Placement Prep', status: 'x' });
+        list.push({ name: 'Projects', status: 'x' });
+      } else if (tier === 'premium') {
+        list.push({ name: 'All Semester Subjects', status: 'v' });
+        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Group Sessions Included', status: 'v' });
+        list.push({ name: 'Extra Classes + Projects', status: 'v' });
+        list.push({ name: 'Placement Prep', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'Premium Tutor Notes', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'v' });
+        list.push({ name: 'Topic wise tests', status: 'v' });
+        list.push({ name: 'Doubt Sessions', status: 'v' });
+      }
+    } else if (category === 'intermediate') {
+      // Intermediate (11-12)
+      if (tier === 'free') {
+        list.push({ name: 'Single Subject Access', status: 'v' });
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: 'Platform Fee Applicable', status: 'v' });
+        list.push({ name: 'Digital Resources', status: 'v' });
+        list.push({ name: 'Refund Policy', status: 'x' });
+        list.push({ name: 'Extra Classes', status: 'x' });
+        list.push({ name: 'Group Sessions', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
+        list.push({ name: 'Projects', status: 'x' });
+      } else if (tier === 'standard') {
+        list.push({ name: 'Up to 3 Subjects', status: 'v' });
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Extra Doubt Classes', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'Group Sessions', status: 'v' });
+        list.push({ name: 'Limited Tutor Notes', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
+        list.push({ name: 'Projects', status: 'x' });
+        list.push({ name: 'Entrance Exam Strategy', status: 'x' });
+      } else if (tier === 'premium') {
+        list.push({ name: 'All Subjects Included', status: 'v' });
+        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Extra Doubt Classes', status: 'v' });
+        list.push({ name: 'Unlimited Extra Classes', status: 'v' });
+        list.push({ name: 'Group Sessions Included', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'v' });
+        list.push({ name: 'Entrance Exam Strategy', status: 'v' });
+        list.push({ name: 'Premium Tutor Notes', status: 'v' });
+        list.push({ name: 'Projects', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+      }
+    } else {
+      // Schools (K-10)
+      if (tier === 'free') {
+        list.push({ name: 'Single Subject Access', status: 'v' });
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: 'Monthly Payment Cycle', status: 'v' });
+        list.push({ name: 'Platform Fee Applicable', status: 'v' });
+        list.push({ name: 'No Added Extra Classes', status: 'x' });
+        list.push({ name: 'Non-Refundable Plan', status: 'x' });
+        list.push({ name: 'Assignment Support', status: 'x' });
+      } else if (tier === 'standard') {
+        list.push({ name: 'Up to 3 Subjects', status: 'v' });
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Extra Doubt Classes', status: 'v' });
+        list.push({ name: 'Tutor Notes Available', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
+      } else if (tier === 'premium') {
+        list.push({ name: 'One-on-One Sessions', status: 'v' });
+        list.push({ name: 'Up to 8 Subjects', status: 'v' });
+        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Extra Classes Available', status: 'v' });
+        list.push({ name: 'Premium Tutor Notes', status: 'v' });
+        list.push({ name: 'Assignments & Mock Tests', status: 'v' });
+        list.push({ name: 'No Platform Fee', status: 'v' });
+      }
+    }
+    return list;
+  };
+
+  const features = getFeatures();
+
+  return (
+    <div className="space-y-10 md:space-y-12">
+      <div className="grid grid-cols-3 gap-4 md:gap-8">
+        {[
+          { label: 'Upcoming Sessions', value: bookings.filter(b => b.status === 'confirmed' && b.attendance_status !== 'attended').length, color: 'text-on-surface', span: 'col-span-1' },
+          { label: 'Completed Classes', value: bookings.filter(b => (b.status === 'completed' || b.attendance_status === 'attended')).length, color: 'text-on-surface', span: 'col-span-1' },
+          { label: 'Tutors Enrolled', value: new Set(bookings.map(b => b.tutorId)).size, color: 'text-on-surface', span: 'col-span-1' }
+        ].map((stat, i) => (
+          <motion.div 
+            key={stat.label}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: i * 0.1 }}
+            className={`p-4 sm:p-6 lg:p-8 bg-white/40 backdrop-blur-md rounded-3xl shadow-sm transition-all cursor-default ${stat.span}`}
+          >
+            <p className="text-[7px] md:text-[10px] font-extrabold uppercase tracking-widest text-on-surface mb-1 md:mb-2">{stat.label}</p>
+            <p className={`text-2xl md:text-5xl font-serif font-black tracking-tighter ${stat.color}`}>{stat.value}</p>
+          </motion.div>
+        ))}
+      </div>
+
+      <section>
+        <div className="flex items-center justify-between mb-6 md:mb-8">
+          <h3 className="text-xl md:text-2xl font-serif font-bold italic">Upcoming Sessions</h3>
+          <button onClick={() => setView('my-bookings')} className="px-3 py-1 bg-accent/10 text-accent text-[9px] font-extrabold uppercase tracking-widest rounded-lg hover:bg-accent hover:text-white transition-all shadow-sm">View All</button>
+        </div>
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.3 }}
+          className="space-y-4"
+        >
+          {(() => {
+            const now = new Date();
+            const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+            
+            const tomorrow = new Date(now);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = tomorrow.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            const isoTomorrow = tomorrow.getFullYear() + '-' + String(tomorrow.getMonth() + 1).padStart(2, '0') + '-' + String(tomorrow.getDate()).padStart(2, '0');
+
+            const nowMins = now.getHours() * 60 + now.getMinutes();
+
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            const yesterdayStr = yesterday.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            const isoYesterday = yesterday.getFullYear() + '-' + String(yesterday.getMonth() + 1).padStart(2, '0') + '-' + String(yesterday.getDate()).padStart(2, '0');
+
+            const filtered = bookings.filter(b => {
+              const isActive = ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status);
+              const isYesterday = b.date === yesterdayStr || b.date === isoYesterday;
+              const isToday = b.date === todayStr || b.date === isoToday;
+              const isTomorrow = b.date === tomorrowStr || b.date === isoTomorrow;
+
+              if (!isActive) return false;
+
+              // Show Yesterday/Today until class completion time
+              if (isYesterday || isToday) {
+                const sessionMins = parseTime(b.time);
+                const durationMins = parseFloat(b.duration || '1') * 60;
+                // Hide only after class end time has passed
+                return nowMins <= (sessionMins + durationMins);
+              }
+
+              // Tomorrow: show all
+              return isTomorrow;
+            }).sort((a, b) => {
+              // Sort by date then time
+              const dateA = new Date(a.date).getTime();
+              const dateB = new Date(b.date).getTime();
+              if (dateA !== dateB) return dateA - dateB;
+              return parseTime(a.time) - parseTime(b.time);
+            });
+
+            if (filtered.length === 0) return (
+              <div className="text-center py-12 md:py-20 bg-white/20 rounded-[2rem] border border-dashed border-primary/10 w-full font-bold uppercase tracking-widest text-[10px] text-primary/30">
+                No sessions for today or tomorrow
+              </div>
+            );
+
+            return (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {filtered.map(b => {
+                  const isToday = b.date === todayStr || b.date === isoToday;
+                  const sessionMins = parseTime(b.time);
+                  const diffMins = sessionMins - nowMins;
+                  const durationMins = parseFloat(b.duration || '1') * 60;
+                  const isInJoinWindow = isToday && diffMins <= 10 && nowMins <= (sessionMins + durationMins);
+                  const isLive = b.status === 'live';
+                  
+                  return (
+                  <div key={b.id} className={cn(
+                    "p-6 bg-white rounded-3xl border transition-all group relative overflow-hidden",
+                    isLive ? "border-blue-200 shadow-lg shadow-blue-100" : "border-black/5 hover:border-primary/20"
+                  )}>
+                    {/* Live indicator */}
+                    {isLive && <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-primary animate-pulse" />}
+                    
+                    <div className="flex items-center justify-between mb-4">
+                       <div className="flex items-center gap-2">
+                         <span className={cn(
+                           "text-[8px] font-black uppercase tracking-widest px-3 py-1 rounded-full",
+                           isToday ? "bg-emerald-50 text-emerald-600" : 
+                           (b.date === yesterdayStr || b.date === isoYesterday) ? "bg-rose-50 text-rose-600" : 
+                           "bg-blue-50 text-blue-600"
+                         )}>{isToday ? 'Today' : (b.date === yesterdayStr || b.date === isoYesterday) ? 'Yesterday' : 'Tomorrow'} · {b.date}</span>
+                         {isLive && <span className="text-[8px] font-black uppercase tracking-widest bg-blue-500 text-white px-2 py-0.5 rounded-full animate-pulse">LIVE</span>}
+                       </div>
+                       <span className="text-[10px] font-bold text-on-surface/40 uppercase">{b.time} · {b.duration}</span>
+                    </div>
+                    
+                    <h4 className="text-lg font-bold text-on-surface mb-1">{b.subject}</h4>
+                    <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mb-4">with {b.tutorName}</p>
+                    
+                    {/* Topic covered (if tutor has set it) */}
+                    {b.topic && (
+                      <div className="mb-4 px-3 py-2 bg-emerald-50 rounded-xl border border-emerald-100">
+                        <p className="text-[8px] font-black uppercase tracking-widest text-emerald-500 mb-0.5">Topic</p>
+                        <p className="text-xs font-bold text-emerald-700">{b.topic}</p>
+                      </div>
+                    )}
+                    
+                    {/* Action buttons */}
+                    <div className="flex items-center gap-2 mt-2">
+                      {/* Join Now button — only in join window */}
+                      {(isInJoinWindow || isLive) && (
+                        <button 
+                          onClick={() => { setView('my-bookings'); }}
+                          className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:scale-[1.02] transition-transform shadow-lg shadow-blue-500/20 animate-pulse flex items-center justify-center gap-2"
+                        >
+                          <Video size={14} /> Join Now
+                        </button>
+                      )}
+                      
+                      {/* Reschedule button — only before class starts */}
+                      {!isLive && !(isToday && nowMins >= sessionMins) && (
+                        <button 
+                          onClick={() => onReschedule(b)}
+                          className="px-4 py-2.5 bg-primary/5 text-primary rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-primary hover:text-white transition-all flex items-center gap-2 border border-primary/10"
+                        >
+                          <Calendar size={14} /> Reschedule
+                        </button>
+                      )}
+                      
+                      {/* Time indicator for sessions not in join window */}
+                      {!isInJoinWindow && !isLive && isToday && (
+                        <span className="flex-1 py-2.5 text-center text-[10px] font-bold text-primary/30 uppercase tracking-widest">
+                          Starts at {b.time} {diffMins > 0 && `(in ${diffMins}m)`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </motion.div>
+      </section>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <section className="lg:col-span-2">
+          <div className="flex items-center justify-between mb-6 md:mb-8">
+            <h3 className="text-xl md:text-2xl font-serif font-bold italic">Curriculum & Features</h3>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {features.map((f, i) => (
+              <motion.div 
+                key={i}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: i * 0.05 }}
+                className={cn(
+                  "p-5 rounded-2xl border flex items-center justify-between",
+                  f.status === 'v' ? "bg-white border-black/5" : "bg-slate-50/50 border-slate-100 grayscale opacity-60"
+                )}
+              >
+                <div className="flex items-center gap-3">
+                   <div className={cn("w-8 h-8 rounded-xl flex items-center justify-center", f.status === 'v' ? "bg-primary/5 text-primary" : "bg-slate-100 text-slate-300")}>
+                      {f.status === 'v' ? <CheckCircle size={18} /> : <X size={18} />}
+                   </div>
+                   <span className="font-bold text-sm text-on-surface">{f.name}</span>
+                </div>
+                {f.status === 'x' && <span className="text-[7px] font-black text-rose-500 uppercase tracking-tighter bg-rose-50 px-2 py-0.5 rounded-sm">Upgrade</span>}
+              </motion.div>
+            ))}
+          </div>
+        </section>
+
+        <section className="bg-primary/5 rounded-[2.5rem] p-8 border border-primary/10 self-start">
+           <div className="flex items-center gap-3 mb-6">
+              <div className="w-10 h-10 bg-primary/10 rounded-xl flex items-center justify-center text-primary">
+                 <ShieldCheck size={24} />
+              </div>
+              <h3 className="text-lg font-bold text-primary">Plan Status</h3>
+           </div>
+           
+           <div className="space-y-6">
+              <div className="p-4 bg-white rounded-2xl shadow-sm border border-black/5">
+                 <p className="text-[9px] font-black uppercase text-primary/30 tracking-widest mb-1">Current Tier</p>
+                 <p className="text-xl font-serif font-bold italic text-primary capitalize">{tier}</p>
+              </div>
+
+              <div className="space-y-3">
+                 <div className="flex justify-between items-end">
+                    <p className="text-[9px] font-black uppercase text-primary/30 tracking-widest">Tutor Availability</p>
+                    <p className="text-[10px] font-bold text-on-surface/60">
+                       {tier === 'free' ? '1 Active Tutor' : tier === 'standard' ? '3 Subjects' : 'Elite Access'}
+                    </p>
+                 </div>
+                 <div className="w-full bg-primary/10 h-2 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: tier === 'free' ? '33%' : tier === 'standard' ? '66%' : '100%' }}
+                      className="h-full bg-primary"
+                    />
+                 </div>
+                 {tier === 'free' && (
+                    <p className="text-[8px] font-bold text-slate-400 italic mt-1 leading-tight">
+                       * On Free Plan, you can only book sessions with 1 tutor at a time.
+                    </p>
+                 )}
+              </div>
+
+              <button 
+                onClick={() => {
+                  setView('settings');
+                  setTimeout(() => {
+                    document.getElementById('subscription-plans')?.scrollIntoView({ behavior: 'smooth' });
+                  }, 100);
+                }}
+                className="w-full py-4 bg-primary text-white rounded-xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:scale-105 active:scale-95 transition-all"
+              >
+                 {tier === 'premium' ? 'Manage Subscription' : 'Upgrade Account'}
+              </button>
+           </div>
+        </section>
+      </div>
+    </div>
   );
 };
 
-  const PaymentsView = ({ bookings, onPay }: { 
-    bookings: Booking[], 
-    onPay: (booking: Booking) => void 
-  }) => {
-    const pendingBookings = bookings.filter(b => b.status === 'pending');
+const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookings, setBookingType, setIsBookingModalOpen, setBookingPlan, setBookingDuration, openChat }: { 
+  setView: (view: View) => void, 
+  setSelectedTutor: (tutor: Tutor | null) => void,
+  tutors: Tutor[],
+  currentUser: StudentProfile | null,
+  bookings: Booking[],
+  setBookingType: (type: 'demo' | 'paid') => void,
+  setIsBookingModalOpen: (open: boolean) => void,
+  setBookingPlan: (plan: string) => void,
+  setBookingDuration: (duration: string) => void,
+  openChat: (tutorId: string, tutorName: string, tutorAvatar?: string) => void
+}) => {
+    const [search, setSearch] = useState('');
+    const [subject, setSubject] = useState('All');
     
+    // Dynamically calculate price options based on current tutors
+    const tutorPrices = tutors.map(t => parseFloat(getEffectivePrice(t.price)));
+    const actualMaxPrice = tutorPrices.length > 0 ? Math.max(...tutorPrices) : 5000;
+    
+    const [maxPrice, setMaxPrice] = useState(actualMaxPrice > 5000 ? actualMaxPrice : 5000); 
+    const [classLevel, setClassLevel] = useState('All');
+
+    // Update maxPrice if actualMaxPrice changes significantly (e.g. data loads after mount)
+    useEffect(() => {
+      if (actualMaxPrice > maxPrice) setMaxPrice(actualMaxPrice);
+    }, [actualMaxPrice]);
+    
+    const filteredTutors = tutors.filter(t => {
+      const matchesSearch = search === '' || (t.name || '').toLowerCase().includes(search.toLowerCase());
+      const subjects = t.subjects || [];
+      const matchesSubject = subject === 'All' || subjects.includes(subject);
+      
+      const effectivePrice = parseFloat(getEffectivePrice(t.price));
+      const matchesPrice = effectivePrice <= maxPrice;
+      
+      const matchesClass = classLevel === 'All' || 
+        (t.targetClasses?.includes(classLevel)) ||
+        (classLevel === 'Graduate' && t.targetClasses?.toLowerCase().includes('graduate'));
+      
+      return matchesSearch && matchesSubject && matchesPrice && matchesClass;
+    });
+
+    // Pricing steps for the filter
+    const priceSteps = [200, 300, 500, 1000, 2000, 3000, 5000].filter(p => p < actualMaxPrice);
+
+    return (
+    <div className="space-y-8 md:space-y-12">
+      <motion.div 
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4 md:gap-6"
+      >
+        <div className="sm:col-span-2 relative">
+          <input 
+            type="text" 
+            placeholder="Search by tutor name..." 
+            className="input-field pr-16"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <Search className="absolute right-6 top-1/2 -translate-y-1/2 text-primary/20" size={20} />
+        </div>
+        
+        <select 
+          className="input-field"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+        >
+          <option value="All">All Subjects</option>
+          {currentUser?.class === 'B.Tech' ? (
+            <>
+              <option value="M1">Engineering Mathematics – M1</option>
+              <option value="M2">Engineering Mathematics – M2</option>
+              <option value="M3">Engineering Mathematics – M3</option>
+              <option value="Engineering Graphics">Engineering Graphics</option>
+              <option value="C Programming">C Programming</option>
+              <option value="C++">C++ (Object Oriented)</option>
+              <option value="Java">Java Programming</option>
+              <option value="Python">Python Programming</option>
+              <option value="SQL">SQL / Database Management</option>
+              <option value="PLSQL">PL/SQL (Oracle)</option>
+              <option value="C#">C# (.NET)</option>
+              <option value="Data Structures">Data Structures & Algorithms</option>
+              <option value="DBMS">DBMS (Database Systems)</option>
+              <option value="Operating Systems">Operating Systems</option>
+              <option value="Computer Networks">Computer Networks</option>
+              <option value="Web Development">Web Development (HTML/CSS/JS)</option>
+              <option value="React">React.js / Frontend Dev</option>
+              <option value="Node.js">Node.js / Backend Dev</option>
+              <option value="AI/ML">Artificial Intelligence / ML</option>
+              <option value="Cloud Computing">Cloud Computing (AWS/Azure)</option>
+              <option value="Software Engineering">Software Engineering</option>
+              <option value="English for Engineers">English for Engineers</option>
+            </>
+          ) : (
+            <>
+              <option value="Mathematics">Mathematics</option>
+              <option value="Physics">Physics</option>
+              <option value="Computer Science">Computer Science</option>
+              <option value="Chemistry">Chemistry</option>
+              <option value="Biology">Biology</option>
+              <option value="English">English</option>
+              <option value="Telugu">Telugu</option>
+              <option value="Hindi">Hindi</option>
+              <option value="Spanish">Spanish</option>
+              <option value="EAMCET">EAMCET (State Entrance)</option>
+              <option value="JEE">JEE (Engineering Entrance)</option>
+            </>
+          )}
+        </select>
+
+        <select 
+          className="input-field"
+          value={maxPrice}
+          onChange={(e) => setMaxPrice(Number(e.target.value))}
+        >
+          <option value={actualMaxPrice + 1000}>All Prices</option>
+          {priceSteps.map(p => (
+            <option key={p} value={p}>Up to ₹{p}</option>
+          ))}
+          <option value={actualMaxPrice}>Up to ₹{actualMaxPrice} (Max)</option>
+        </select>
+
+        <select 
+          className="input-field"
+          value={classLevel}
+          onChange={(e) => setClassLevel(e.target.value)}
+        >
+          <option value="All">Class Level (All)</option>
+          <option value="Nursery - UKG">Nursery - UKG</option>
+          <option value="1-5">1-5 Class</option>
+          <option value="6-10">6-10 Class</option>
+          <option value="11-12">Intermediate (11-12)</option>
+          <option value="Graduate">Graduates</option>
+        </select>
+      </motion.div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6">
+          {filteredTutors.length > 0 ? filteredTutors.map(tutor => (
+            <motion.div 
+              key={tutor.id} 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="bg-white rounded-2xl md:rounded-3xl p-4 md:p-6 atelier-card-shadow flex flex-col hover:scale-[1.01] transition-all border border-primary/5 min-h-[400px]"
+            >
+              <div className="flex items-start justify-between mb-4 md:mb-6">
+                <Avatar src={tutor.avatar} size="md" mdSize="lg" initials={(tutor.name || '??').substring(0, 2).toUpperCase()} />
+                <div className="flex flex-col items-end">
+                  <span className="text-secondary text-sm md:text-lg font-black">₹{getEffectivePrice(tutor.price)}/hr</span>
+                  <p className="text-[8px] font-black uppercase tracking-widest text-primary/30 mt-0.5">Final Hourly Price</p>
+                </div>
+              </div>
+              
+              <div className="flex-1 min-w-0">
+                <h3 className="text-lg md:text-xl font-serif font-bold italic text-on-surface mb-2 leading-tight truncate">{tutor.name}</h3>
+                <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
+                  {(tutor as any).subjects?.slice(0, 2).map((s: string) => (
+                    <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
+                  ))}
+                  <span className="pill-tag bg-accent/5 text-accent/70 !text-[8px]">
+                    {tutor.experience === 'Fresher' ? 'Fresher' : `${tutor.experience || 'Expert'} Exp`}
+                  </span>
+                </div>
+                <p className="text-primary/60 text-[10px] md:text-xs leading-relaxed mb-4 line-clamp-2">{(tutor as any).bio}</p>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <div className="flex gap-2">
+                  {(() => {
+                    const hasAttendedDemo = bookings.some(b => b.tutorId === tutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
+                    const hasBookedDemo = hasAttendedDemo; // Only enforce enrollment if they actually attended a demo
+
+                    if (!hasBookedDemo) {
+                      return (
+                        <button 
+                          onClick={() => { setSelectedTutor(tutor); setBookingType('demo'); setIsBookingModalOpen(true); }}
+                          className="flex-1 bg-accent/10 text-accent py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-accent hover:text-white transition-all text-center"
+                        >
+                          Book Free Demo
+                        </button>
+                      );
+                    } else {
+                      return (
+                        <button 
+                          onClick={() => { 
+                            setSelectedTutor(tutor); 
+                            setBookingType('paid'); 
+                            const isGrad = tutor.targetClasses?.toLowerCase().includes('graduate');
+                            setBookingPlan(''); // Force them to choose
+                            setBookingDuration('1');
+                            setIsBookingModalOpen(true); 
+                          }}
+                          className="flex-1 bg-primary text-background py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:scale-[1.02] active:scale-[0.98] transition-all"
+                        >
+                          {hasAttendedDemo ? 'Pay for Next Session' : 'Enroll Now'}
+                        </button>
+                      );
+                    }
+                  })()}
+                </div>
+                <button 
+                  onClick={() => openChat(tutor.id, tutor.name, tutor.avatar)}
+                  className="w-full flex items-center justify-center gap-2 border border-primary/10 text-primary py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-primary/5 transition-all"
+                >
+                  <MessageSquare size={14} /> Chat with Tutor
+                </button>
+              </div>
+              
+              <div className="mt-4 md:mt-6 pt-4 border-t border-primary/5 flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-primary/40 font-bold uppercase tracking-widest text-[8px]">
+                  <CheckCircle2 size={10} className="text-emerald-500" />
+                  Verified
+                </div>
+                <div className="flex items-center gap-1 text-accent font-black px-2 py-1 rounded-full border border-accent/10">
+                  <Star size={12} fill="currentColor" />
+                  <span className="text-xs md:text-sm">{getReputation(tutor.id, tutor.reviews || []).rating.toFixed(1)}</span>
+                </div>
+              </div>
+            </motion.div>
+          )) : (
+            <div className="col-span-full text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
+              <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">No tutors found</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openChat, bookings, setBookingType, setBookingDuration, setBookingPlan, parseTime }: { 
+  selectedTutor: Tutor | null, 
+  setView: (view: View) => void, 
+  setIsBookingModalOpen: (open: boolean) => void,
+  openChat: (tutorId: string, tutorName: string, avatar: string) => void,
+  bookings: Booking[],
+  setBookingType: (type: 'demo' | 'paid') => void,
+  setBookingDuration: (duration: string) => void,
+  setBookingPlan: (plan: string) => void,
+  parseTime: (time: string) => number
+}) => {
+  if (!selectedTutor) return <div className="text-center py-20 font-bold opacity-20 uppercase tracking-widest">Tutor not found</div>;
     return (
       <motion.div 
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
-        className="space-y-12"
+        className="max-w-5xl mx-auto space-y-12"
       >
-        <div className="flex flex-col md:flex-row items-center justify-between gap-6 mb-8 mt-2">
-          <div>
-            <h2 className="text-3xl md:text-5xl font-black tracking-tighter">Payments & Billing</h2>
-            <p className="text-sm font-bold text-primary/40 mt-1">Manage your course transactions securely.</p>
+        <button onClick={() => setView('find-tutors')} className="flex items-center gap-3 text-primary/40 font-bold uppercase tracking-widest text-xs hover:text-primary transition-colors">
+          <ArrowLeft size={16} /> Back to Search
+        </button>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 md:gap-16">
+          <div className="lg:col-span-2 space-y-8 md:space-y-16">
+            <section className="flex flex-col sm:flex-row gap-8 md:gap-12 items-center sm:items-start text-center sm:text-left">
+              <Avatar src={selectedTutor.avatar} size="lg" mdSize="xl" className="w-32 h-32 md:w-40 md:h-40" />
+              <div className="flex-1 space-y-4 md:space-y-6">
+                <div>
+                  <h1 className="text-3xl md:text-5xl font-serif font-bold italic tracking-tight">{selectedTutor.name}</h1>
+                  <div className="flex flex-wrap items-center justify-center sm:justify-start gap-4 md:gap-6 mt-3 md:mt-4">
+                    <div className="flex items-center gap-2 text-accent font-bold">
+                      <Star size={16} fill="currentColor" /> {selectedTutor.rating}
+                    </div>
+                    {selectedTutor.experience && (
+                      <>
+                        <span className="hidden sm:inline text-primary/10">|</span>
+                        <span className="text-primary/40 text-[10px] md:text-xs font-bold uppercase tracking-widest">
+                          {selectedTutor.experience === 'Fresher' ? 'Fresher' : `${selectedTutor.experience} Experience`}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
+                  <div>
+                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Subjects</p>
+                    <div className="flex flex-wrap justify-center sm:justify-start gap-2">
+                      {selectedTutor.subjects.map(s => (
+                        <span key={s} className="pill-tag text-[8px] md:text-[9px]">{s}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Next Available</p>
+                    <p className="text-xs md:text-sm font-bold">
+                      {(() => {
+                        if (!selectedTutor?.availability || selectedTutor.availability.length === 0) return 'No availability';
+                        const now = new Date();
+                        const currentMins = now.getHours() * 60 + now.getMinutes();
+                        const futureToday = selectedTutor.availability
+                          .map(slot => {
+                            const time = typeof slot === 'string' ? slot : (slot.start || '');
+                            return { time, mins: parseTime(time) };
+                          })
+                          .filter(slot => slot.mins > currentMins + 60)
+                          .sort((a, b) => a.mins - b.mins);
+                        if (futureToday.length > 0) return `${futureToday[0].time} Today`;
+                        const sorted = [...selectedTutor.availability]
+                          .map(slot => typeof slot === 'string' ? slot : (slot.start || ''))
+                          .sort((a, b) => parseTime(a) - parseTime(b));
+                        return sorted.length > 0 ? `${sorted[0]} Tomorrow` : 'No availability';
+                      })()}
+                    </p>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest">About the Tutor</p>
+                  <p className="text-primary/70 leading-relaxed text-base md:text-lg font-medium">{selectedTutor.bio}</p>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div className="bg-primary p-6 md:p-10 rounded-[2rem] md:rounded-[3rem] text-background mb-8 md:mb-12 shadow-2xl relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-32 h-32 md:w-64 md:h-64 bg-white/5 rounded-full -mr-16 -mt-16 group-hover:scale-110 transition-transform duration-700" />
+                <div className="relative z-10">
+                  <p className="text-background/40 text-[9px] md:text-[10px] font-bold uppercase tracking-[0.2em] mb-4 md:mb-6">Overall Student Satisfaction</p>
+                  <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 md:gap-0">
+                    <div>
+                      <div className="flex items-baseline gap-2 mb-2">
+                        <span className="text-5xl md:text-7xl font-serif font-black italic tracking-tighter">
+                          {getReputation(selectedTutor.id, selectedTutor.reviews || []).rating.toFixed(1)} / 5.0
+                        </span>
+                      </div>
+                      <p className="text-background/50 text-[10px] md:text-xs font-medium">
+                        Based on {getReputation(selectedTutor.id, selectedTutor.reviews || []).count} total reviews
+                      </p>
+                    </div>
+                    <div className="flex flex-col items-end gap-3">
+                      <div className="flex text-amber-300 gap-1 tooltip" title="Excellent Rating">
+                        {[1, 2, 3, 4, 5].map((i) => (
+                          <Star key={i} size={20} fill={i <= Math.round(getMockRating(selectedTutor.id)) ? "currentColor" : "none"} strokeWidth={2.5} />
+                        ))}
+                      </div>
+                      <div className="px-4 py-2 bg-white/10 rounded-full border border-white/10">
+                        <p className="text-[8px] md:text-[9px] font-black uppercase tracking-[0.15em] text-white">Next review prompt in 2 weeks</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <h3 className="text-xl md:text-2xl font-serif font-bold italic mb-6 md:mb-8">Feedback Stream</h3>
+              <div className="space-y-6 md:space-y-8">
+                {(selectedTutor.reviews || []).length > 0 ? (selectedTutor.reviews || []).map(review => (
+                  <div key={review.id} className="p-6 md:p-8 bg-white/40 backdrop-blur-md rounded-[1.5rem] md:rounded-[2rem] border border-primary/5">
+                    <div className="flex items-center justify-between mb-3 md:mb-4">
+                      <div className="flex items-center gap-3">
+                        <Avatar src="" size="sm" initials={review.studentName?.charAt(0) || 'S'} />
+                        <h5 className="font-bold text-base md:text-lg text-black">{review.studentName}</h5>
+                      </div>
+                      <span className="text-[9px] md:text-[10px] font-bold text-black/40 uppercase tracking-widest">{review.date}</span>
+                    </div>
+                    <div className="flex items-center gap-1 text-amber-400 mb-3 md:mb-4">
+                      {[...Array(5)].map((_, i) => (
+                        <Star key={i} size={12} fill={i < review.rating ? 'currentColor' : 'none'} />
+                      ))}
+                    </div>
+                    <p className="text-black italic font-medium text-sm md:text-base">"{review.comment}"</p>
+                  </div>
+                )) : (
+                  <div className="py-12 md:py-16 bg-white/20 rounded-[2rem] border-2 border-dashed border-primary/5 text-center">
+                    <Quote size={32} className="mx-auto text-primary/10 mb-4" />
+                    <p className="text-primary/30 font-bold uppercase tracking-widest text-[10px] md:text-xs">Incoming Feedback from {getMockCount(selectedTutor.id)}+ Students</p>
+                  </div>
+                )}
+              </div>
+            </section>
           </div>
-          <div className="bg-primary/5 px-6 py-4 rounded-2xl flex items-center gap-3 border border-primary/10 shadow-sm">
-            <Lock className="text-primary w-5 h-5" />
-            <div>
-              <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest">Gateway</p>
-              <p className="font-bold text-sm tracking-tight text-primary">Razorpay Secure</p>
-            </div>
+
+          <div className="space-y-6 md:space-y-8">
+            <section className="p-8 md:p-10 bg-primary text-background rounded-[2rem] md:rounded-[3rem] shadow-2xl">
+              <p className="text-background/50 text-[9px] md:text-[10px] font-bold uppercase tracking-widest mb-2">Investment</p>
+              <div className="flex flex-col gap-2">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-4xl md:text-5xl font-serif font-bold italic">₹{getEffectivePrice(selectedTutor.price)}</span>
+                  <span className="text-background/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/ hour</span>
+                </div>
+                {selectedTutor.upiId && (
+                  <div className="flex items-center gap-2 text-background/70 text-[10px] md:text-xs">
+                    <span className="font-bold">UPI ID:</span> {selectedTutor.upiId}
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-col gap-4 mt-6 md:mt-8">
+                {(() => {
+                  const hasAttendedDemo = bookings.some(b => b.tutorId === selectedTutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
+                  const hasBookedDemo = hasAttendedDemo; // Only enforce enrollment if they actually attended a demo
+                  const isGraduateTutor = selectedTutor.targetClasses?.includes('Graduate') || selectedTutor.subjects?.some(s => s.toLowerCase().includes('graduate'));
+
+                  if (selectedTutor.subjectsPricing && selectedTutor.subjectsPricing.length > 0) {
+                    return (
+                      <div className="space-y-4 mb-4">
+                        <p className="text-background/40 text-[9px] font-black uppercase tracking-widest">Enrollment Options</p>
+                        <div className="space-y-2">
+                          {selectedTutor.subjectsPricing.map((sp, idx) => (
+                            <div key={idx} className="p-4 bg-white/10 rounded-2xl border border-white/5 space-y-2 group/price hover:bg-white/15 transition-all">
+                              <div className="flex items-center justify-between">
+                                <span className="text-sm font-bold">{sp.subject}</span>
+                                <span className="text-[9px] font-black px-2 py-0.5 bg-background/10 rounded-md text-background/60 tracking-widest">{sp.type === 'course' ? 'FULL COURSE' : 'MONTHLY'}</span>
+                              </div>
+                              <div className="flex items-baseline justify-between">
+                                <span className="text-xl font-black italic">₹{Math.ceil(sp.price * 1.17).toLocaleString('en-IN')}</span>
+                                {sp.type === 'course' && sp.durationDays && <span className="text-[8px] font-bold text-background/30 uppercase tracking-widest">{sp.durationDays} Days</span>}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        
+                        {!hasBookedDemo ? (
+                          <button 
+                            onClick={() => { setBookingType('demo'); setIsBookingModalOpen(true); }}
+                            className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
+                          >
+                            Book Free Demo
+                          </button>
+                        ) : (
+                          <button 
+                            onClick={() => { 
+                              setBookingType('paid'); 
+                              setBookingDuration('1'); 
+                              const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') || selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
+                              setBookingPlan(isGrad ? 'monthly' : 'subscription');
+                              setIsBookingModalOpen(true); 
+                            }}
+                            className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
+                          >
+                            {hasAttendedDemo ? 'Enroll Now' : 'Complete Enrollment'}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  if (!hasBookedDemo) {
+                    return (
+                      <button 
+                        onClick={() => { setBookingType('demo'); setIsBookingModalOpen(true); }}
+                        className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
+                      >
+                        Book Free Demo
+                      </button>
+                    );
+                  } else {
+                    return (
+                      <button 
+                        onClick={() => { 
+                          setBookingType('paid'); 
+                          setBookingDuration('1'); 
+                          const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate');
+                          setBookingPlan(isGrad ? 'monthly' : 'subscription');
+                          setIsBookingModalOpen(true); 
+                        }}
+                        className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
+                      >
+                        {hasAttendedDemo ? 'Complete Enrollment' : 'Become a Paid Student'}
+                      </button>
+                    );
+                  }
+                })()}
+              </div>
+              <button 
+                onClick={() => openChat(selectedTutor.id, selectedTutor.name, selectedTutor.avatar)}
+                className="w-full mt-3 md:mt-4 bg-primary/10 text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-primary/20 transition-all border border-background/10 text-sm md:text-base"
+              >
+                Message Tutor
+              </button>
+            </section>
+
+            {(selectedTutor.availability && selectedTutor.availability.length > 0) && (
+            <section className="p-8 md:p-10 bg-white/40 backdrop-blur-md rounded-[2rem] md:rounded-[3rem] border border-primary/5">
+              <h3 className="text-base md:text-lg font-bold mb-4 md:mb-6">Availability</h3>
+              <div className="grid grid-cols-2 gap-2 md:gap-3">
+                {selectedTutor.availability.map((slot, index) => {
+                  const time = typeof slot === 'string' ? slot : (slot.start || '');
+                  if (!time) return null;
+                  return (
+                    <button key={index} className="py-2 md:py-3 px-3 md:px-4 rounded-lg md:rounded-xl border border-primary/10 text-[9px] md:text-[10px] font-bold uppercase tracking-widest hover:bg-primary hover:text-background transition-all">
+                      {time}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[9px] md:text-[10px] text-primary/30 mt-4 md:mt-6 text-center font-bold uppercase tracking-widest">All times are local</p>
+            </section>
+            )}
           </div>
         </div>
-
-        <section className="space-y-6">
-          <h3 className="text-xl md:text-2xl font-serif font-bold italic border-b border-primary/5 pb-4">Unpaid Sessions</h3>
-          {pendingBookings.length > 0 ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {pendingBookings.map((booking, i) => (
-                <motion.div 
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.05 }}
-                  key={booking.id}
-                  className="bg-white/60 backdrop-blur-md rounded-[2rem] p-6 border border-rose-100 shadow-xl relative overflow-hidden group hover:-translate-y-1 hover:shadow-rose-100 transition-all flex flex-col"
-                >
-                  <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-rose-400 to-primary"></div>
-                  <div className="flex justify-between items-start mb-4">
-                    <div>
-                      <h4 className="font-bold text-lg leading-tight">{booking.subject}</h4>
-                      <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-1">with {booking.tutorName}</p>
-                    </div>
-                    <Badge variant="pending">Pending</Badge>
-                  </div>
-                  
-                  <div className="space-y-2 mb-6 flex-1">
-                    <div className="flex items-center gap-2 text-xs font-bold text-primary/60">
-                      <Calendar size={14} className="text-accent" /> {booking.date}
-                    </div>
-                    <div className="flex items-center gap-2 text-[10px] font-bold text-primary/40 uppercase tracking-widest">
-                      <Clock size={14} /> {booking.time} • {booking.duration}
-                    </div>
-                  </div>
-
-                  <div className="pt-4 border-t border-primary/5 flex items-center justify-between">
-                    <div>
-                      <p className="text-[9px] font-bold text-primary/30 uppercase tracking-widest">Total Price</p>
-                      <p className="text-2xl font-serif font-bold italic text-primary">${MOCK_TUTORS.find(t => t.id === booking.tutorId)?.price}</p>
-                    </div>
-                    <button 
-                      onClick={() => onPay(booking)}
-                      className="bg-primary text-background px-6 py-3 rounded-xl font-bold hover:scale-105 transition-transform shadow-lg text-xs tracking-wide flex items-center gap-2"
-                    >
-                      <DollarSign size={14} /> Pay Now
-                    </button>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-center py-24 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
-              <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto mb-4 opacity-70" />
-              <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">All caught up! No pending payments.</p>
-            </div>
-          )}
-        </section>
       </motion.div>
     );
   };
 
-  // --- Render Logic ---
-  const views = {
-    'payments': (
-      <PaymentsView 
-        bookings={bookings}
-        onPay={(booking) => {
-          setSelectedTutor(MOCK_TUTORS.find(t => t.id === booking.tutorId) || null);
-          setBookingFormData({ 
-            subject: booking.subject, 
-            date: booking.date, 
-            time: booking.time, 
-            duration: booking.duration.replace(/ Hours?/, ''),
-            id: booking.id
+export default function App() {
+  const [view, setView] = useState<View>(() => {
+    // Try to restore previous view, but default to login if no auth session flag exists
+    const savedView = localStorage.getItem('student_view') as View;
+    const isLoggedIn = localStorage.getItem('student_logged_in') === 'true';
+    if (isLoggedIn && savedView && savedView !== 'login' && savedView !== 'register' && savedView !== 'forgot-password') {
+      return savedView;
+    }
+    return 'login';
+  });
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+  const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
+  const [currentUser, setCurrentUser] = useState<StudentProfile | null>(() => {
+    const savedUser = localStorage.getItem('student_user');
+    return savedUser ? JSON.parse(savedUser) : null;
+  });
+  const [loading, setLoading] = useState(true);
+  const [authInitialized, setAuthInitialized] = useState(false);
+
+  // Persist view changes
+  useEffect(() => {
+    if (view && !['login', 'register', 'forgot-password'].includes(view)) {
+      localStorage.setItem('student_view', view);
+    }
+  }, [view]);
+
+  // Persist user changes
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem('student_user', JSON.stringify(currentUser));
+      localStorage.setItem('student_logged_in', 'true');
+    } else {
+      localStorage.removeItem('student_user');
+      localStorage.setItem('student_logged_in', 'false');
+    }
+  }, [currentUser]);
+
+  // Scroll to top when view changes
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
+      const mainElement = document.querySelector('main') || document.querySelector('.main-content') || document.body;
+      if (mainElement) {
+        mainElement.scrollTop = 0;
+      }
+    });
+  }, [view]);
+
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('view') === 'login') {
+      signOut(auth).then(() => {
+        localStorage.clear();
+        window.history.replaceState({}, '', window.location.pathname);
+        window.location.reload();
+      });
+    }
+  }, []);
+
+  const markNotifRead = async (id: string) => {
+    setNotifications(notifications.map(n => n.id === id ? { ...n, read: true } : n));
+    try {
+      const notifRef = doc(db, 'notifications', id);
+      await updateDoc(notifRef, { read: true });
+    } catch (e) {
+      console.error('Error marking notification read:', e);
+    }
+  };
+  useEffect(() => {
+    let isMounted = true;
+    let authTimeout: NodeJS.Timeout;
+    
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!isMounted) return;
+      
+      console.log("Auth state changed:", user ? "User logged in" : "User logged out");
+      
+      // Clear any existing timeout
+      if (authTimeout) {
+        clearTimeout(authTimeout);
+      }
+      
+      try {
+        if (user) {
+          // Firebase User Found
+          const docRef = doc(db, 'students', user.uid);
+          
+          // Set timeout for the Firestore operation
+          const timeoutPromise = new Promise((_, reject) => {
+            authTimeout = setTimeout(() => reject(new Error('Firestore timeout')), 8000);
           });
-          setIsPaymentModalOpen(true);
-          setPaymentStatus('idle');
-          setPaymentData({});
-        }}
-      />
-    ),
-    'login': (
-      <LoginView 
-        setView={setView} 
-        setCurrentUser={setCurrentUser} 
-      />
-    ),
-    'register': (
-      <RegisterView 
-        setView={setView} 
-        setCurrentUser={setCurrentUser} 
-      />
-    ),
-    'forgot-password': <ForgotPasswordView setView={setView} />,
-    'dashboard': (
-      <DashboardView 
-        setView={setView} 
-        bookings={bookings} 
-        setSelectedTutor={setSelectedTutor} 
-        openChat={openChat} 
-        onReschedule={(booking) => setReschedulingBooking(booking)} 
-        tutors={tutors}
-      />
-    ),
-    'find-tutors': (
-      <FindTutorsView 
-        setView={setView} 
-        setSelectedTutor={setSelectedTutor} 
-        tutors={tutors}
-      />
-    ),
-    'tutor-profile': (
-      <TutorProfileView 
-        selectedTutor={selectedTutor} 
-        setView={setView} 
-        setIsBookingModalOpen={setIsBookingModalOpen} 
-        openChat={openChat}
-      />
-    ),
-    'my-bookings': (
-      <MyBookingsView 
-        bookings={bookings} 
-        setBookings={setBookings}
-        openChat={openChat} 
-        onReschedule={(booking) => setReschedulingBooking(booking)} 
-        setView={setView}
-        setSelectedTutor={setSelectedTutor}
-        tutors={tutors}
-        startSession={startSession}
-        parseTime={parseTime}
-      />
-    ),
-    'chat': (
-      <ChatView 
-        chats={chats}
-        activeChatId={activeChatId}
-        setActiveChatId={setActiveChatId}
-        setChats={setChats}
-        drafts={drafts}
-        setDrafts={setDrafts}
-        sendMessage={sendMessage}
-        baseSendMessage={baseSendMessage}
-        deleteMessage={deleteMessage}
-        setView={setView}
-        editingMessageId={editingMessageId}
-        setEditingMessageId={setEditingMessageId}
-        setIsMobileSidebarOpen={setIsMobileSidebarOpen}
-        isChatMenuOpen={isChatMenuOpen}
-        setIsChatMenuOpen={setIsChatMenuOpen}
-        currentUser={currentUser}
-        bookings={bookings}
-        tutors={tutors}
-        openChat={openChat}
-      />
-    ),
-    'reviews': <ReviewsView bookings={bookings} tutors={tutors} currentUser={currentUser} />,
-    'progress': <ProgressTrackerView setView={setView} bookings={bookings} />,
-    'settings': <SettingsView setView={setView} currentUser={currentUser} setCurrentUser={setCurrentUser} />
+          
+          try {
+            const docSnap = await Promise.race([getDoc(docRef), timeoutPromise]) as any;
+            clearTimeout(authTimeout);
+            
+            if (docSnap.exists) {
+              const userData = docSnap.data();
+              if (userData.status === 'blocked') {
+                setView('blocked');
+                setCurrentUser({ id: user.uid, ...userData } as any);
+                return;
+              }
+              
+              // Ensure subscription exists (Step 1 implementation)
+              if (!userData.subscription) {
+                const defaultPlan = getPlanDefaults('free', userData.studentType || 'school');
+                await updateDoc(docRef, { subscription: defaultPlan });
+                userData.subscription = defaultPlan;
+              }
+
+              setCurrentUser({ id: user.uid, ...userData } as any);
+
+              // If student is on free plan, gently remind them to upgrade
+              if (userData.subscription?.tier === 'free') {
+                const planNotifId = `plan_remind_${user.uid}`;
+                setNotifications(prev => {
+                  if (prev.some(n => n.id === planNotifId)) return prev;
+                  return [{
+                    id: planNotifId,
+                    title: 'You\'re on the Free Plan',
+                    message: 'Choose Free plan to access basic features, or upgrade to Standard/Premium for more subjects and features.',
+                    time: 'Just now',
+                    type: 'update' as const,
+                    read: false,
+                    link: 'settings'
+                  }, ...prev];
+                });
+              }
+            } else {
+              const defaultPlan = getPlanDefaults('free', 'school');
+              const newUser: StudentProfile = {
+                id: user.uid,
+                name: user.displayName || user.email?.split('@')[0] || 'User',
+                email: user.email || '',
+                mobile: user.phoneNumber || '',
+                class: '10',
+                board: 'CBSE',
+                notifications: { reminders: true, messages: true, updates: true, push: true },
+                subscription: defaultPlan
+              };
+              await setDoc(docRef, newUser);
+              setCurrentUser(newUser as any);
+
+              // Notify student to choose a plan
+              setNotifications(prev => [{
+                id: `plan_prompt_${Date.now()}`,
+                title: 'Welcome to Eduqra! Choose Your Plan',
+                message: `You're on the Free plan. Explore Standard or Premium plans for more subjects, extra classes, and premium features.`,
+                time: 'Just now',
+                type: 'update' as const,
+                read: false,
+                link: 'settings'
+              }, ...prev]);
+
+              // Notify Admin of new student
+              addDoc(collection(db, 'admin_notifications'), {
+                type: 'New Student',
+                title: 'New Student Registered',
+                message: `${newUser.name} (${newUser.email}) joined the platform on the Free plan.`,
+                time: serverTimestamp(),
+                read: false
+              });
+            }
+            // Only set to dashboard if we are currently on a login/register page
+            setView(prev => ['login', 'register', 'forgot-password'].includes(prev) ? 'dashboard' : (prev === 'blocked' ? 'dashboard' : prev));
+          } catch (firestoreError) {
+            console.error("Firestore error:", firestoreError);
+            const defaultPlan = getPlanDefaults('free', 'school');
+            setCurrentUser({
+              id: user.uid,
+              name: user.displayName || user.email?.split('@')[0] || 'User',
+              email: user.email || '',
+              mobile: user.phoneNumber || '',
+              class: '10',
+              board: 'CBSE',
+              notifications: { reminders: true, messages: true, updates: true, push: true },
+              subscription: defaultPlan
+            } as any);
+            setView(prev => ['login', 'register', 'forgot-password'].includes(prev) ? 'dashboard' : prev);
+          }
+        } else {
+          // No Firebase User
+          // If we have a test account session, stay logged in
+          const isTestAccount = currentUser?.email === 'test@eduqra.com';
+          const isLoggedIn = localStorage.getItem('student_logged_in') === 'true';
+
+          if (!isTestAccount && !isLoggedIn) {
+            setView('login');
+            setCurrentUser(null);
+          } else if (!isTestAccount && isLoggedIn && !authInitialized) {
+            // Wait for auth to initialize before giving up
+            // This case is handled by the initial state and finally block
+          }
+        }
+      } catch (err) {
+        console.error("Auth fetch error:", err);
+        if (isMounted) {
+          setView('login');
+          setCurrentUser(null);
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+          setAuthInitialized(true);
+        }
+      }
+    });
+    
+    // Set a fallback timeout in case onAuthStateChanged doesn't fire
+    authTimeout = setTimeout(() => {
+      if (isMounted && loading) {
+        console.log("Auth initialization timeout, setting loading to false");
+        setLoading(false);
+        setAuthInitialized(true);
+        setView('login');
+      }
+    }, 15000); // 15 second fallback timeout
+    
+    return () => {
+      isMounted = false;
+      if (authTimeout) {
+        clearTimeout(authTimeout);
+      }
+      unsubscribe();
+    };
+  }, []);
+
+  // Additional safety check for loading state
+  useEffect(() => {
+    if (authInitialized && loading) {
+      console.log("Auth initialized but still loading, forcing loading to false");
+      setLoading(false);
+    }
+  }, [authInitialized, loading]);
+
+  const [selectedTutor, setSelectedTutor] = useState<Tutor|null>(null);
+  const [tutors, setTutors] = useState<Tutor[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
+
+  // 🛡️ Subscription Cycle & Expiry Logic (Step 4)
+  const effectiveSubscription = useMemo(() => {
+    if (!currentUser?.subscription) return { tier: 'free' as const, expiresAt: null, isExpired: false };
+    const { tier, expiresAt } = currentUser.subscription;
+    if (tier === 'free') return { tier: 'free' as const, expiresAt: null, isExpired: false };
+    
+    const expiry = expiresAt ? new Date(expiresAt) : null;
+    const isExpired = expiry && new Date() > expiry;
+    
+    return {
+      tier: (isExpired ? 'free' : tier) as 'free' | 'standard' | 'premium',
+      isExpired,
+      expiresAt
+    };
+  }, [currentUser?.subscription]);
+
+  const currentTier = effectiveSubscription.tier;
+
+  // --- Real-time Data Sync ---
+  useEffect(() => {
+    // 1. Fetch APPROVED tutors only — real-time listener from 'users' collection
+    const tutorsQuery = query(
+      collection(db, 'users'), 
+      where('role', '==', 'tutor'),
+      where('status', '==', 'approved')
+    );
+    const unsubTutors = onSnapshot(tutorsQuery, (snap) => {
+      const tutorList = snap.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          name: data.name || data.displayName || 'Tutor',
+          subjects: data.subjects || [],
+          availability: data.availability || [],
+          rating: data.rating || 5.0,
+          price: data.classPricing || data.price || 160,
+          upiId: data.upiId || '',
+          classTaught: data.classTaught || '',
+          avatar: data.avatar || data.profileImage || '',
+          bio: data.bio || '',
+          experience: data.experience || 'Fresher',
+          reviews: data.reviews || []
+        };
+      });
+      setTutors(tutorList);
+    }, (err) => {
+      console.error("Error fetching tutors:", err);
+      setTutors([]);
+    });
+
+    return () => unsubTutors();
+  }, []);
+
+  // 2. Real-time bookings for current student — reflects admin confirm/cancel instantly
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    console.log("Syncing bookings for:", currentUser.email);
+    const bQuery = query(collection(db, 'bookings'), where('studentEmail', '==', currentUser.email));
+    const unsubBookings = onSnapshot(bQuery, (snap) => {
+      const bookingList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Booking));
+      console.log(`Found ${bookingList.length} real bookings`);
+      // Merge with mock data to satisfy "previous all data with present"
+      setBookings(bookingList);
+    }, (err) => {
+      console.error("Error fetching bookings:", err);
+    });
+    return () => unsubBookings();
+  }, [currentUser?.email]);
+
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  // 3. Real-time notifications for current student
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    const uid = currentUser.id;
+    const email = currentUser?.email || '';
+
+    // Query for notifications directed to this student (by ID)
+    const nQuery = query(
+      collection(db, 'notifications'), 
+      where('userId', '==', uid)
+    );
+    
+    const unsubNotifs = onSnapshot(nQuery, (snap) => {
+      const notifList = snap.docs.map(doc => ({ 
+        id: doc.id, 
+        ...doc.data() 
+      } as any));
+      
+      // Sort by time (handle both ISO string and Firestore Timestamp)
+      notifList.sort((a, b) => {
+         const timeA = a.time?.seconds ? a.time.seconds * 1000 : new Date(a.time).getTime();
+         const timeB = b.time?.seconds ? b.time.seconds * 1000 : new Date(b.time).getTime();
+         return timeB - timeA;
+      });
+      
+      setNotifications(notifList);
+    });
+
+    return () => unsubNotifs();
+  }, [currentUser?.id, currentUser?.email]);
+  const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
+  const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
+  const [paymentStatus, setPaymentStatus] = useState<'idle' | 'processing' | 'success' | 'failed' | 'cancelled'>('idle');
+  const [paymentData, setPaymentData] = useState<{paymentId?: string, orderId?: string, status?: string}>({});
+  const [bookingFormData, setBookingFormData] = useState<any>(null);
+  const [bookingPlan, setBookingPlan] = useState<string>('');
+  const [bookingSelectedDate, setBookingSelectedDate] = useState<string>('');
+  const [bookingSelectedSubject, setBookingSelectedSubject] = useState<string>('');
+  const [bookingSelectedTime, setBookingSelectedTime] = useState<string>('');
+  const [bookingDuration, setBookingDuration] = useState('1');
+  const [bookingType, setBookingType] = useState<'demo' | 'paid'>('paid');
+  
+  useEffect(() => {
+    if (selectedTutor && bookingSelectedDate) {
+      const tutorBookings = bookings.filter(b => b.tutorId === selectedTutor.id);
+      const tutorAvailability = selectedTutor.availability || [];
+      const expandedSlots = tutorAvailability.length > 0 ? tutorAvailability.flatMap((s: any) => {
+        const startMins = parseTime(typeof s === 'string' ? s : s.start);
+        const endMins = typeof s === 'string' ? startMins + 60 : parseTime(s.end);
+        const slots = [];
+        for (let m = startMins; m < endMins; m += 60) {
+          slots.push(formatMins(m));
+        }
+        return slots;
+      }) : [];
+      const finalSlots = expandedSlots.filter(slotTime => {
+        return !tutorBookings.some(b => 
+          b.date === bookingSelectedDate && 
+          b.time === slotTime && 
+          ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
+        );
+      });
+      if (finalSlots.length === 0) {
+        setBookingSelectedTime("10:00 AM");
+      } else if (bookingSelectedTime === "10:00 AM") {
+         setBookingSelectedTime("");
+      }
+    }
+  }, [bookingSelectedDate, selectedTutor]);
+  const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [reschedulingBooking, setReschedulingBooking] = useState<Booking | null>(null);
+  const [rescheduleDate, setRescheduleDate] = useState<string>('');
+  const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
+  const [rescheduleSuccess, setRescheduleSuccess] = useState(false);
+
+
+
+  const getBookingAmount = () => {
+    if (!selectedTutor) return 0;
+    
+    const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') || selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
+    const subjectPriceObj = selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject);
+    const getFinal = (base?: any) => Math.ceil((parseFloat(String(base || '0')) || 0) * 1.17);
+
+    const planToUse = bookingFormData?.plan || bookingPlan;
+
+    if (isGraduate && subjectPriceObj) {
+      const finalPrice = getFinal(subjectPriceObj.price);
+      if (planToUse === 'course' || subjectPriceObj.type === 'course') {
+        return finalPrice;
+      }
+      if (planToUse === 'monthly' || subjectPriceObj.type === 'monthly') {
+        return finalPrice; // Graduate specific monthly/course prices already final
+      }
+      return getFinal(selectedTutor.price) * 30;
+    }
+
+    const finalPerHour = getFinal(selectedTutor?.price);
+    
+    if (planToUse === 'subscription') {
+      return finalPerHour * 365; // Yearly amount (365 days)
+    }
+    if (planToUse === 'monthly') {
+      return finalPerHour * 30; // Monthly amount (30 days)
+    }
+    
+    const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '1');
+    return finalPerHour * currentDur;
+  };
+
+  const calculateTotal = () => {
+    if (bookingType === 'demo') return 'Free First Demo Session';
+    
+    const amt = getBookingAmount();
+    const planToUse = bookingFormData?.plan || bookingPlan;
+
+    if (planToUse === 'course' || selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject)?.type === 'course') {
+      return `Course Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+    }
+    if (planToUse === 'subscription') {
+      return `Yearly Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+    }
+    if (planToUse === 'monthly') {
+      return `Monthly Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+    }
+    
+    return `Enrollment Total: ₹${amt.toLocaleString('en-IN')}`;
+  };
+
+  // --- Real-time Notes Notification for Student ---
+  useEffect(() => {
+    if (!currentUser || !['standard', 'premium'].includes(currentTier)) return;
+
+    const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+    const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => normalize(b.subject))));
+    const studentClass = normalize(currentUser.class);
+
+    const q = query(collection(db, 'notes'), orderBy('createdAt', 'desc'), limit(5));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added') {
+          const note = change.doc.data();
+          const noteCreatedAt = note.createdAt?.seconds ? note.createdAt.seconds * 1000 : Date.now();
+          
+          // Only notify for fresh notes (less than 1 minute old) to avoid spamming old notes on load
+          if (Date.now() - noteCreatedAt < 60000) {
+            const noteSubject = normalize(note.subject || '');
+            const targetClass = normalize(note.targetClass || note.class || '');
+            
+            const matchesClass = !targetClass || targetClass === studentClass || targetClass.includes(studentClass) || studentClass.includes(targetClass);
+            const matchesSubject = enrolledSubjects.length === 0 || enrolledSubjects.includes(noteSubject) || enrolledSubjects.some(s => s.includes(noteSubject) || noteSubject.includes(s));
+
+            if (matchesClass && matchesSubject) {
+              setNotifications(prev => [{
+                id: `note_${change.doc.id}`,
+                title: 'New Study Material!',
+                message: `${note.tutorName} uploaded new notes for ${note.subject}: "${note.fileName}"`,
+                time: 'Just now',
+                type: 'update',
+                read: false,
+                link: 'notes'
+              }, ...prev]);
+            }
+          }
+        }
+      });
+    });
+
+    return () => unsubscribe();
+  }, [currentUser?.id, currentTier, bookings.length]);
+
+  // --- Real-time Attendance & Global Status Engine ---
+  useEffect(() => {
+    if (!bookings.length || !currentUser) return;
+
+    const engineInterval = setInterval(async () => {
+      const now = new Date();
+      const nowMins = now.getHours() * 60 + now.getMinutes();
+      const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+
+      bookings.forEach(async (b) => {
+        // 1. Status updates only for confirmed, pending, or live classes
+        if (b.status === 'confirmed' || b.status === 'pending' || b.status === 'live') {
+          const isToday = b.date === todayStr || b.date === isoToday;
+          const bMins = parseTime(b.time);
+          const diff = bMins - nowMins;
+          const durationHrs = parseFloat(b.duration || '1');
+          const durationMins = durationHrs * 60;
+
+          // 0. AUTO-MARK PAST DAYS: If the booking date is before today, mark as not attended
+          if (!isToday) {
+            // Parse booking date to compare
+            const bookingDate = new Date(b.date);
+            const todayDate = new Date(isoToday);
+            if (bookingDate < todayDate && !isNaN(bookingDate.getTime())) {
+              const bRef = doc(db, 'bookings', b.id);
+              if (b.studentPresent && b.tutorPresent) {
+                await updateDoc(bRef, { 
+                  status: 'completed', 
+                  attendance_status: 'attended',
+                  completedAt: serverTimestamp() 
+                });
+              } else {
+                await updateDoc(bRef, { 
+                  status: 'cancelled', 
+                  attendance_status: 'not_attended' 
+                });
+              }
+              return; // Skip further checks for past-day bookings
+            }
+          }
+
+          // 1a. 10min Notification Hook (Pre-class) — also notify tutor
+          if (isToday && diff === 10 && currentUser?.notifications?.reminders !== false) {
+            const notifId = `rem_${b.id}`;
+            const alreadyExists = notifications.some(n => n.id === notifId);
+            if (!alreadyExists) {
+              setNotifications(prev => [{
+                id: notifId,
+                title: 'Class Starts in 10m!',
+                message: `Your session for ${b.subject} with ${b.tutorName} starts soon. The Join button is now enabled.`,
+                time: 'Just now',
+                type: 'booking',
+                read: false,
+                link: 'dashboard'
+              }, ...prev]);
+
+              // Also notify tutor about the upcoming class
+              addDoc(collection(db, 'tutor_notifications'), {
+                tutorId: b.tutorId,
+                type: 'reminder',
+                title: 'Class Starts in 10m!',
+                description: `Your session for ${b.subject} with ${b.studentName} starts soon.`,
+                time: 'Just now',
+                read: false,
+                createdAt: serverTimestamp()
+              });
+            }
+          }
+
+          // 1b. Completion/Not-Attended Logic (after class end time)
+          if (isToday && nowMins > (bMins + durationMins)) {
+            const bRef = doc(db, 'bookings', b.id);
+            if (b.studentPresent && b.tutorPresent) {
+              await updateDoc(bRef, { 
+                status: 'completed', 
+                attendance_status: 'attended',
+                completedAt: serverTimestamp() 
+              });
+            } else {
+              await updateDoc(bRef, { 
+                status: 'cancelled', 
+                attendance_status: 'not_attended' 
+              });
+            }
+          }
+          
+          // 1c. Post-Time Auto-Cancel for Pending sessions (if start time passed)
+          if (isToday && nowMins > (bMins + 15) && b.status === 'pending') {
+             await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled', attendance_status: 'not_attended' });
+          }
+        }
+
+        // 2. Automatic Cancellation for Unpaid Bookings (30 min timeout) - Check regardless of status here
+        if (b.status === 'unpaid' && b.paymentDeadline) {
+          const deadline = b.paymentDeadline.seconds ? new Date(b.paymentDeadline.seconds * 1000) : new Date(b.paymentDeadline);
+          if (now > deadline) {
+             await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled', cancellationReason: 'Payment Timeout' });
+          }
+        }
+
+        // 3. Subscription Auto-Cancellation (if next billing date passed without payment)
+        if (b.plan === 'subscription' && b.nextBillingDate && b.status !== 'cancelled') {
+          const billingDeadline = b.nextBillingDate.seconds ? new Date(b.nextBillingDate.seconds * 1000) : new Date(b.nextBillingDate);
+          if (now > billingDeadline) {
+             await updateDoc(doc(db, 'bookings', b.id), { 
+               status: 'cancelled', 
+               subscriptionStatus: 'expired',
+               cancellationReason: 'Subscription Payment Overdue' 
+             });
+               
+               // Notify Tutor
+               await addDoc(collection(db, 'tutor_notifications'), {
+                 tutorId: b.tutorId,
+                 type: 'booking',
+                 title: 'Subscription Cancelled',
+                 description: `Student ${b.studentName}'s subscription for ${b.subject} has been cancelled due to non-payment.`,
+                 time: serverTimestamp(),
+                 read: false
+               });
+
+               // Notify Admin
+               await addDoc(collection(db, 'admin_notifications'), {
+                 type: 'Subscription Cancelled',
+                 title: 'Automatic Cancellation',
+                 message: `Subscription for ${b.studentName} with ${b.tutorName} cancelled (Payment overdue).`,
+                 bookingId: b.id,
+                 time: serverTimestamp(),
+                 read: false
+               });
+          }
+        }
+        // 4. Two-week Review Prompt - ONLY if student has actually ATTENDED at least one class
+        const attendedBookings = bookings.filter(b => b.status === 'completed' && b.attendance_status === 'attended');
+        const tutorsToReview = new Set(attendedBookings.filter(b => !b.reviewSubmitted).map(b => b.tutorId));
+        
+        tutorsToReview.forEach(async (tid) => {
+          const tutorBookings = attendedBookings.filter(b => b.tutorId === tid);
+          const lastReview = tutorBookings.filter(b => b.reviewSubmitted).sort((a,b) => (b.reviewedAt?.seconds || 0) - (a.reviewedAt?.seconds || 0))[0];
+          
+          const fourteenDaysAgo = new Date();
+          fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+          
+          const needsReview = !lastReview || (lastReview.reviewedAt && (lastReview.reviewedAt.seconds * 1000) < fourteenDaysAgo.getTime());
+          
+          if (needsReview) {
+            const reviewNotifId = `review_prompt_${tid}`;
+            if (!notifications.some(n => n.id === reviewNotifId)) {
+              const tutorName = tutorBookings[0]?.tutorName || 'your tutor';
+              setNotifications(prev => [{
+                id: reviewNotifId,
+                title: 'Review Your Tutor',
+                message: `It's been two weeks since your sessions with ${tutorName}. Please share your feedback!`,
+                time: 'Just now',
+                type: 'update',
+                read: false,
+                link: 'reviews'
+              }, ...prev]);
+            }
+          }
+        });
+      });
+    }, 60000); // Audit every minute
+
+    return () => clearInterval(engineInterval);
+  }, [bookings, currentUser, notifications]);
+
+  // --- Live Class States ---
+  const [sessionStartTime, setSessionStartTime] = useState<Date | null>(null);
+  const [sessionTimer, setSessionTimer] = useState("00:00:00");
+  const [isMicOn, setIsMicOn] = useState(true);
+  const [isCamOn, setIsCamOn] = useState(true);
+  const [isLiveChatOpen, setIsLiveChatOpen] = useState(false);
+  const [sessionStatus, setSessionStatus] = useState<'waiting' | 'connecting' | 'live' | 'disconnected'>('waiting');
+  const [liveMessages, setLiveMessages] = useState<{id: string, sender: string, text: string, time: string}[]>([]);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
+  
+  const socketRef = useRef<any>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+
+  // --- Push Notification Registration ---
+  useEffect(() => {
+    const setupNotifications = async () => {
+      if (!messaging || !currentUser?.email) return;
+
+      try {
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') {
+          const token = await getToken(messaging, { 
+            vapidKey: 'BGFS0hv59YGe6BMn5-wcbjlBLu0jw5Gd_zBsVZPPFX-16YOYB92_9qbaIp_SyUE4DeG7HH9-suupaEveV6vIrj4'
+          });
+          
+          if (token) {
+            console.log('FCM Token generated');
+            const studentRef = doc(db, 'students', currentUser.id);
+            await updateDoc(studentRef, {
+              fcmTokens: arrayUnion(token)
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Push notification setup failed:', error);
+      }
+    };
+
+    if (currentUser && currentUser.notifications?.push !== false) {
+      setupNotifications();
+      const unsubscribe = onMessage(messaging!, (payload) => {
+        console.log('Foregound message received:', payload);
+        // Display browser notification if enabled
+      });
+      return () => unsubscribe();
+    }
+  }, [currentUser]);
+
+
+  const handleScreenShare = async () => {
+    if (isScreenSharing) {
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(track => track.stop());
+        screenStreamRef.current = null;
+      }
+      setIsScreenSharing(false);
+      setIsCamOn(false);
+      setTimeout(() => setIsCamOn(true), 100);
+    } else {
+      try {
+        const stream = await (navigator.mediaDevices as any).getDisplayMedia({ video: true });
+        screenStreamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+        setIsScreenSharing(true);
+        stream.getVideoTracks()[0].onended = () => {
+          setIsScreenSharing(false);
+          setIsCamOn(true);
+        };
+      } catch (err) {
+        console.error("Error sharing screen:", err);
+      }
+    }
+  };
+
+  const startSession = async (bookingId: string) => {
+    const booking = bookings.find(b => b.id === bookingId);
+    if (!booking || !currentUser?.email) return;
+
+    // 🔐 VALIDATE ENTRY 🔐
+    const isParticipant = booking.participants?.includes(currentUser.email) || booking.studentEmail === currentUser.email;
+    if (!isParticipant) {
+      alert("⛔ Access Denied: You are not a registered participant for this session.");
+      return;
+    }
+
+    setView('live-class');
+    setSessionStatus('connecting');
+    setActiveMeetingId(bookingId);
+    
+    // Track attendance start
+    const emailKey = currentUser.email.replace(/\./g, '_');
+    try {
+      if (booking.isGroup) {
+        await updateDoc(doc(db, 'bookings', bookingId), {
+          [`participantData.${emailKey}.joinTime`]: serverTimestamp(),
+          [`participantData.${emailKey}.status`]: 'pending',
+          studentJoined: true // Legacy flag compatibility
+        });
+      } else {
+        await updateDoc(doc(db, 'bookings', bookingId), {
+          studentJoinTime: serverTimestamp(),
+          studentPresent: true,
+          studentJoined: true,
+          attendance_status: 'pending'
+        });
+      }
+    } catch (e) {
+      console.error("Error updating attendance:", e);
+    }
+    
+    (window as any).lastMuteSignal = Date.now();
+    
+    const sessionRef = doc(db, 'live_sessions', bookingId);
+    const unsub = onSnapshot(doc(db, 'bookings', bookingId), (snap) => {
+      if (!snap.exists()) return;
+      const data = snap.data();
+      
+      // Sync with status from booking
+      if (data.status === 'live' && (sessionStatus === 'waiting' || sessionStatus === 'connecting')) {
+        setSessionStatus('live');
+        if (data.startedAt) {
+          const startedAt = data.startedAt.seconds ? new Date(data.startedAt.seconds * 1000) : new Date(data.startedAt);
+          setSessionStartTime(startedAt);
+        } else {
+          setSessionStartTime(new Date());
+        }
+      }
+      
+      if (data.status === 'completed') {
+        endSession();
+        return;
+      }
+    });
+
+    const reactUnsub = onSnapshot(collection(db, `live_sessions/${bookingId}/reactions`), (snap) => {
+      snap.docChanges().forEach(change => {
+        if (change.type === 'added') {
+          const reaction = change.doc.data();
+          handleSendLiveMessage(`[REACTION]: ${reaction.emoji}`, true);
+        }
+      });
+    });
+
+    const msgUnsub = onSnapshot(query(collection(db, `live_sessions/${bookingId}/messages`), orderBy('timestamp', 'asc')), (snap) => {
+      const msgs = snap.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        time: doc.data().timestamp?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '...'
+      })) as any[];
+      setLiveMessages(msgs);
+    });
+
+    setTimeout(() => {
+      setSessionStatus(prev => {
+        const currentBooking = bookings.find(b => b.id === bookingId);
+        if (currentBooking?.status === 'live') return 'live';
+        return prev === 'connecting' ? 'waiting' : prev;
+      });
+    }, 2000);
+
+    // Socket.IO WebRTC Signaling Setup
+    socketRef.current = io('http://localhost:5001');
+    socketRef.current.emit('join-room', bookingId);
+
+    const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    
+    const initPeerConnection = () => {
+      const pc = new RTCPeerConnection(configuration);
+      
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socketRef.current.emit('ice-candidate', { candidate: event.candidate, roomId: bookingId });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
+      }
+
+      peerConnectionRef.current = pc;
+      return pc;
+    };
+
+    socketRef.current.on('user-connected', async () => {
+      const pc = initPeerConnection();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socketRef.current.emit('offer', { offer, roomId: bookingId });
+    });
+
+    socketRef.current.on('offer', async (offer: any) => {
+      const pc = initPeerConnection();
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socketRef.current.emit('answer', { answer, roomId: bookingId });
+    });
+
+    socketRef.current.on('answer', async (answer: any) => {
+      if (peerConnectionRef.current) {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      }
+    });
+
+    socketRef.current.on('ice-candidate', async (candidate: any) => {
+      if (peerConnectionRef.current) {
+        try {
+          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) { console.error("Error adding ice candidate", e); }
+      }
+    });
+
+    return () => {
+
+      unsub();
+      reactUnsub();
+      msgUnsub();
+    };
+  };
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    const startCamera = async () => {
+      try {
+        if (isCamOn && view === 'live-class' && sessionStatus !== 'disconnected') {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: isMicOn });
+          localStreamRef.current = stream;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+          }
+        } else {
+          if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+          }
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = null;
+          }
+        }
+      } catch (err) {
+        console.error("Error accessing camera:", err);
+      }
+    };
+    startCamera();
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [isCamOn, isMicOn, view, sessionStatus]);
+
+  useEffect(() => {
+    let interval: any;
+    if (sessionStatus === 'live' && sessionStartTime) {
+      interval = setInterval(() => {
+        const diff = Math.floor((new Date().getTime() - sessionStartTime.getTime()) / 1000);
+        const h = Math.floor(diff / 3600).toString().padStart(2, '0');
+        const m = Math.floor((diff % 3600) / 60).toString().padStart(2, '0');
+        const s = (diff % 60).toString().padStart(2, '0');
+        setSessionTimer(`${h}:${m}:${s}`);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [sessionStatus, sessionStartTime]);
+
+  const endSession = async () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    if (activeMeetingId && currentUser?.email) {
+
+      try {
+        const bookingRef = doc(db, 'bookings', activeMeetingId);
+        const bookingSnap = await getDoc(bookingRef);
+        const bookingData = bookingSnap.data() as Booking;
+        
+        let duration = 0;
+        const now = new Date();
+        const emailKey = currentUser.email.replace(/\./g, '_');
+
+        if (bookingData.isGroup && bookingData.participantData && bookingData.participantData[emailKey]) {
+          const joinTime = bookingData.participantData[emailKey].joinTime?.toDate() || new Date();
+          duration = Math.floor((now.getTime() - joinTime.getTime()) / 60000);
+          
+          await updateDoc(bookingRef, {
+            [`participantData.${emailKey}.leaveTime`]: serverTimestamp(),
+            [`participantData.${emailKey}.status`]: duration >= 12 ? 'attended' : 'not_attended',
+            studentPresent: false
+          });
+        } else {
+          const joinTime = bookingData.studentJoinTime?.toDate() || new Date();
+          duration = Math.floor((now.getTime() - joinTime.getTime()) / 60000);
+          
+          await updateDoc(bookingRef, {
+            studentPresent: false,
+            studentLeaveTime: serverTimestamp(),
+            attendance_status: duration >= 12 ? 'attended' : 'not_attended'
+          });
+        }
+      } catch (e) {
+        console.error("Error updating leave time:", e);
+      }
+    }
+    setSessionStatus('disconnected');
+    setSessionStartTime(null);
+    setSessionTimer("00:00:00");
+    setTimeout(() => {
+      setActiveMeetingId(null);
+      setView('dashboard');
+    }, 2000);
+  };
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (activeMeetingId) {
+        updateDoc(doc(db, 'bookings', activeMeetingId), {
+          studentPresent: false,
+          studentLeaveTime: new Date() // Use client date as fallback
+        });
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [activeMeetingId]);
+
+  const handleSendLiveMessage = async (text: string, isReaction: boolean = false) => {
+    if (!text.trim() || !activeMeetingId) return;
+    
+    if (isReaction) {
+      const newMessage = {
+        id: Date.now().toString(),
+        sender: 'System',
+        text,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+      setLiveMessages(prev => [...prev.filter(m => m.text !== text), newMessage]);
+      return;
+    }
+
+    await addDoc(collection(db, `live_sessions/${activeMeetingId}/messages`), {
+      sender: currentUser?.name || 'Student',
+      senderId: currentUser?.id,
+      text,
+      timestamp: serverTimestamp()
+    });
+  };  const openChat = async (tutorId: string) => {
+    if (!currentUser?.email) return;
+
+    const studentEmailKey = currentUser.email.replace(/\./g, '_');
+    const chatId = `${tutorId}_${studentEmailKey}`;
+    
+    // Ensure chat document exists in 'whatsapp'
+    const chatRef = doc(db, 'whatsapp', chatId);
+    const chatSnap = await getDoc(chatRef);
+    
+    if (!chatSnap.exists()) {
+      const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
+      const initialMsg = 'Hi! I am interested in your classes.';
+      
+      await setDoc(chatRef, {
+        tutorId: tutorId,
+        tutorName: tutor?.name || 'Tutor',
+        tutorAvatar: tutor?.avatar || '',
+        studentEmail: currentUser.email,
+        studentName: currentUser.name || 'Student',
+        lastMessage: initialMsg,
+        lastMessageTime: new Date().toISOString(),
+        timestamp: serverTimestamp(),
+        studentUnreadCount: 0,
+        tutorUnreadCount: 1
+      });
+
+      // Add actual message record so it's not empty
+      await addDoc(collection(chatRef, 'messages'), {
+        senderId: currentUser.email,
+        text: initialMsg,
+        timestamp: serverTimestamp(),
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        date: 'TODAY',
+        deletedBy: []
+      });
+    }
+
+    setActiveChatId(chatId);
+    setView('chat');
+  };
+
+
+
+  const processPayment = (upiOption: string) => {
+    if (!selectedTutor || !bookingFormData) return;
+    
+    setPaymentStatus('processing');
+    
+    // Generate UPI Intent deep link for the authentic mobile flow
+    const durationStr = bookingFormData.duration ? bookingFormData.duration.toString().replace(/ Hours?/, '') : '1';
+    const durationNum = parseFloat(durationStr) || 1;
+    
+    const fhpValue = parseFloat(getEffectivePrice(selectedTutor?.price));
+    let amountStr = '0';
+    if (bookingFormData.type === 'demo') {
+      amountStr = '0';
+    } else if (bookingFormData.plan === 'monthly') {
+      const monthTotal = fhpValue * 30;
+      amountStr = monthTotal.toFixed(2);
+    } else {
+      const sCount = parseFloat(bookingFormData.duration) || 1;
+      const countTotal = fhpValue * sCount;
+      amountStr = countTotal.toFixed(2);
+    }
+    const vpa = 'rzp@hdfcbank';
+    const name = encodeURIComponent('Scholar Platform');
+    
+    let deepLink = '';
+    if (upiOption === 'PhonePe') {
+      deepLink = `phonepe://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
+    } else if (upiOption === 'Google Pay') {
+      deepLink = `tez://upi/pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
+    } else if (upiOption === 'Paytm') {
+      deepLink = `paytmmp://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
+    } else {
+      deepLink = `upi://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
+    }
+    
+    // Attempt to open the installed app (if on mobile, this prompts the user to open PhonePe/GPay)
+    try {
+      if (deepLink && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+        window.location.href = deepLink;
+      } else if (deepLink) {
+        console.warn('Deep link redirection skipped on desktop: ', deepLink);
+      }
+    } catch (err) {
+      console.error('Redirection failed:', err);
+    }
+    
+    // Simulate Razorpay checkout process webhook callback from background
+    setTimeout(async () => {
+      // Simulate success
+      const paymentId = 'pay_' + Math.random().toString(36).substr(2, 9);
+      const orderId = 'order_' + Math.random().toString(36).substr(2, 9);
+      
+      setPaymentData({ paymentId, orderId, status: 'success' });
+      setPaymentStatus('success');
+
+      if (bookingFormData?.id) {
+        // Update the 'unpaid' booking to 'pending' (for Admin/Tutor review)
+        const isSub = bookingFormData.plan === 'subscription';
+        const nextBilling = new Date();
+        nextBilling.setDate(nextBilling.getDate() + 30);
+
+        await updateDoc(doc(db, 'bookings', bookingFormData.id), {
+          status: 'pending',
+          paymentId: paymentId,
+          orderId: orderId,
+          amount: parseFloat(amountStr),
+          paidAt: serverTimestamp(),
+          isSubscription: isSub,
+          subscriptionStatus: isSub ? 'active' : null,
+          nextBillingDate: isSub ? nextBilling : null
+        });
+
+        // 🛡️ UPDATE STUDENT SUBSCRIPTION CYCLE (Day 1 of Payment)
+        if (currentUser?.id) {
+          const subStart = new Date();
+          const subEnd = new Date();
+          subEnd.setMonth(subEnd.getMonth() + 3);
+
+          const subLimit = currentTier === 'free' ? 1 : currentTier === 'standard' ? 3 : 8;
+          const updatedSubscription: SubscriptionPlan = {
+            ...currentUser.subscription!,
+            status: 'active',
+            startDate: subStart.toISOString(),
+            expiresAt: subEnd.toISOString(),
+            allowedSubjects: subLimit
+          };
+
+          const userRef = doc(db, 'students', currentUser.id);
+          await updateDoc(userRef, { subscription: updatedSubscription });
+          
+          // Update local state
+          setCurrentUser({ ...currentUser, subscription: updatedSubscription });
+
+          // 🔔 NOTIFY TUTORS
+          notifyTutorsOfPlanUpdate(currentUser.name, updatedSubscription.tier, bookings);
+        }
+
+        // Trigger email notification to the student
+        try {
+          sendPlatformEmail(
+            { name: currentUser?.name || 'Student', email: currentUser?.email || '' },
+            'booking_confirm',
+            { 
+              tutorName: selectedTutor.name, 
+              subject: bookingFormData.subject, 
+              timing: `${bookingFormData.date} at ${bookingFormData.time}` 
+            }
+          );
+        } catch(e) { console.warn("Email dispatch failed:", e) }
+
+          // Notify admin of completed payment
+          await addDoc(collection(db, 'admin_notifications'), {
+            type: 'Payment Success',
+            title: 'Enrollment Confirmed',
+            message: `${currentUser?.name} paid ₹${amountStr} for ${bookingFormData.subject}. Booking ID: ${bookingFormData.id}`,
+            bookingId: bookingFormData.id,
+            time: serverTimestamp(),
+            read: false
+          });
+
+          // Notify tutor of confirmed enrollment
+          await addDoc(collection(db, 'tutor_notifications'), {
+            tutorId: selectedTutor.id,
+            type: 'booking',
+            title: 'Enrollment Confirmed',
+            description: `${currentUser?.name} has completed payment for the ${bookingFormData.subject} session. Plan: ${bookingFormData.plan}.`,
+            time: 'Just now',
+            read: false,
+            createdAt: serverTimestamp()
+          });
+      }
+      
+      setNotifications([{
+        id: `n${Date.now()}`,
+        title: 'Payment Successful',
+        message: `Your booking with ${selectedTutor.name} is confirmed.`,
+        time: 'Just now',
+        type: 'booking',
+        read: false,
+        link: 'my-bookings'
+      }, ...notifications]);
+
+      // 2. Automated welcome chat message
+      const studentEmailKey = currentUser?.email?.replace(/\./g, '_');
+      if (studentEmailKey && selectedTutor) {
+        const chatId = `${selectedTutor.id}_${studentEmailKey}`;
+        const chatRef = doc(db, 'whatsapp', chatId);
+        const autoMsg = `Hi ${selectedTutor.name}, I have just booked a ${bookingFormData.subject} session for ${bookingFormData.date} at ${bookingFormData.time}. Looking forward to it!`;
+        
+        await setDoc(chatRef, {
+          tutorId: selectedTutor.id,
+          tutorName: selectedTutor.name,
+          tutorAvatar: selectedTutor.avatar || '',
+          studentEmail: currentUser?.email,
+          studentName: currentUser?.name || 'Student',
+          lastMessage: autoMsg,
+          lastMessageTime: new Date().toISOString(),
+          timestamp: serverTimestamp(),
+          tutorUnreadCount: increment(1)
+        }, { merge: true });
+
+        await addDoc(collection(chatRef, 'messages'), {
+          senderId: currentUser?.email,
+          text: autoMsg,
+          timestamp: serverTimestamp(),
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          date: 'TODAY',
+          deletedBy: []
+        });
+      }
+
+      // Close modal after success
+      setTimeout(() => {
+        setIsPaymentModalOpen(false);
+        setView('my-bookings');
+      }, 2500);
+
+    }, 4500);
+  };
+
+  const cancelPayment = () => {
+    setPaymentStatus('cancelled');
+    setTimeout(() => {
+      setIsPaymentModalOpen(false);
+      setIsBookingModalOpen(true); // Bring user back to booking modal
+    }, 1500);
+  };
+
+
+  // --- REAL-TIME CHAT SYNC (Rename to whatsapp) ---
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    console.log("Syncing chats for:", currentUser.email);
+
+    // Listen to chats where user is participant
+    const cQuery = query(collection(db, 'whatsapp'), where('studentEmail', '==', currentUser.email));
+    const unsubChats = onSnapshot(cQuery, (snap) => {
+      setChats(prev => {
+        const chatList = snap.docs.map(d => {
+          const data = d.data();
+          const existing = prev.find(p => p.id === d.id);
+          // Use the timestamp to determine a smart date label
+          const getSmartDate = (dateVal: any) => {
+            if (!dateVal) return 'Active';
+            let d: Date;
+            if (dateVal.seconds) d = new Date(dateVal.seconds * 1000);
+            else d = new Date(dateVal);
+
+            if (isNaN(d.getTime())) return 'Active';
+
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const yesterday = new Date(today);
+            yesterday.setDate(yesterday.getDate() - 1);
+
+            const msgDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+
+            if (msgDate.getTime() === today.getTime()) {
+              return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+            if (msgDate.getTime() === yesterday.getTime()) return 'YESTERDAY';
+            
+            return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+          };
+
+          return {
+            id: d.id,
+            tutorId: data.tutorId,
+            tutorName: data.tutorName,
+            avatar: data.tutorAvatar || '',
+            lastMessage: data.lastMessage || 'No messages yet',
+            time: getSmartDate(data.timestamp || data.lastMessageTime),
+            unreadCount: data.studentUnreadCount || 0,
+            tutorUnreadCount: data.tutorUnreadCount || 0,
+            timestamp: data.timestamp,
+            messages: existing?.messages || []
+          } as any;
+        });
+
+        const sortedChats = chatList.sort((a, b) => {
+          const timeA = a.timestamp?.seconds || 0;
+          const timeB = b.timestamp?.seconds || 0;
+          return timeB - timeA;
+        });
+        console.log(`Synced ${sortedChats.length} real chats`);
+        // Merge with mock chats, but only keep mock chats for tutors we DON'T have a real chat for
+        const filteredMockChats = MOCK_CHATS.filter(mock => !sortedChats.some(real => real.tutorId === mock.tutorId));
+        return [...filteredMockChats, ...sortedChats];
+      });
+    }, (err) => {
+      console.error("Chat sync error:", err);
+    });
+
+    return () => unsubChats();
+  }, [currentUser?.email]);
+
+  // Sync messages for active chat
+  useEffect(() => {
+    if (!activeChatId || !currentUser?.email) return;
+
+    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
+    
+    const q = query(
+      collection(db, `whatsapp/${chatId}/messages`), 
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubMsgs = onSnapshot(q, (snap) => {
+      const msgs = snap.docs.map(d => {
+        const data = d.data();
+        return {
+          id: d.id,
+          ...data,
+          // 'me' if student sent it, otherwise 'tutor'
+          sender: data.senderId === currentUser.email ? 'me' : 'tutor'
+        };
+      }).filter((m: any) => !m.deletedBy?.includes(currentUser.email));
+
+      setChats(prev => prev.map(c => {
+        const cId = c.id || `${(c as any).tutorId}_${currentUser.email.replace(/\./g, '_')}`;
+        return cId === chatId ? { ...c, messages: msgs as Message[] } : c;
+      }));
+      
+      // Mark as read
+      const chatDocRef = doc(db, 'whatsapp', chatId);
+      setDoc(chatDocRef, { studentUnreadCount: 0 }, { merge: true });
+    });
+
+    return () => unsubMsgs();
+  }, [activeChatId, currentUser?.email]);
+
+  const baseSendMessage = async (payload: any) => {
+    if (!activeChatId || !currentUser?.email) return;
+    // chatId format: tutorId_studentEmailKey
+    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
+    
+    // Extract tutorId from chatId (everything before the first _)
+    const tutorId = chatId.split('_')[0];
+    const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
+    
+    const chatRef = doc(db, 'whatsapp', chatId);
+    const msgCol = collection(chatRef, 'messages');
+
+    const now = new Date();
+    const msg = {
+      senderId: currentUser.email,
+      timestamp: serverTimestamp(),
+      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      date: now.toDateString(), // Store real date so 'Yesterday' works
+      deletedBy: [],
+      ...payload
+    };
+
+    // Write message first
+    if (payload.editId) {
+      // Editing an existing message
+      const msgRef = doc(db, `whatsapp/${chatId}/messages`, payload.editId);
+      await updateDoc(msgRef, { text: payload.text, edited: true });
+    } else {
+      await addDoc(msgCol, msg);
+    }
+
+    // Always update the chat document with full identity so tutor can find it
+    await setDoc(chatRef, {
+      tutorId: tutorId,
+      tutorName: tutor?.name || 'Tutor',
+      tutorAvatar: tutor?.avatar || '',
+      studentEmail: currentUser.email,
+      studentName: currentUser.name || 'Student',
+      lastMessage: payload.text || (payload.type === 'poll' ? '📊 Poll' : '📎 Attachment'),
+      lastMessageTime: now.toISOString(),
+      timestamp: serverTimestamp(),
+      tutorUnreadCount: increment(1),
+      studentUnreadCount: 0
+    }, { merge: true });
+
+    // 4. Notify Tutor of new message
+    if (tutorId && !payload.editId) {
+      await addDoc(collection(db, 'tutor_notifications'), {
+        tutorId: tutorId,
+        type: 'message',
+        title: `New Message from ${currentUser.name || 'Student'}`,
+        description: payload.text || 'Sent an attachment',
+        time: 'Just now',
+        createdAt: serverTimestamp(),
+        read: false
+      });
+    }
+  };
+
+  const sendMessage = async () => {
+    const chatId = activeChatId;
+    if (!chatId || !currentUser?.email) return;
+
+    const currentDraft = drafts[chatId] || '';
+    if (!currentDraft.trim()) return;
+
+    if (editingMessageId) {
+      // Edit existing message
+      await baseSendMessage({ text: currentDraft.trim(), editId: editingMessageId });
+    } else {
+      await baseSendMessage({ text: currentDraft.trim() });
+    }
+    setDrafts(prev => ({ ...prev, [chatId]: '' }));
+    setEditingMessageId(null);
+  };
+
+  const deleteMessage = async (msgId: string, everyone: boolean) => {
+    if (!activeChatId || !currentUser) return;
+    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
+    const msgRef = doc(db, `whatsapp/${chatId}/messages`, msgId);
+
+    if (everyone) {
+      // Delete for Everyone
+      await updateDoc(msgRef, {
+        text: '🚫 This message was deleted',
+        deletedForEveryone: true
+      });
+    } else {
+      // Delete for Me
+      await updateDoc(msgRef, {
+        deletedBy: arrayUnion(currentUser.email)
+      });
+    }
+  };
+
+  // --- Dynamic Availability ---
+  const [tutorBookings, setTutorBookings] = useState<any[]>([]);
+  const [availableSlots, setAvailableSlots] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (!selectedTutor) return;
+    
+    const unsub = onSnapshot(query(collection(db, 'bookings'), where('tutorId', '==', selectedTutor.id)), (snap) => {
+      setTutorBookings(snap.docs.map(d => d.data()));
+    });
+    return () => unsub();
+  }, [selectedTutor]);
+
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    const q = query(
+      collection(db, 'notifications'), 
+      where('studentEmail', '==', currentUser.email)
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      const data = snap.docs.map(d => ({ id: d.id, ...d.data() })) as Notification[];
+      
+      // Filter based on Student Preferences
+      const prefs = currentUser?.notifications || { reminders: true, messages: true, updates: true };
+      const filtered = data.filter(n => {
+        if (n.type === 'booking') return prefs.reminders !== false;
+        if (n.type === 'message') return prefs.messages !== false;
+        if (n.type === 'update' || n.type === 'platform') return prefs.updates !== false;
+        return true;
+      });
+
+      setNotifications(filtered.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()));
+    });
+    return () => unsub();
+  }, [currentUser]);
+
+
+  // --- Reschedule Availability ---
+  useEffect(() => {
+    if (!reschedulingBooking) {
+      setRescheduleDate('');
+      setRescheduleSlots([]);
+      return;
+    }
+    
+    const initialDate = rescheduleDate || reschedulingBooking.date;
+    if (!rescheduleDate) setRescheduleDate(initialDate);
+
+    const tutorId = reschedulingBooking.tutorId;
+    const studentEmail = reschedulingBooking.studentEmail;
+    const tutor = tutors.find(t => t.id === tutorId) || MOCK_TUTORS.find(t => t.id === tutorId);
+    
+    if (!tutor) return;
+
+    // Note: Sunday is generally a holiday, but we allow rescheduling for regular students if the tutor has explicit slots.
+    const isSunday = new Date(initialDate).getDay() === 0;
+
+    const now = new Date();
+    const isToday = initialDate === now.toISOString().split('T')[0];
+
+    // Find the student's NEXT confirmed class to set a hard deadline
+    const studentBookings = bookings
+      .filter(b => b.studentEmail === studentEmail && b.id !== reschedulingBooking.id && b.status === 'confirmed')
+      .sort((a, b) => new Date(`${a.date} ${a.time}`).getTime() - new Date(`${b.date} ${b.time}`).getTime());
+    
+    // Find the first booking that happens AFTER the original class date or right now
+    const nextClass = studentBookings.find(b => new Date(`${b.date} ${b.time}`) > now);
+    const deadlineTime = nextClass ? new Date(`${nextClass.date} ${nextClass.time}`).getTime() : null;
+
+    // Filter tutor bookings for conflicts
+    const booked = bookings
+      .filter(b => b.tutorId === tutorId && b.date === initialDate && b.status !== 'cancelled' && b.id !== reschedulingBooking.id)
+      .map(b => {
+        const s = parseTime(b.time);
+        const durStr = b.duration ? b.duration.toString().replace(/ Hours?/, '') : '1';
+        const d = (parseFloat(durStr) * 60) || 60;
+        return { start: s, end: s + d };
+      });
+
+    const slots: string[] = [];
+    // Convert tutor's manual slots to time strings for the selected date
+    const getDayName = (dateStr: string) => {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('en-US', { weekday: 'long' });
+    };
+    
+    const selectedDay = getDayName(initialDate);
+    
+    const manualSlotsRaw = (tutor.availability && tutor.availability.length > 0)
+      ? tutor.availability
+          .filter((slot: any) => {
+            if (typeof slot === 'string') return true;
+            if (!slot || typeof slot !== 'object') return false;
+            // Filter out busy slots
+            if (slot.status === 'busy') return false;
+            if (slot.date) return slot.date === initialDate;
+            if (slot.day) return slot.day.toLowerCase() === selectedDay.toLowerCase();
+            return false;
+          })
+      : [];
+
+    const baseAvailability = manualSlotsRaw.map((slot: any) => typeof slot === 'string' ? slot : (slot.start || ''))
+          .filter((time: string) => !!time);
+
+    manualSlotsRaw.forEach((s: any) => {
+      const startTime = typeof s === 'string' ? s : (s.start || '');
+      const endTime = typeof s === 'string' ? '' : (s.end || '');
+      
+      if (!startTime) return;
+
+      const startMins = parseTime(startTime);
+      const endMins = endTime ? parseTime(endTime) : startMins + 60;
+
+      // Expand range in 1-hour intervals
+      for (let slotStartMins = startMins; slotStartMins < endMins; slotStartMins += 60) {
+        const slotEndMins = slotStartMins + 60;
+        const slotTimeStr = formatMins(slotStartMins);
+        const slotDateTime = new Date(`${initialDate} ${slotTimeStr}`).getTime();
+
+        // Rule 1: Must be in the future (if today)
+        if (isToday) {
+          const minTime = now.getTime() + (60 * 60 * 1000); // At least 1 hour from now
+          if (slotDateTime < minTime) continue;
+        }
+
+        // Rule 2: Must be BEFORE the next class
+        if (deadlineTime && slotDateTime >= deadlineTime) continue;
+
+        // Rule 3: Must not conflict with tutor's other bookings
+        if (!booked.some(r => slotStartMins < r.end && slotEndMins > r.start)) {
+          slots.push(slotTimeStr);
+        }
+      }
+    });
+
+    setRescheduleSlots(slots);
+  }, [reschedulingBooking, rescheduleDate, bookings, tutors]);
+
+
+
+  const handleBooking = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const type = bookingType;
+    if (!selectedTutor || !currentUser) return;
+    
+    const form = e.target as HTMLFormElement;
+    const subject = (form.elements.namedItem('subject') as HTMLSelectElement)?.value || (bookingFormData?.subject || 'General');
+    const date = (form.elements.namedItem('date') as HTMLInputElement)?.value || (bookingFormData?.date || '');
+    const time = (form.elements.namedItem('time') as HTMLSelectElement)?.value || bookingSelectedTime || (bookingFormData?.time || '');
+    const duration = (form.elements.namedItem('duration') as HTMLSelectElement)?.value || (bookingFormData?.duration || '1 Hour');
+    const plan = (form.elements.namedItem('plan') as HTMLSelectElement)?.value as 'monthly' | 'subscription' | 'course' || 'subscription';
+    const amount = getBookingAmount();
+
+    // ⚡ PREVENT DUPLICATE BOOKINGS ⚡
+    const isDuplicate = bookings.some(b => 
+      b.tutorId === selectedTutor.id && 
+      b.studentEmail === currentUser.email && 
+      b.date === date && 
+      b.time === time &&
+      b.status !== 'cancelled'
+    );
+
+    if (isDuplicate) {
+      alert(`⚠️ You already have a session booked for this exact time (${date} at ${time}). Please choose another slot or subject.`);
+      return;
+    }
+
+    // 🛡️ TIER-BASED BOOKING GUARDS (Updated Logic)
+    const tier = currentTier;
+    const activeBookings = bookings.filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+    const activeSubjects = new Set(activeBookings.map(b => b.subject.toLowerCase()));
+    const activeTutors = new Set(activeBookings.map(b => b.tutorId));
+
+    const isNewSubject = !activeSubjects.has(subject.toLowerCase());
+    const isNewTutor = !activeTutors.has(selectedTutor.id);
+
+    // Subject Limits based on Plan (Fixed 1, 3, 8)
+    const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
+
+    // Rule: Allow multiple tutors as long as within subject count. 
+    // Example: 1 tutor 3 subjects OR 3 tutors 1 subject each.
+    if (isNewSubject && activeSubjects.size >= subjectLimit) {
+       alert(`⚠️ ${tier.charAt(0).toUpperCase() + tier.slice(1)} Plan Subject Limit: You have reached your ${subjectLimit}-subject limit. Upgrade to a higher plan for more subjects!`);
+       return;
+    }
+
+    if (isNewTutor && activeTutors.size >= subjectLimit) {
+       alert(`⚠️ ${tier.charAt(0).toUpperCase() + tier.slice(1)} Plan Tutor Limit: You can book as many tutors as your subject count (${subjectLimit}). Cancel a session or upgrade to add another tutor.`);
+       return;
+    }
+
+    const isGroup = (form.elements.namedItem('isGroup') as HTMLInputElement)?.value === 'true';
+
+    // ⚡ CHECK FOR EXISTING GROUP SESSION ⚡
+    const existingGroup = bookings.find(b => 
+      b.tutorId === selectedTutor.id && 
+      b.date === date && 
+      b.time === time &&
+      b.subject === subject &&
+      b.isGroup === true &&
+      b.status !== 'cancelled'
+    );
+
+    if (isGroup && existingGroup) {
+      if (existingGroup.participants?.includes(currentUser.email)) {
+        alert("🚨 You are already enrolled in this group session.");
+        setIsBookingModalOpen(false);
+        return;
+      }
+      if (existingGroup.participantCount && existingGroup.participantCount >= 5) {
+        alert("🚨 This group session is now full. Please choose another slot.");
+        setIsBookingModalOpen(false);
+        return;
+      }
+    }
+
+    if (type === 'demo') {
+      const hasExistingDemo = bookings.some(b => 
+        b.tutorId === selectedTutor.id && 
+        b.studentEmail === currentUser.email && 
+        b.type === 'demo' &&
+        b.status !== 'cancelled'
+      );
+
+      if (hasExistingDemo) {
+        alert("🚨 You have already booked a demo with this tutor. Please proceed to book a full course or wait for your session.");
+        setIsBookingModalOpen(false);
+        return;
+      }
+
+      try {
+        if (isGroup && existingGroup) {
+          // Join existing group demo
+          updateDoc(doc(db, 'bookings', existingGroup.id), {
+            participants: arrayUnion(currentUser.email),
+            participantCount: increment(1),
+            [`participantData.${currentUser.email.replace(/\./g, '_')}`]: {
+              name: currentUser.name,
+              joinTime: null,
+              leaveTime: null,
+              status: 'pending'
+            }
+          });
+        } else {
+          // Create new demo (1-on-1 or new Group)
+          const bookingData = {
+            tutorId: selectedTutor.id,
+            tutorName: selectedTutor.name,
+            studentId: currentUser.email,
+            studentName: currentUser.name,
+            studentEmail: currentUser.email,
+            studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
+            subject,
+            date,
+            time,
+            duration,
+            status: 'pending',
+            type: 'demo',
+            amount: 0,
+            createdAt: serverTimestamp(),
+            isGroup,
+            maxParticipants: isGroup ? 5 : 1,
+            participantCount: 1,
+            participants: [currentUser.email],
+            participantData: {
+              [currentUser.email.replace(/\./g, '_')]: {
+                name: currentUser.name,
+                joinTime: null,
+                leaveTime: null,
+                status: 'pending'
+              }
+            }
+          };
+          addDoc(collection(db, 'bookings'), bookingData);
+        }
+        
+        // Immediate Feedback: Close modal and switch view before notification finishes
+        setIsBookingModalOpen(false);
+        setView('my-bookings');
+
+        // Background: Notify Tutor
+        addDoc(collection(db, 'tutor_notifications'), {
+          tutorId: selectedTutor.id,
+          type: 'booking',
+          title: isGroup ? 'New Group Participant' : 'New Demo Requested',
+          description: `${currentUser.name} joined ${isGroup ? 'the group' : 'a demo'} session for ${subject} on ${date} at ${time}.`,
+          time: 'Just now',
+          read: false,
+          createdAt: serverTimestamp()
+        });
+
+        // Background: Notify Admin about demo booking
+        addDoc(collection(db, 'admin_notifications'), {
+          type: 'Demo Booking',
+          title: 'New Demo Session',
+          message: `${currentUser.name} booked a demo with ${selectedTutor.name} for ${subject} on ${date} at ${time}.`,
+          time: serverTimestamp(),
+          read: false
+        });
+      } catch (e) {
+        console.error("Booking error:", e);
+      }
+    } else {
+      // Paid sessions
+      try {
+        if (isGroup && existingGroup) {
+        // For now, even if joining a group, we create a reference for payment
+        // But the shared document is what matters for the live class.
+        // We'll update the shared document after payment success.
+        const paymentRefData = {
+          isJoiningGroup: true,
+          groupId: existingGroup.id,
+          tutorId: selectedTutor.id,
+          tutorName: selectedTutor.name,
+          studentId: currentUser.email,
+          studentName: currentUser.name,
+          studentEmail: currentUser.email,
+          subject,
+          date,
+          time,
+          duration,
+          plan,
+          amount,
+          createdAt: serverTimestamp(),
+          isGroup: true
+        };
+        const docRef = await addDoc(collection(db, 'bookings'), paymentRefData);
+        setBookingFormData({ ...paymentRefData, id: docRef.id });
+      } else {
+        const bookingData = {
+          tutorId: selectedTutor.id,
+          tutorName: selectedTutor.name,
+          studentId: currentUser.email,
+          studentName: currentUser.name,
+          studentEmail: currentUser.email,
+          studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
+          subject,
+          date,
+          time,
+          duration,
+          plan,
+          status: 'unpaid',
+          type: 'paid',
+          amount,
+          createdAt: serverTimestamp(),
+          isGroup,
+          maxParticipants: isGroup ? 5 : 1,
+          participantCount: 1,
+          participants: [currentUser.email]
+        };
+        const docRef = await addDoc(collection(db, 'bookings'), bookingData);
+        setBookingFormData({ ...bookingData, id: docRef.id });
+      }
+      
+        setIsBookingModalOpen(false);
+        setIsPaymentModalOpen(true);
+        setPaymentStatus('idle');
+      } catch (e) {
+        console.error("Payment setup error:", e);
+      }
+    }
+  };
+
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+
+  const handleLogout = async () => {
+    setShowLogoutConfirm(true);
+  };
+
+  const confirmLogout = async () => {
+    localStorage.removeItem('student_logged_in');
+    localStorage.removeItem('student_view');
+    localStorage.removeItem('student_user');
+    await signOut(auth);
+    setView('login');
+    setCurrentUser(null);
+    setShowLogoutConfirm(false);
+  };
+
+  const cancelLogout = () => {
+    setShowLogoutConfirm(false);
+  };
+
+
+
+
+
+
+
+
+
+  // --- View Components ---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
+  const [cancelBooking, setCancelBooking] = useState<Booking | null>(null);
+  const [isCancelling, setIsCancelling] = useState(false);
+
+  const calculateRefund = (booking: Booking) => {
+    if (!booking.amount) return { eligible: false, refundAmount: 0, reason: "No payment found" };
+
+    const platformFeeRate = 0.17;
+    const totalAmount = booking.amount;
+    const platformFee = totalAmount * platformFeeRate;
+    
+    // Calculate days since payment
+    const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
+    if (!paidAt) return { eligible: false, refundAmount: 0, reason: "Payment date unknown" };
+
+    const now = new Date();
+    const diffTime = Math.abs(now.getTime() - paidAt.getTime());
+    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+    // Plan-Specific Flags
+    const isSubscription = booking.isSubscription || booking.plan === 'subscription';
+    const isMonthly = booking.plan === 'monthly';
+    const isCourse = booking.plan?.startsWith('course_');
+
+    // Visibility & Eligibility Thresholds
+    // Subscriptions: Always visible/eligible (any time)
+    // Monthly/Course: Only eligible within first 15 days
+    const isWithinWindow = diffDays <= 15;
+
+    if (!isSubscription && !isWithinWindow) {
+      return { eligible: false, refundAmount: 0, reason: "Cancellation window (15 days) has expired for this plan type." };
+    }
+
+    // Refund Split Rules: Tutor 50%, Platform 17%, Student 33% (Remaining)
+    // This applies to all eligible cancellations
+    const tutorShare = totalAmount * 0.5;
+    const refundAmount = totalAmount - tutorShare - platformFee;
+
+    return { 
+      eligible: refundAmount > 0, 
+      refundAmount: Math.max(0, Math.floor(refundAmount)),
+      breakdown: { 
+        platformFee: Math.floor(platformFee), 
+        tutorShare: Math.floor(tutorShare), 
+        diffDays, 
+        type: isSubscription ? 'subscription' : (isMonthly ? 'monthly' : 'course')
+      }
+    };
+  };
+
+  const handleRequestCancellation = async () => {
+    if (!cancelBooking) return;
+    setIsCancelling(true);
+    try {
+      await updateDoc(doc(db, 'bookings', cancelBooking.id), { 
+        status: 'pending_cancellation',
+        cancellationRequestedAt: serverTimestamp()
+      });
+      // 1. Notify Admin
+      await addDoc(collection(db, 'admin_notifications'), {
+        type: 'Cancellation Request',
+        title: 'Booking Cancellation Requested',
+        message: `${currentUser?.name} has requested to cancel their session for ${cancelBooking.subject} with ${cancelBooking.tutorName}.`,
+        bookingId: cancelBooking.id,
+        time: serverTimestamp(),
+        read: false
+      });
+
+      // 2. Notify Tutor
+      await addDoc(collection(db, 'tutor_notifications'), {
+        tutorId: cancelBooking.tutorId,
+        type: 'update',
+        title: 'Cancellation Requested',
+        description: `${currentUser?.name} requested to cancel the ${cancelBooking.subject} session on ${cancelBooking.date}.`,
+        time: 'Just now',
+        read: false,
+        createdAt: serverTimestamp()
+      });
+
+      alert('Your booking cancellation request has been submitted. We will review it and notify you soon.');
+      setIsCancelModalOpen(false);
+      setCancelBooking(null);
+    } catch (e) {
+      console.error("Error submitting cancellation:", e);
+      alert('Failed to submit cancellation request. Please try again.');
+    } finally {
+      setIsCancelling(false);
+    }
+  };
+
+  // --- Core Lifecycle ---
+  const renderView = () => {
+    switch (view) {
+      case 'blocked':
+        return (
+          <div className="min-h-screen bg-background flex flex-col items-center justify-center p-6 text-center">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="w-20 h-20 bg-rose-100 rounded-full flex items-center justify-center text-rose-600 mb-6"
+            >
+              <AlertTriangle size={40} />
+            </motion.div>
+            <h2 className="text-3xl font-black text-slate-800 tracking-tight mb-4">Account Suspended</h2>
+            <p className="max-w-md text-slate-500 font-medium leading-relaxed mb-8">
+              Your access to Eduqra Scholar has been temporarily suspended by the administrator. 
+              This is typically due to policy violations, inactivity, or a manual review.
+            </p>
+            <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 text-[10px] font-black uppercase tracking-widest text-slate-400">
+              Reference ID: {currentUser?.id || 'N/A'}
+            </div>
+            <div className="mt-8 space-y-4">
+              <p className="text-sm font-bold text-rose-600 bg-rose-50 py-3 px-6 rounded-xl border border-rose-100 italic">
+                "We're sorry, but you are currently unable to access this site."
+              </p>
+              <button 
+                onClick={confirmLogout}
+                className="w-full px-8 py-4 bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:scale-105 active:scale-95 transition-all shadow-xl shadow-slate-900/20 flex items-center justify-center gap-3"
+              >
+                Sign Out & Support
+              </button>
+            </div>
+          </div>
+        );
+      case 'payments':
+        return (
+          <PaymentsView 
+            bookings={bookings}
+            onPay={(booking) => {
+              const tutor = tutors.find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId);
+              setSelectedTutor(tutor || null);
+              setBookingFormData({ 
+                subject: booking.subject, 
+                date: booking.date, 
+                time: booking.time, 
+                duration: booking.duration.replace(/ Hours?/, ''),
+                id: booking.id,
+                plan: booking.plan
+              });
+              setIsPaymentModalOpen(true);
+              setPaymentStatus('idle');
+              setPaymentData({});
+            }}
+          />
+        );
+      case 'login':
+        return <LoginView setView={setView} setCurrentUser={setCurrentUser} />;
+      case 'register':
+        return <RegisterView setView={setView} setCurrentUser={setCurrentUser} />;
+      case 'forgot-password':
+        return <ForgotPasswordView setView={setView} />;
+      case 'dashboard':
+        return (
+          <DashboardView 
+            setView={setView} 
+            bookings={bookings} 
+            setSelectedTutor={setSelectedTutor} 
+            openChat={openChat} 
+            onReschedule={(booking) => setReschedulingBooking(booking)} 
+            tutors={tutors}
+            currentUser={currentUser}
+            parseTime={parseTime}
+            currentTier={currentTier}
+          />
+        );
+      case 'find-tutors':
+        return (
+          <FindTutorsView 
+            setView={setView} 
+            setSelectedTutor={setSelectedTutor} 
+            tutors={tutors}
+            currentUser={currentUser}
+            bookings={bookings}
+            setBookingType={setBookingType}
+            setIsBookingModalOpen={setIsBookingModalOpen}
+            setBookingPlan={setBookingPlan}
+            setBookingDuration={setBookingDuration}
+            openChat={openChat}
+          />
+        );
+      case 'tutor-profile':
+        return (
+          <TutorProfileView 
+            selectedTutor={selectedTutor} 
+            setView={setView} 
+            setIsBookingModalOpen={setIsBookingModalOpen} 
+            openChat={openChat}
+            bookings={bookings}
+            setBookingType={setBookingType}
+            setBookingDuration={setBookingDuration}
+            setBookingPlan={setBookingPlan}
+            parseTime={parseTime}
+          />
+        );
+      case 'my-bookings':
+        return (
+          <MyBookingsView 
+            bookings={bookings} 
+            setBookings={setBookings}
+            openChat={openChat} 
+            onReschedule={(booking) => setReschedulingBooking(booking)} 
+            setView={setView}
+            setSelectedTutor={setSelectedTutor}
+            tutors={tutors}
+            startSession={startSession}
+            parseTime={parseTime}
+            currentUser={currentUser}
+            setCancelBooking={setCancelBooking}
+            setIsCancelModalOpen={setIsCancelModalOpen}
+            calculateRefund={calculateRefund}
+          />
+        );
+      case 'chat':
+        return (
+          <ChatView 
+            chats={chats}
+            activeChatId={activeChatId}
+            setActiveChatId={setActiveChatId}
+            setChats={setChats}
+            drafts={drafts}
+            setDrafts={setDrafts}
+            sendMessage={sendMessage}
+            baseSendMessage={baseSendMessage}
+            deleteMessage={deleteMessage}
+            setView={setView}
+            editingMessageId={editingMessageId}
+            setEditingMessageId={setEditingMessageId}
+            setIsMobileSidebarOpen={setIsMobileSidebarOpen}
+            isChatMenuOpen={isChatMenuOpen}
+            setIsChatMenuOpen={setIsChatMenuOpen}
+            currentUser={currentUser}
+            bookings={bookings}
+            tutors={tutors}
+            openChat={openChat}
+          />
+        );
+      case 'reviews':
+        return <ReviewsView bookings={bookings} tutors={tutors} currentUser={currentUser} setBookings={setBookings} getReputation={getReputation} />;
+      case 'progress':
+        return <ProgressTrackerView setView={setView} bookings={bookings} />;
+      case 'notes':
+        if (currentTier === 'free') {
+          return (
+            <div className="p-10 text-center flex flex-col items-center justify-center min-h-[60vh]">
+              <Lock size={48} className="text-primary/20 mb-6" />
+              <h2 className="text-3xl font-serif font-black italic text-slate-800">Tutor Notes Vault</h2>
+              <p className="text-sm text-slate-500 mt-4 max-w-md mx-auto">
+                Access comprehensive study materials and session notes shared by your tutors. 
+                Upgrade to a **Standard** or **Premium** plan to unlock this vault.
+              </p>
+              <button 
+                onClick={() => setView('settings')}
+                className="mt-8 px-8 py-3.5 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-105 transition-all shadow-xl shadow-primary/20"
+              >
+                Upgrade Plan
+              </button>
+            </div>
+          );
+        }
+        return <NotesView currentUser={currentUser} bookings={bookings} currentTier={currentTier} setView={setView} />;
+      case 'assignments':
+        if (currentTier !== 'premium') {
+          return (
+            <div className="p-10 text-center flex flex-col items-center justify-center min-h-[60vh]">
+              <FileCheck size={48} className="text-primary/20 mb-6" />
+              <h2 className="text-3xl font-serif font-black italic text-slate-800">Assessments & Mock Tests</h2>
+              <p className="text-sm text-slate-500 mt-4 max-w-md mx-auto">
+                Regular mock tests and assignments are exclusive to our **Elite Premium** scholars.
+                Get real-time feedback and detailed performance analysis.
+              </p>
+              <button 
+                onClick={() => setView('settings')}
+                className="mt-8 px-8 py-3.5 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-105 transition-all shadow-xl shadow-primary/20"
+              >
+                Upgrade to Premium
+              </button>
+            </div>
+          );
+        }
+        return (
+          <div className="p-10 text-center">
+            <FileCheck size={48} className="mx-auto mb-4 text-primary" />
+            <h2 className="text-2xl font-serif font-bold">Assignments & Mock Tests</h2>
+            <p className="text-sm text-primary/40 mt-2">Welcome to your assessment portal. New tests will appear here based on your curriculum.</p>
+          </div>
+        );
+      case 'projects':
+        if (currentTier !== 'premium') {
+          return (
+            <div className="p-10 text-center flex flex-col items-center justify-center min-h-[60vh]">
+              <Briefcase size={48} className="text-primary/20 mb-6" />
+              <h2 className="text-3xl font-serif font-black italic text-slate-800">Project Guidance</h2>
+              <p className="text-sm text-slate-500 mt-4 max-w-md mx-auto">
+                Get hands-on industry project guidance and academic project support. 
+                This feature is reserved for our **Elite Premium** scholars.
+              </p>
+              <button 
+                onClick={() => setView('settings')}
+                className="mt-8 px-8 py-3.5 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-105 transition-all shadow-xl shadow-primary/20"
+              >
+                Upgrade to Premium
+              </button>
+            </div>
+          );
+        }
+        return (
+          <div className="p-10 text-center">
+            <Briefcase size={48} className="mx-auto mb-4 text-primary" />
+            <h2 className="text-2xl font-serif font-bold">Advanced Projects</h2>
+            <p className="text-sm text-primary/40 mt-2">Academic & Industry project guidance portal is active.</p>
+          </div>
+        );
+      case 'settings':
+        return <SettingsView setView={setView} currentUser={currentUser} setCurrentUser={setCurrentUser} currentTier={currentTier} bookings={bookings} notifyTutorsOfPlanUpdate={notifyTutorsOfPlanUpdate} effectiveSubscription={effectiveSubscription} />;
+      case 'live-class':
+        return <div className="flex-1 bg-[#0A0A0B]" />;
+      default:
+        return (
+          <div className="min-h-screen bg-background flex items-center justify-center">
+            <div className="text-center">
+              <h2 className="text-xl font-bold text-gray-700 mb-4">Page Not Found</h2>
+              <p className="text-gray-500 mb-6">The requested view could not be loaded.</p>
+              <button 
+                onClick={() => setView('dashboard')}
+                className="bg-primary text-white px-6 py-2 rounded-lg hover:bg-primary/90"
+              >
+                Go to Dashboard
+              </button>
+            </div>
+          </div>
+        );
+    }
   };
 
   if (loading) {
@@ -4526,28 +6601,7 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
   }
 
   if (['login', 'register', 'forgot-password'].includes(view)) {
-    const viewComponent = views[view as keyof typeof views];
-    return viewComponent || <LoginView setView={setView} setCurrentUser={setCurrentUser} />;
-  }
-
-  const currentView = views[view];
-  
-  if (!currentView) {
-    console.error("View not found:", view);
-    return (
-      <div className="min-h-screen bg-background flex items-center justify-center">
-        <div className="text-center">
-          <h2 className="text-xl font-bold text-gray-700 mb-4">Page Not Found</h2>
-          <p className="text-gray-500 mb-6">The requested view could not be loaded.</p>
-          <button 
-            onClick={() => setView('dashboard')}
-            className="bg-primary text-white px-6 py-2 rounded-lg hover:bg-primary/90"
-          >
-            Go to Dashboard
-          </button>
-        </div>
-      </div>
-    );
+    return renderView();
   }
 
 
@@ -4562,6 +6616,8 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
           handleLogout={handleLogout} 
           currentUser={currentUser} 
           chats={chats}
+          currentTier={currentTier}
+          effectiveSubscription={effectiveSubscription}
         />
         <div className="flex-1 h-screen overflow-hidden flex flex-col min-w-0 md:pl-64 lg:pl-72">
           <main className={`content-area ${view === 'chat' ? '' : 'content-area-padded'}`}>
@@ -4578,10 +6634,13 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                 setView={setView} 
                 currentUser={currentUser}
                 handleLogout={handleLogout}
+                notifBgMap={notifBgMap}
+                notifIconMap={notifIconMap}
+                formatTime={formatTime}
               />
             )}
             
-            {currentView}
+            {renderView()}
           </main>
         </div>
       </div>
@@ -4593,8 +6652,14 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
       >
         <form onSubmit={handleBooking} className="space-y-8">
           <div className="space-y-3">
-            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Select Subject</label>
-            <select name="subject" className="input-field" required defaultValue="">
+            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Current Focus</label>
+            <select 
+              name="subject" 
+              className="input-field" 
+              required 
+              value={bookingSelectedSubject}
+              onChange={(e) => setBookingSelectedSubject(e.target.value)}
+            >
               <option value="" disabled>Select Subject</option>
               {(() => {
                 const btechTechnical = [
@@ -4640,22 +6705,31 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
               value={bookingPlan}
               onChange={(e: any) => setBookingPlan(e.target.value)}
             >
-              <option value="hourly">Hourly Foundation (Per Session)</option>
-              <option value="monthly">Monthly Track (20 Sessions)</option>
-              {(currentUser?.studentType === 'btech' || currentUser?.studentType === 'degree' || currentUser?.class === 'B.Tech') ? (
-                <>
-                  <option value="course_45">B.Tech Technical (45 Sessions)</option>
-                  <option value="course_60">B.Tech Technical (60 Sessions)</option>
-                  <option value="yearly">Yearly Mentorship (Monthly Payment)</option>
-                </>
-              ) : (
-                <option value="yearly">Academic Yearly (Monthly Payment)</option>
-              )}
+              {(() => {
+                const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate');
+                if (isGraduate) {
+                  return (
+                    <>
+                      <option value="monthly">Monthly Academic Enrollment</option>
+                      <option value="course">Full Course Enrollment</option>
+                    </>
+                  );
+                }
+                return (
+                  <>
+                    <option value="" disabled>Choose One</option>
+                    <option value="subscription">Yearly Plan (Pay Monthly)</option>
+                    <option value="monthly">Monthly Academic Enrollment</option>
+                  </>
+                );
+              })()}
             </select>
           </div>
 
-          {/* Group Session Selection for B.Tech/Degree students */}
-          {(currentUser?.studentType === 'btech' || currentUser?.studentType === 'degree' || currentUser?.class === 'B.Tech') && (
+
+
+          {/* Group Session Selection - GRADUATES ONLY */}
+          {(currentUser?.studentType === 'btech' || currentUser?.studentType === 'degree' || currentUser?.class === 'B.Tech') ? (
             <div className="space-y-4 p-4 bg-primary/5 rounded-2xl border border-primary/10">
               <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Session Format</label>
               <div className="flex gap-4">
@@ -4666,53 +6740,62 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                   </div>
                   <input type="radio" name="isGroup" value="false" defaultChecked className="accent-primary" />
                 </label>
-                <label className="flex-1 flex items-center justify-between p-3 rounded-xl border bg-white cursor-pointer hover:border-primary transition-all">
-                  <div className="flex items-center gap-2">
-                    <Users size={16} className="text-primary" />
-                    <div>
-                      <span className="text-sm font-bold">Group</span>
-                      {(() => {
-                        const existingGroup = bookings.find(b => 
-                          b.tutorId === selectedTutor?.id && 
-                          b.date === bookingSelectedDate && 
-                          b.isGroup === true &&
-                          b.status !== 'cancelled'
-                        );
-                        if (existingGroup) {
-                          return (
-                            <p className={`text-[9px] font-black uppercase ${existingGroup.participantCount && existingGroup.participantCount >= 5 ? 'text-rose-500' : 'text-emerald-500'}`}>
-                              {existingGroup.participantCount || 0}/5 Filled
-                            </p>
-                          );
-                        }
-                        return <p className="text-[9px] font-black uppercase text-primary/20">New Group</p>;
-                      })()}
-                    </div>
-                  </div>
-                  {(() => {
-                    const existingGroup = bookings.find(b => 
-                      b.tutorId === selectedTutor?.id && 
-                      b.date === bookingSelectedDate && 
-                      b.isGroup === true &&
-                      b.status !== 'cancelled'
-                    );
-                    const isFull = existingGroup && existingGroup.participantCount && existingGroup.participantCount >= 5;
+                
+                {(() => {
+                  if (!bookingSelectedSubject) {
                     return (
+                      <div className="flex-1 p-3 rounded-xl border border-dashed border-gray-200 bg-gray-50 flex items-center justify-center">
+                        <p className="text-[10px] font-black text-gray-300 uppercase">Select Subject First</p>
+                      </div>
+                    );
+                  }
+
+                  const existingGroup = bookings.find(b => 
+                    b.tutorId === selectedTutor?.id && 
+                    b.date === bookingSelectedDate && 
+                    b.subject === bookingSelectedSubject &&
+                    b.isGroup === true &&
+                    b.status !== 'cancelled'
+                  );
+                  const count = existingGroup?.participantCount || 0;
+                  const isFull = count >= 5;
+                  
+                  return (
+                    <label className={cn(
+                      "flex-1 flex items-center justify-between p-3 rounded-xl border bg-white transition-all",
+                      isFull ? "opacity-60 cursor-not-allowed border-rose-100 bg-rose-50/30" : "cursor-pointer hover:border-primary"
+                    )}>
+                      <div className="flex items-center gap-2">
+                        <Users size={16} className={cn(isFull ? "text-rose-400" : "text-primary")} />
+                        <div>
+                          <span className="text-sm font-bold">Group</span>
+                          <p className={cn(
+                            "text-[9px] font-black uppercase",
+                            isFull ? "text-rose-500" : count > 0 ? "text-emerald-500" : "text-primary/20"
+                          )}>
+                            {isFull ? 'Booking Full' : count > 0 ? `${5 - count} Slots Left` : 'New Group'}
+                          </p>
+                        </div>
+                      </div>
                       <input 
                         type="radio" 
                         name="isGroup" 
                         value="true" 
                         disabled={isFull}
-                        className={`accent-primary ${isFull ? 'cursor-not-allowed opacity-30' : ''}`}
+                        className="accent-primary"
                       />
-                    );
-                  })()}
-                </label>
+                    </label>
+                  );
+                })()}
               </div>
+              
               {(() => {
+                if (!bookingSelectedSubject) return null;
+
                 const existingGroup = bookings.find(b => 
                   b.tutorId === selectedTutor?.id && 
                   b.date === bookingSelectedDate && 
+                  b.subject === bookingSelectedSubject &&
                   b.isGroup === true &&
                   b.status !== 'cancelled'
                 );
@@ -4720,12 +6803,17 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                   return (
                     <div className="flex items-center gap-2 text-rose-500 p-2 bg-rose-50 rounded-lg">
                       <XCircle size={14} />
-                      <span className="text-[10px] font-bold uppercase tracking-widest">Slot Full - Join another session</span>
+                      <span className="text-[10px] font-bold uppercase tracking-widest">Subject Group is Full</span>
                     </div>
                   );
                 }
                 return null;
               })()}
+            </div>
+          ) : (
+            /* School/Inter Students - Lock to 1-on-1 */
+            <div className="hidden">
+              <input type="radio" name="isGroup" value="false" checked readOnly />
             </div>
           )}
           <div className="grid grid-cols-2 gap-6">
@@ -4737,34 +6825,85 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                 className="input-field" 
                 required 
                 min={new Date().toISOString().split('T')[0]} 
+                max="2099-12-31"
                 value={bookingSelectedDate}
+                onInput={(e) => {
+                  const val = e.currentTarget.value;
+                  if (val) {
+                    const parts = val.split('-');
+                    if (parts[0] && parts[0].length > 4) {
+                      parts[0] = parts[0].slice(0, 4);
+                      e.currentTarget.value = parts.join('-');
+                      setBookingSelectedDate(e.currentTarget.value);
+                    }
+                  }
+                }}
                 onChange={(e) => setBookingSelectedDate(e.target.value)}
               />
             </div>
             <div className="space-y-3">
               <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Select Time</label>
-              <select name="time" className="input-field" required>
-                {new Date(bookingSelectedDate).getDay() !== 0 ? (
-                  <>
-                    {(selectedTutor?.availability || []).map(t => <option key={t} value={t}>{t}</option>)}
-                    {(!selectedTutor?.availability || selectedTutor.availability.length === 0) && (
-                      <>
-                        <option value="09:00 AM">09:00 AM (Default)</option>
-                        <option value="11:00 AM">11:00 AM (Default)</option>
-                        <option value="02:00 PM">02:00 PM (Default)</option>
-                        <option value="04:00 PM">04:00 PM (Default)</option>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <option value="" disabled>Classes are not available on Sundays</option>
-                )}
+              <select 
+                name="time" 
+                className="input-field" 
+                required 
+                value={bookingSelectedTime}
+                onChange={(e) => setBookingSelectedTime(e.target.value)}
+              >
+                {(() => {
+                  if (!bookingSelectedDate) {
+                    return <option value="10:00 AM">10:00 AM</option>;
+                  }
+                  
+                  const dateObj = new Date(bookingSelectedDate);
+                  const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
+                  
+                  const rawSlots = (selectedTutor?.availability || [])
+                    .filter((s: any) => {
+                       if (typeof s === 'string') return true;
+                       if (s.status === 'busy') return false;
+                       if (s.date) return s.date === bookingSelectedDate;
+                       if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
+                       return false;
+                    });
+
+                  const expandedSlots: string[] = [];
+                  rawSlots.forEach((s: any) => {
+                    const startTime = typeof s === 'string' ? s : (s.start || '');
+                    const endTime = typeof s === 'string' ? '' : (s.end || '');
+                    if (!startTime) return;
+                    const startMins = parseTime(startTime);
+                    const endMins = endTime ? parseTime(endTime) : startMins + 60;
+                    for (let m = startMins; m < endMins; m += 60) {
+                      expandedSlots.push(formatMins(m));
+                    }
+                  });
+
+                  const finalSlots = expandedSlots.filter(slotTime => {
+                    return !tutorBookings.some(b => 
+                      b.date === bookingSelectedDate && 
+                      b.time === slotTime && 
+                      ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
+                    );
+                  });
+
+                  if (finalSlots.length === 0) {
+                    return <option value="10:00 AM">10:00 AM</option>;
+                  }
+
+                  return (
+                    <>
+                      <option value="" disabled>Choose Time</option>
+                      {finalSlots.map((t, idx) => <option key={idx} value={t}>{t}</option>)}
+                    </>
+                  );
+                })()}
               </select>
             </div>
           </div>
           {bookingType === 'paid' && (
             <div className="space-y-3">
-              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Duration</label>
+              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Daily Duration</label>
               <select 
                 name="duration" 
                 className="input-field" 
@@ -4785,9 +6924,9 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
               <p className="text-xl md:text-2xl font-serif font-bold italic">
                 {calculateTotal()}
               </p>
-              {bookingType === 'paid' && (
+              {bookingType === 'paid' && bookingPlan && (
                 <p className="text-[8px] font-bold text-primary/20 uppercase tracking-widest mt-1">
-                  {bookingPlan.startsWith('course') ? 'Full Industrial Course Access' : 'Monthly Academic Enrollment'}
+                  {bookingPlan === 'subscription' ? 'Yearly Plan Enrollment (Monthly Billing)' : 'Monthly Academic Enrollment'}
                 </p>
               )}
             </div>
@@ -4797,7 +6936,10 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                   Batch: 1-5 Members
                 </span>
               )}
-              <button type="submit" className="bg-primary text-background px-10 py-5 rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl">
+              <button 
+                type="submit" 
+                className="bg-primary text-background px-10 py-5 rounded-2xl font-bold transition-all shadow-xl hover:scale-105"
+              >
                 {bookingType === 'demo' ? 'Confirm Demo Session' : 'Proceed to Payment'}
               </button>
             </div>
@@ -4820,22 +6962,7 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
               <div className="text-3xl font-black text-primary mt-2 flex items-center justify-center gap-1">
                 <span>₹</span>
                 {(() => {
-                  const rate = getEffectivePrice(selectedTutor?.price);
-                  const dur = parseFloat(bookingFormData?.duration || '1');
-                  const plan = bookingFormData?.plan || bookingPlan;
-                  
-                  if (plan === 'yearly') {
-                    return currentUser?.class === 'B.Tech' ? '4000' : (rate * 15).toLocaleString();
-                  }
-                  if (currentUser?.class === 'B.Tech' && plan.startsWith('course')) {
-                    return '3000';
-                  }
-                  if (plan === 'hourly') {
-                    return (rate * dur).toLocaleString();
-                  }
-                  if (plan === 'course_45') return (rate * 45).toLocaleString();
-                  if (plan === 'course_60') return (rate * 60).toLocaleString();
-                  return (rate * 20).toLocaleString(); // Default monthly
+                  return getBookingAmount().toFixed(2);
                 })()}
               </div>
               <p className="text-[10px] font-bold text-primary/40 mt-1">{currentUser?.email || 'student@scholar.com'}</p>
@@ -5000,8 +7127,19 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                 className="input-field" 
                 required 
                 min={new Date().toISOString().split('T')[0]} 
-                max={new Date(Date.now() + 86400000).toISOString().split('T')[0]}
+                max="2099-12-31"
                 value={rescheduleDate} 
+                onInput={(e) => {
+                  const val = e.currentTarget.value;
+                  if (val) {
+                    const parts = val.split('-');
+                    if (parts[0] && parts[0].length > 4) {
+                      parts[0] = parts[0].slice(0, 4);
+                      e.currentTarget.value = parts.join('-');
+                      setRescheduleDate(e.currentTarget.value);
+                    }
+                  }
+                }}
                 onChange={(e) => setRescheduleDate(e.target.value)}
               />
             </div>
@@ -5014,6 +7152,9 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                   <option value="" disabled>No slots available for this date</option>
                 )}
               </select>
+              <p className="text-[8px] font-bold text-primary/30 uppercase tracking-tight ml-4">
+                * Slots are based on tutor's free time
+              </p>
             </div>
           </div>
           <div className="pt-8 flex justify-end">
@@ -5096,10 +7237,11 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                   <div className="relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center group">
                     {sessionStatus === 'live' ? (
                       <>
-                        <img 
-                          src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=800&h=800&fit=crop" 
-                          className="w-full h-full object-cover grayscale-[0.2]"
-                          alt="Remote Participant"
+                        <video 
+                          ref={remoteVideoRef} 
+                          autoPlay 
+                          playsInline 
+                          className="w-full h-full object-cover"
                         />
                         <div className="absolute inset-x-0 bottom-0 p-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
                           <div className="flex items-center gap-3">
@@ -5123,7 +7265,12 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
                           <p className="text-lg font-serif italic text-white/80">Dr. Sarah Jenkins</p>
                           <p className="text-[10px] font-bold uppercase tracking-widest text-primary animate-pulse">Waiting for participant...</p>
                         </div>
-                        <button onClick={startSession} className="px-8 py-3 bg-primary text-white rounded-2xl font-bold shadow-xl shadow-primary/20 hover:scale-[1.02] active:scale-[0.98] transition-all">Start Session</button>
+                        <button 
+                          onClick={() => activeMeetingId && startSession(activeMeetingId)} 
+                          className="px-8 py-3 bg-primary text-white rounded-2xl font-bold shadow-xl shadow-primary/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
+                        >
+                          Start Session
+                        </button>
                       </div>
                     ) : sessionStatus === 'connecting' ? (
                       <div className="text-center">
@@ -5310,6 +7457,127 @@ const SettingsView = ({ setView, currentUser, setCurrentUser }: { setView: (view
           </motion.div>
         )}
       </AnimatePresence>
+      <Modal 
+        isOpen={showLogoutConfirm} 
+        onClose={() => setShowLogoutConfirm(false)}
+        title="Confirm Logout"
+      >
+        <div className="p-8 text-center space-y-6">
+          <div className="w-20 h-20 bg-rose-50 rounded-full flex items-center justify-center mx-auto ring-8 ring-rose-50/50">
+            <LogOut size={32} className="text-rose-500" />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-xl font-black text-on-surface">Sign Out?</h3>
+            <p className="text-sm font-bold text-on-surface/40">Are you sure you want to end your session?</p>
+          </div>
+          <div className="flex gap-4 pt-4">
+            <button 
+              onClick={() => setShowLogoutConfirm(false)}
+              className="flex-1 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest text-on-surface/40 hover:bg-slate-50 transition-all border border-transparent hover:border-slate-200"
+            >
+              Cancel
+            </button>
+            <button 
+              onClick={confirmLogout}
+              className="flex-1 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest bg-rose-500 text-white shadow-xl shadow-rose-500/20 hover:scale-105 active:scale-95 transition-all"
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      </Modal>
+      {/* Cancellation Modal */}
+      <AnimatePresence>
+        {isCancelModalOpen && cancelBooking && (
+          <div className="fixed inset-0 z-[500] bg-black/80 backdrop-blur-xl flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 30 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 30 }}
+              className="bg-white rounded-[3rem] w-full max-w-lg p-8 md:p-12 shadow-2xl overflow-hidden relative"
+            >
+              <div className="absolute top-0 right-0 w-32 h-32 bg-rose-50 rounded-full -mr-16 -mt-16 opacity-50" />
+              
+              <div className="text-center relative z-10">
+                <div className="w-20 h-20 bg-rose-100 rounded-[2rem] flex items-center justify-center mx-auto mb-8">
+                  <AlertTriangle size={36} className="text-rose-600" />
+                </div>
+                <h3 className="text-3xl font-serif font-black italic text-slate-900 mb-4 tracking-tight">Cancel This Booking?</h3>
+                <p className="text-slate-500 font-medium mb-10 leading-relaxed px-4">
+                  Are you sure you want to request cancellation for your <span className="text-slate-900 font-black tracking-tight">{cancelBooking.subject}</span> course? 
+                  This will stop all upcoming classes under this booking.
+                </p>
+
+                {/* Refund Information */}
+                <div className="bg-slate-50 rounded-[2rem] p-8 mb-10 border border-slate-100 text-left">
+                  <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-6 flex items-center gap-2">
+                    <DollarSign size={14} className="text-primary" /> Refund Eligibility Preview
+                  </h4>
+                  <p className="text-[9px] font-black text-rose-500 uppercase tracking-widest mb-4 italic opacity-60">
+                    * Cancellation requests are subject to admin approval
+                  </p>
+                  
+                  {(() => {
+                    const { eligible, refundAmount, reason, breakdown } = calculateRefund(cancelBooking);
+                    if (!eligible) return (
+                      <div className="space-y-3">
+                        <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-xl border border-rose-100 italic">
+                        {reason}
+                        </p>
+                        <p className="text-[9px] font-medium text-slate-400 leading-relaxed italic">
+                          * As per our policy, cancellations after 15 days or usage of more than 50% of the course duration are not eligible for a refund.
+                        </p>
+                      </div>
+                    );
+
+                    return (
+                      <div className="space-y-6">
+                        <div className="flex items-center justify-between text-slate-600">
+                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Course Amount</span>
+                          <span className="font-extrabold">₹{cancelBooking.amount}</span>
+                        </div>
+                        <div className="flex items-center justify-between text-slate-600">
+                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Platform Fee (17%)</span>
+                          <span className="font-extrabold text-rose-500">- ₹{breakdown?.platformFee}</span>
+                        </div>
+                        <div className="flex items-center justify-between text-slate-600">
+                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Tutor Share (50%)</span>
+                          <span className="font-extrabold text-rose-500">- ₹{breakdown?.tutorShare}</span>
+                        </div>
+                        <div className="h-px bg-slate-200 border-dashed border-t" />
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-black text-slate-900">Estimated Refund</span>
+                          <span className="text-2xl font-serif font-black italic text-emerald-600">₹{refundAmount}</span>
+                        </div>
+                        <p className="text-[9px] font-medium text-slate-400 leading-relaxed flex items-start gap-2 pt-2 border-t border-slate-100 mt-4">
+                           <Check size={12} className="text-emerald-500 shrink-0" />
+                           Refunds are subject to final admin verification and approval.
+                        </p>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                <div className="space-y-4">
+                  <button 
+                    disabled={isCancelling}
+                    onClick={handleRequestCancellation}
+                    className="w-full bg-rose-600 text-white font-black py-5 rounded-[1.5rem] shadow-xl shadow-rose-600/20 hover:scale-[1.02] active:scale-95 transition-all uppercase text-xs tracking-widest flex items-center justify-center gap-3 disabled:opacity-50"
+                  >
+                    {isCancelling ? 'Submitting Request...' : 'Yes, Request Cancellation'}
+                  </button>
+                  <button 
+                    onClick={() => { setIsCancelModalOpen(false); setCancelBooking(null); }}
+                    className="w-full bg-slate-100 text-slate-600 font-black py-5 rounded-[1.5rem] hover:bg-slate-200 transition-all uppercase text-xs tracking-widest"
+                  >
+                    No, Keep Booking
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </>
   );
 }
@@ -5336,7 +7604,7 @@ interface ChatViewProps {
   tutors: Tutor[];
   openChat: (tutorId: string) => Promise<void>;
 }
-const ChatView = ({
+function ChatView({
   chats,
   activeChatId,
   setActiveChatId,
@@ -5356,7 +7624,7 @@ const ChatView = ({
   tutors,
   openChat,
   baseSendMessage
-}: ChatViewProps) => {
+}: ChatViewProps) {
   const [chatSearch, setChatSearch] = useState('');
   const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
   const [isPollModalOpen, setIsPollModalOpen] = useState(false);
@@ -5439,49 +7707,18 @@ const ChatView = ({
     return c.tutorName?.toLowerCase().includes(searchLower);
   });
   
-  const activeChat = fullChatList.find(c => c.id === activeChatId) || fullChatList.find(c => c.tutorId === activeChatId?.split('_')[0]);
-  
-  // Helper to format Firestore timestamp safely
-  const formatTime = (ts: any) => {
-    if (!ts) return 'Sending...';
-    if (typeof ts === 'string' && ts.includes(':')) return ts;
-    let date: Date;
-    if (ts.seconds) date = new Date(ts.seconds * 1000);
-    else date = new Date(ts);
-    
-    if (isNaN(date.getTime())) return 'Sending...';
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
-  };
-
-  const formatDateLabel = (d: any) => {
-    if (!d) return 'TODAY';
-    if (d === 'TODAY' || d === 'YESTERDAY') return d;
-    
-    let date: Date;
-    if (d.seconds) date = new Date(d.seconds * 1000);
-    else date = new Date(d);
-
-    if (isNaN(date.getTime())) return 'TODAY';
-
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    
-    const msgDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-    
-    if (msgDate.getTime() === today.getTime()) return 'TODAY';
-    if (msgDate.getTime() === yesterday.getTime()) return 'YESTERDAY';
-    
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
-  };
+  const activeChat = fullChatList.find(c => c.id === activeChatId) || fullChatList.find(c => c.tutorId === (activeChatId || '').split('_')[0]);
   const currentDraft = activeChatId ? (drafts[activeChatId] || '') : '';
 
   const attachmentOptions = [
     { icon: FileText, label: 'Document', color: 'bg-indigo-500 text-white' },
+    { icon: ImageIcon, label: 'Gallery', color: 'bg-emerald-500 text-white' },
     { icon: Camera, label: 'Camera', color: 'bg-rose-500 text-white' },
+    { icon: Mic, label: 'Voice Note', color: 'bg-blue-500 text-white' },
     { icon: BarChart2, label: 'Poll', color: 'bg-amber-500 text-white' },
   ];
+
+  const galleryInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (chatEndRef.current) {
@@ -5523,7 +7760,12 @@ const ChatView = ({
           </div>
           
           <div className="overflow-y-auto flex-1 p-2 md:p-3 space-y-1 md:space-y-2 custom-scrollbar">
-            {filteredChats.map((chat) => (
+            {filteredChats.map((chat) => {
+              const liveTutor = tutors.find(t => t.id === chat.tutorId);
+              const displayTutorName = liveTutor?.name || chat.tutorName || 'Tutor';
+              const displayAvatar = liveTutor?.avatar || (chat as any).avatar || (chat as any).tutorAvatar || '';
+              
+              return (
               <button 
                 key={chat.id}
                 onClick={() => {
@@ -5544,7 +7786,7 @@ const ChatView = ({
                   <motion.div layoutId="active-chat-pill" className="absolute left-0 top-3 bottom-3 md:top-4 md:bottom-4 w-1 bg-primary rounded-r-full" />
                 )}
                 <div className="relative shrink-0">
-                  <Avatar src={(chat as any).avatar || (chat as any).tutorAvatar || ''} initials={(chat.tutorName || 'T')[0]} size="md" className={cn("transition-transform group-hover:scale-105", activeChatId === chat.id ? "ring-2 ring-primary/20" : "")} />
+                  <Avatar src={displayAvatar} initials={displayTutorName[0]} size="md" className={cn("transition-transform group-hover:scale-105", activeChatId === chat.id ? "ring-2 ring-primary/20" : "")} />
                   <span className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full shadow-sm"></span>
                 </div>
                 <div className="flex-1 text-left min-w-0">
@@ -5553,7 +7795,7 @@ const ChatView = ({
                       "text-xs md:text-sm truncate transition-colors",
                       activeChatId === chat.id ? "font-black text-on-surface" : "font-bold text-on-surface/80"
                     )}>
-                      {chat.tutorName}
+                      {displayTutorName}
                     </h5>
                     <span className="status-label opacity-60 shrink-0 ml-2">{chat.time}</span>
                   </div>
@@ -5571,8 +7813,9 @@ const ChatView = ({
                     )}
                   </div>
                 </div>
-              </button>
-            ))}
+             </button>
+            );
+            })}
           </div>
         </div>
 
@@ -5582,6 +7825,12 @@ const ChatView = ({
           !activeChatId ? "hidden md:flex" : "flex"
         )}>
           {activeChat ? (
+            (() => {
+              const liveTutor = tutors.find(t => t.id === activeChat.tutorId);
+              const activeTutorName = liveTutor?.name || activeChat.tutorName || 'Tutor';
+              const activeAvatar = liveTutor?.avatar || (activeChat as any).avatar || (activeChat as any).tutorAvatar || '';
+              
+              return (
             <>
               {/* Subtle pattern */}
               <div className="absolute inset-0 opacity-[0.15] pointer-events-none bg-[radial-gradient(#94a3b8_1px,transparent_1px)] [background-size:24px_24px]"></div>
@@ -5596,10 +7845,10 @@ const ChatView = ({
                     <ArrowLeft size={20} />
                   </button>
                   <div className="relative">
-                    <Avatar src={(activeChat as any).avatar || (activeChat as any).tutorAvatar || ''} initials={((activeChat as any).tutorName || 'T')[0]} size="md" />
+                    <Avatar src={activeAvatar} initials={activeTutorName[0]} size="md" />
                   </div>
                   <div>
-                    <h4 className="font-black text-sm md:text-lg leading-tight text-on-surface">{activeChat.tutorName}</h4>
+                    <h4 className="font-black text-sm md:text-lg leading-tight text-on-surface">{activeTutorName}</h4>
                     <div className="flex items-center gap-1.5 mt-0.5">
                       <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-emerald-500 rounded-full" />
                       <span className="status-label opacity-60">Online Now</span>
@@ -5607,6 +7856,30 @@ const ChatView = ({
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {/* Join Now shortcut in Chat Header */}
+                  {(() => {
+                    const tutorBooking = bookings.find(b => b.tutorId === activeChat.tutorId && ['confirmed', 'live'].includes(b.status));
+                    if (tutorBooking) {
+                      const now = new Date();
+                      const nowMins = now.getHours() * 60 + now.getMinutes();
+                      const sessionMins = parseTime(tutorBooking.time);
+                      const diffMins = sessionMins - nowMins;
+                      const durationMins = parseFloat(tutorBooking.duration || '1') * 60;
+                      const isToday = tutorBooking.date === now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) || tutorBooking.date === (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0'));
+                      
+                      if ((isToday && diffMins <= 10 && nowMins <= (sessionMins + durationMins)) || tutorBooking.status === 'live') {
+                        return (
+                          <button 
+                            onClick={() => setView('my-bookings')}
+                            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-transform animate-pulse shadow-lg shadow-blue-500/20"
+                          >
+                            <Video size={14} /> Join Now
+                          </button>
+                        );
+                      }
+                    }
+                    return null;
+                  })()}
                   <button className="p-2 hover:bg-primary/5 rounded-xl transition-all text-primary/60 hover:text-primary">
                     <Search size={20} />
                   </button>
@@ -5631,7 +7904,23 @@ const ChatView = ({
                           <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3">
                             <FileText size={16} /> Shared Files
                           </button>
-                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-rose-500 border-t border-surface-variant">
+                          <button 
+                            onClick={async () => {
+                              if (confirm('Are you sure you want to clear this chat for yourself?')) {
+                                try {
+                                  const msgs = await getDocs(collection(db, `whatsapp/${activeChatId}/messages`));
+                                  for (const m of msgs.docs) {
+                                    await updateDoc(doc(db, `whatsapp/${activeChatId}/messages`, m.id), {
+                                      deletedBy: arrayUnion(currentUser?.email)
+                                    });
+                                  }
+                                  setIsChatMenuOpen(false);
+                                  alert('Chat cleared.');
+                                } catch (e) { console.error(e); }
+                              }
+                            }}
+                            className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-rose-500 border-t border-surface-variant"
+                          >
                             <LogOut size={16} /> Clear Chat
                           </button>
                         </motion.div>
@@ -5706,9 +7995,21 @@ const ChatView = ({
                           )}>
                             {msg.type === 'poll' ? (
                               <div className={cn("p-1 md:p-2 min-w-[200px] md:min-w-[250px]", isUser ? "text-white" : "text-on-surface")}>
-                                <h4 className="font-black text-sm md:text-base mb-3 md:mb-4 flex items-center gap-2">
-                                  <BarChart2 size={16} /> {msg.pollData.question}
-                                </h4>
+                                <div className="flex items-start justify-between mb-3 md:mb-4">
+                                  <h4 className="font-black text-sm md:text-base flex items-center gap-2 pr-2">
+                                    <BarChart2 size={16} /> {msg.pollData.question}
+                                  </h4>
+                                  <button 
+                                    onClick={() => deleteMessage(msg.id, isUser)}
+                                    className={cn(
+                                      "shrink-0 p-1.5 rounded-lg transition-all",
+                                      isUser ? "hover:bg-white/20 text-white" : "hover:bg-rose-50 text-rose-500"
+                                    )}
+                                    title="Delete Poll"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
                                 <div className="space-y-1.5 md:space-y-2">
                                   {msg.pollData.options.map((opt: string, idx: number) => {
                                     const votes = msg.pollData.votes || {};
@@ -5748,10 +8049,27 @@ const ChatView = ({
                                   <span className="text-[9px] font-black">{Object.keys(msg.pollData.votes || {}).length} participants</span>
                                 </div>
                               </div>
+                            ) : (msg.type === 'image' || (msg.type === 'file' && (msg.fileName?.toLowerCase().includes('.jpg') || msg.fileName?.toLowerCase().includes('.png') || msg.fileName?.toLowerCase().includes('.jpeg') || msg.fileName?.toLowerCase().includes('.webp') || msg.fileUrl?.startsWith('data:image')))) ? (
+                              <div className="relative group max-w-[220px] md:max-w-[280px]">
+                                <img 
+                                  src={msg.fileUrl || msg.url} 
+                                  alt={msg.fileName}
+                                  className="w-full h-auto rounded-xl object-cover shadow-sm bg-white/50"
+                                  onError={(e) => {
+                                    (e.target as HTMLImageElement).src = 'https://via.placeholder.com/200?text=Image+Load+Error';
+                                  }}
+                                />
+                                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity rounded-xl flex items-center justify-center backdrop-blur-[2px]">
+                                  <a href={msg.fileUrl || msg.url} target="_blank" download={msg.fileName || 'image.jpg'} className="bg-white text-black text-xs font-black px-4 py-2 rounded-full cursor-pointer hover:scale-105 transition-transform flex items-center gap-2">
+                                    <Download size={14} /> Download
+                                  </a>
+                                </div>
+                              </div>
                             ) : msg.type === 'file' ? (
                               <a 
-                                href={msg.fileUrl} 
+                                href={msg.fileUrl || msg.url} 
                                 target="_blank" 
+                                download={msg.fileName}
                                 className={cn(
                                   "flex items-center gap-3 p-2 md:p-3 rounded-xl border transition-all",
                                   isUser ? "bg-white/10 border-white/20" : "bg-slate-50 border-slate-100"
@@ -5761,23 +8079,10 @@ const ChatView = ({
                                   <FileText size={18} />
                                 </div>
                                 <div className="min-w-0 pr-4">
-                                  <p className="text-xs md:text-sm font-bold truncate max-w-[150px]">{msg.fileName}</p>
+                                  <p className="text-xs md:text-sm font-bold truncate max-w-[150px]">{msg.fileName || 'Document'}</p>
                                   <p className="text-[9px] font-black opacity-40 uppercase tracking-tighter">Document • {msg.fileSize || 'N/A'}</p>
                                 </div>
                               </a>
-                            ) : msg.type === 'image' || (msg.type === 'file' && (msg.fileName?.includes('.jpg') || msg.fileName?.includes('.png') || msg.fileName?.includes('.jpeg') || msg.fileName?.includes('.webp'))) ? (
-                              <div className="relative group max-w-[220px] md:max-w-[280px]">
-                                <img 
-                                  src={msg.fileUrl} 
-                                  alt={msg.fileName}
-                                  className="w-full h-auto rounded-xl object-cover shadow-sm bg-white/50"
-                                />
-                                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity rounded-xl flex items-center justify-center backdrop-blur-[2px]">
-                                  <a href={msg.fileUrl} target="_blank" download className="bg-white text-black text-xs font-black px-4 py-2 rounded-full cursor-pointer hover:scale-105 transition-transform flex items-center gap-2">
-                                    <Download size={14} /> Download
-                                  </a>
-                                </div>
-                              </div>
                             ) : (
                               <p className={cn(
                                 "text-sm md:text-sm font-bold leading-snug",
@@ -5853,8 +8158,12 @@ const ChatView = ({
                                   setIsAttachmentMenuOpen(false);
                                   if (opt.label === 'Document') {
                                     fileInputRef.current?.click();
+                                  } else if (opt.label === 'Gallery') {
+                                    galleryInputRef.current?.click();
                                   } else if (opt.label === 'Camera') {
                                     cameraInputRef.current?.click();
+                                  } else if (opt.label === 'Voice Note') {
+                                    alert('Voice Recording starting... (Simulated)');
                                   } else if (opt.label === 'Poll') {
                                     setIsPollModalOpen(true);
                                   }
@@ -5874,6 +8183,31 @@ const ChatView = ({
                   </div>
 
                   <div className="flex-1 relative">
+                    <input 
+                      type="file" 
+                      ref={galleryInputRef} 
+                      className="hidden" 
+                      accept="image/*"
+                      multiple
+                      onChange={async (e) => {
+                        const files = e.target.files;
+                        if (!files || files.length === 0) return;
+                        for (let i = 0; i < files.length; i++) {
+                          const file = files[i];
+                          const reader = new FileReader();
+                          reader.onloadend = async () => {
+                            await baseSendMessage({
+                              type: 'file', // Can use type image but logic handles file-images too
+                              fileName: file.name,
+                              fileSize: (file.size / 1024).toFixed(1) + ' KB',
+                              fileUrl: reader.result as string
+                            });
+                          };
+                          reader.readAsDataURL(file);
+                        }
+                        if (galleryInputRef.current) galleryInputRef.current.value = '';
+                      }}
+                    />
                     <input 
                       type="file" 
                       ref={fileInputRef} 
@@ -5958,18 +8292,19 @@ const ChatView = ({
                     />
                     <button 
                       onClick={sendMessage}
-                      disabled={!(drafts[activeChatId || ''] || '').trim()}
                       className={cn(
                         "absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg md:rounded-xl transition-all",
-                        (drafts[activeChatId || ''] || '').trim() ? 'text-primary hover:bg-primary/10' : 'text-primary/30 cursor-not-allowed'
+                        (drafts[activeChatId || ''] || '').trim() ? 'text-primary hover:bg-primary/10' : 'text-primary/30'
                       )}
                     >
-                      <Send size={22} />
+                      {(drafts[activeChatId || ''] || '').trim() ? <Send size={22} /> : <Mic size={22} />}
                     </button>
                   </div>
                 </div>
               </div>
             </>
+            );
+            })()
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-4">
               <div className="w-20 h-20 md:w-32 md:h-32 bg-primary/5 rounded-full flex items-center justify-center text-primary/20">
@@ -6068,14 +8403,16 @@ const ChatView = ({
                   <button 
                     onClick={() => setPollDraft(prev => ({ ...prev, allowMultiple: !prev.allowMultiple }))}
                     className={cn(
-                      "w-12 h-6 rounded-full transition-all relative overflow-hidden",
-                      pollDraft.allowMultiple ? "bg-primary" : "bg-slate-200"
+                      "w-12 h-6 rounded-full transition-all duration-300 relative overflow-hidden",
+                      pollDraft.allowMultiple ? "bg-primary" : "bg-[#D1D5DB]"
                     )}
                   >
-                    <div className={cn(
-                      "absolute top-1 w-4 h-4 bg-white rounded-full transition-all",
-                      pollDraft.allowMultiple ? "left-7" : "left-1"
-                    )} />
+                    <motion.div 
+                      initial={false}
+                      transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                      animate={{ x: pollDraft.allowMultiple ? '1.5rem' : '0.25rem' }}
+                      className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                    />
                   </button>
                 </div>
               </div>
@@ -6101,5 +8438,86 @@ const ChatView = ({
       </AnimatePresence>
       
     </div>
+  );
+};
+const PaymentsView = ({ bookings, onPay }: { 
+  bookings: Booking[], 
+  onPay: (booking: Booking) => void 
+}) => {
+  const pendingBookings = bookings.filter(b => b.status === 'unpaid' || b.status === 'pending');
+  
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      className="space-y-12"
+    >
+      <div className="flex flex-col md:flex-row items-center justify-between gap-6 mb-8 mt-2">
+        <div>
+          <h2 className="text-3xl md:text-5xl font-black tracking-tighter">Payments & Billing</h2>
+          <p className="text-sm font-bold text-primary/40 mt-1">Manage your course transactions securely.</p>
+        </div>
+        <div className="bg-primary/5 px-6 py-4 rounded-2xl flex items-center gap-3 border border-primary/10 shadow-sm">
+          <Lock className="text-primary w-5 h-5" />
+          <div>
+            <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest">Gateway</p>
+            <p className="font-bold text-sm tracking-tight text-primary">Razorpay Secure</p>
+          </div>
+        </div>
+      </div>
+
+      <section className="space-y-6">
+        <h3 className="text-xl md:text-2xl font-serif font-bold italic border-b border-primary/5 pb-4">Unpaid Sessions</h3>
+        {pendingBookings.length > 0 ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {pendingBookings.map((booking, i) => (
+              <motion.div 
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: i * 0.05 }}
+                key={booking.id}
+                className="bg-white/60 backdrop-blur-md rounded-[2rem] p-6 border border-rose-100 shadow-xl relative overflow-hidden group hover:-translate-y-1 hover:shadow-rose-100 transition-all flex flex-col"
+              >
+                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-rose-400 to-primary"></div>
+                <div className="flex justify-between items-start mb-4">
+                  <div>
+                    <h4 className="font-bold text-lg leading-tight">{booking.subject}</h4>
+                    <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-1">with {booking.tutorName}</p>
+                  </div>
+                  <Badge variant="unpaid">Unpaid</Badge>
+                </div>
+                
+                <div className="space-y-2 mb-6 flex-1">
+                  <div className="flex items-center gap-2 text-xs font-bold text-primary/60">
+                    <Calendar size={14} className="text-accent" /> {booking.date}
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-primary/40 uppercase tracking-widest">
+                    <Clock size={14} /> {booking.time} • {booking.duration}
+                  </div>
+                </div>
+
+                <div className="pt-4 border-t border-primary/5 flex items-center justify-between">
+                  <div>
+                    <p className="text-[9px] font-bold text-primary/30 uppercase tracking-widest">Total Price</p>
+                    <p className="text-2xl font-serif font-bold italic text-primary">₹{(booking.amount || 0).toLocaleString('en-IN')}</p>
+                  </div>
+                  <button 
+                    onClick={() => onPay(booking)}
+                    className="bg-primary text-background px-6 py-3 rounded-xl font-bold hover:scale-105 transition-transform shadow-lg text-xs tracking-wide flex items-center gap-2"
+                  >
+                    <DollarSign size={14} /> Pay Now
+                  </button>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-24 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
+            <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto mb-4 opacity-70" />
+            <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">All caught up! No pending payments.</p>
+          </div>
+        )}
+      </section>
+    </motion.div>
   );
 };

@@ -3,6 +3,8 @@ import { getAnalytics, isSupported as isAnalyticsSupported } from "firebase/anal
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
+import { getMessaging } from "firebase/messaging";
+
 
 const firebaseConfig = {
   apiKey: "AIzaSyDwXgG11d-FJc1IkRLs9_H7tR6NBIKXDbw",
@@ -33,4 +35,7 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app);
 
-export { app, analytics, auth, db, storage };
+const messaging = typeof window !== 'undefined' ? getMessaging(app) : null;
+
+export { app, analytics, auth, db, storage, messaging };
+
