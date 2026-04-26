@@ -369,6 +369,7 @@ interface Booking {
   isSubscription?: boolean;
   subscriptionStatus?: 'active' | 'expired' | 'cancelled';
   nextBillingDate?: any;
+  talkingTime?: number; // in seconds
 }
 
 interface Poll {
@@ -815,7 +816,7 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
               <p className="text-[10px] md:text-xs text-primary/50 font-bold uppercase tracking-widest">Attendance Tracking</p>
             </div>
             <div className="flex items-end gap-3 text-primary">
-              <span className="text-3xl md:text-5xl font-black">{bookings.filter(b => (b.attendance_status === 'attended' || b.status === 'completed') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2)).length}</span>
+              <span className="text-3xl md:text-5xl font-black">{bookings.filter(b => (b.attendance_status === 'attended' || b.status === 'completed') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 10)).length}</span>
               <span className="text-lg md:text-xl font-bold mb-1 md:mb-2 opacity-50">/ {currentUser?.totalSessions || 30}</span>
               <span className="text-[10px] md:text-xs font-bold mb-2 md:mb-3 opacity-50 uppercase tracking-widest ml-2">Sessions Ended</span>
             </div>
@@ -911,6 +912,13 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                   {booking.topic && (
                     <div className="mt-2 text-[10px] font-bold text-on-surface/60 bg-primary/5 px-3 py-1.5 rounded-lg border border-primary/5 italic truncate max-w-[200px]">
                       Topic: {booking.topic}
+                    </div>
+                  )}
+                  
+                  {booking.status === 'completed' && booking.durationConducted && (
+                    <div className="mt-1 flex items-center gap-3 text-[9px] font-black uppercase tracking-tighter opacity-50">
+                       <Clock size={10} /> {booking.durationConducted} mins conducted
+                       {booking.talkingTime && <span>• {Math.round(booking.talkingTime / 60)} mins interaction</span>}
                     </div>
                   )}
 
@@ -1508,7 +1516,8 @@ const RegisterView = ({ setView, setCurrentUser }: {
     );
   };
 
-const NotesView = ({ currentUser, bookings, currentTier, setView }: { currentUser: StudentProfile | null, bookings: Booking[], currentTier: string, setView: (view: View) => void }) => {
+  const NotesView = ({ currentUser, bookings, currentTier, setView }: { currentUser: StudentProfile | null, bookings: Booking[], currentTier: string, setView: (view: View) => void }) => {
+    const tierToUse = currentTier || 'free';
   const [notes, setNotes] = useState<any[]>([]);
   const [polls, setPolls] = useState<Poll[]>([]);
   const [notesLoading, setNotesLoading] = useState(true);
@@ -1519,11 +1528,6 @@ const NotesView = ({ currentUser, bookings, currentTier, setView }: { currentUse
   const [viewingDoc, setViewingDoc] = useState<any>(null);
   const [zoomScale, setZoomScale] = useState(1);
 
-  const formatDateLabel = (ts: any) => {
-    if (!ts) return '';
-    const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
-    return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
-  };
 
   // Enrolled subjects for filtering (confirmed, completed, or pending)
   const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => b.subject.toLowerCase())));
@@ -2014,8 +2018,10 @@ const NotesView = ({ currentUser, bookings, currentTier, setView }: { currentUse
     </div>
   );
 
-  // 🔒 Feature Gating Logic (Step 2 Implementation)
-  if (currentTier === 'free') {
+  // 🔒 Feature Gating Logic (Plan-based Access)
+  const isGated = currentTier === 'free' || currentTier === 'scholarship';
+  
+  if (isGated) {
     return (
       <div className="min-h-[70vh] flex flex-col items-center justify-center p-10 text-center animate-in fade-in slide-in-from-bottom-10 duration-700">
         <div className="w-24 h-24 bg-primary/5 rounded-[2.5rem] flex items-center justify-center mb-8 relative">
@@ -3906,7 +3912,7 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
   );
 };
 
-const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookings, setBookingType, setIsBookingModalOpen, setBookingPlan, setBookingDuration, openChat }: { 
+const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookings, setBookingType, setIsBookingModalOpen, setBookingPlan, setBookingDuration, setBookingSelectedTime, openChat }: { 
   setView: (view: View) => void, 
   setSelectedTutor: (tutor: Tutor | null) => void,
   tutors: Tutor[],
@@ -3916,6 +3922,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
   setIsBookingModalOpen: (open: boolean) => void,
   setBookingPlan: (plan: string) => void,
   setBookingDuration: (duration: string) => void,
+  setBookingSelectedTime: (time: string) => void,
   openChat: (tutorId: string, tutorName: string, tutorAvatar?: string) => void
 }) => {
     const [search, setSearch] = useState('');
@@ -4054,8 +4061,10 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
               <div className="flex items-start justify-between mb-4 md:mb-6">
                 <Avatar src={tutor.avatar} size="md" mdSize="lg" initials={(tutor.name || '??').substring(0, 2).toUpperCase()} />
                 <div className="flex flex-col items-end">
-                  <span className="text-secondary text-sm md:text-lg font-black">₹{getEffectivePrice(tutor.price)}/hr</span>
-                  <p className="text-[8px] font-black uppercase tracking-widest text-primary/30 mt-0.5">Final Hourly Price</p>
+                  <div className="flex items-center gap-1.5 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-100">
+                    <span className="text-emerald-600 text-xs md:text-sm font-black">₹{getEffectivePrice(tutor.price)}<span className="text-[9px] opacity-40">/hr</span></span>
+                  </div>
+                  <p className="text-[7px] font-bold uppercase tracking-[0.1em] text-emerald-600/40 mt-1">₹{tutor.price} + 17% fee</p>
                 </div>
               </div>
               
@@ -4094,13 +4103,14 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                             setSelectedTutor(tutor); 
                             setBookingType('paid'); 
                             const isGrad = tutor.targetClasses?.toLowerCase().includes('graduate');
-                            setBookingPlan(''); // Force them to choose
-                            setBookingDuration('1');
+                            setBookingPlan(''); 
+                            setBookingDuration(''); // Force them to choose
+                            setBookingSelectedTime(''); // Force them to choose
                             setIsBookingModalOpen(true); 
                           }}
                           className="flex-1 bg-primary text-background py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:scale-[1.02] active:scale-[0.98] transition-all"
                         >
-                          {hasAttendedDemo ? 'Pay for Next Session' : 'Enroll Now'}
+                          Enroll Now
                         </button>
                       );
                     }
@@ -4135,7 +4145,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
     );
   };
 
-const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openChat, bookings, setBookingType, setBookingDuration, setBookingPlan, parseTime }: { 
+const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openChat, bookings, setBookingType, setBookingDuration, setBookingPlan, setBookingSelectedTime, parseTime }: { 
   selectedTutor: Tutor | null, 
   setView: (view: View) => void, 
   setIsBookingModalOpen: (open: boolean) => void,
@@ -4144,6 +4154,7 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
   setBookingType: (type: 'demo' | 'paid') => void,
   setBookingDuration: (duration: string) => void,
   setBookingPlan: (plan: string) => void,
+  setBookingSelectedTime: (time: string) => void,
   parseTime: (time: string) => number
 }) => {
   if (!selectedTutor) return <div className="text-center py-20 font-bold opacity-20 uppercase tracking-widest">Tutor not found</div>;
@@ -4277,11 +4288,18 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
 
           <div className="space-y-6 md:space-y-8">
             <section className="p-8 md:p-10 bg-primary text-background rounded-[2rem] md:rounded-[3rem] shadow-2xl">
-              <p className="text-background/50 text-[9px] md:text-[10px] font-bold uppercase tracking-widest mb-2">Investment</p>
+              <p className="text-background/50 text-[9px] md:text-[10px] font-bold uppercase tracking-widest mb-2">Hourly Rate</p>
               <div className="flex flex-col gap-2">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-4xl md:text-5xl font-serif font-bold italic">₹{getEffectivePrice(selectedTutor.price)}</span>
-                  <span className="text-background/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/ hour</span>
+                  <span className="text-4xl md:text-5xl font-serif font-bold italic text-emerald-400">₹{getEffectivePrice(selectedTutor.price)}</span>
+                  <span className="text-emerald-400/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/hr</span>
+                </div>
+                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest">
+                  <span className="text-background/40">₹{selectedTutor.price}/hr</span>
+                  <span className="text-background/20">+</span>
+                  <span className="text-background/40">17% Platform Fee</span>
+                  <span className="text-background/20">=</span>
+                  <span className="text-background/60">₹{getEffectivePrice(selectedTutor.price)}/hr</span>
                 </div>
                 {selectedTutor.upiId && (
                   <div className="flex items-center gap-2 text-background/70 text-[10px] md:text-xs">
@@ -4325,14 +4343,15 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                           <button 
                             onClick={() => { 
                               setBookingType('paid'); 
-                              setBookingDuration('1'); 
                               const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') || selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
-                              setBookingPlan(isGrad ? 'monthly' : 'subscription');
+                              setBookingPlan(''); 
+                              setBookingDuration(''); // Force them to choose
+                              setBookingSelectedTime(''); // Force them to choose
                               setIsBookingModalOpen(true); 
                             }}
                             className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
                           >
-                            {hasAttendedDemo ? 'Enroll Now' : 'Complete Enrollment'}
+                            Enroll Now
                           </button>
                         )}
                       </div>
@@ -4353,14 +4372,15 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                       <button 
                         onClick={() => { 
                           setBookingType('paid'); 
-                          setBookingDuration('1'); 
                           const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate');
-                          setBookingPlan(isGrad ? 'monthly' : 'subscription');
+                          setBookingPlan(''); 
+                          setBookingDuration(''); // Force them to choose
+                          setBookingSelectedTime(''); // Force them to choose
                           setIsBookingModalOpen(true); 
                         }}
                         className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
                       >
-                        {hasAttendedDemo ? 'Complete Enrollment' : 'Become a Paid Student'}
+                        Enroll Now
                       </button>
                     );
                   }
@@ -4755,26 +4775,45 @@ export default function App() {
     if (selectedTutor && bookingSelectedDate) {
       const tutorBookings = bookings.filter(b => b.tutorId === selectedTutor.id);
       const tutorAvailability = selectedTutor.availability || [];
-      const expandedSlots = tutorAvailability.length > 0 ? tutorAvailability.flatMap((s: any) => {
-        const startMins = parseTime(typeof s === 'string' ? s : s.start);
-        const endMins = typeof s === 'string' ? startMins + 60 : parseTime(s.end);
-        const slots = [];
+      
+      // Get the selected weekday name (same as render logic)
+      const dateObj = new Date(bookingSelectedDate);
+      const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
+
+      // Filter by matching day OR specific date — same logic as the render
+      const rawSlots = tutorAvailability.filter((s: any) => {
+        if (typeof s === 'string') return true;
+        if (s.status === 'busy') return false;
+        if (s.date) return s.date === bookingSelectedDate;
+        if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
+        return false;
+      });
+
+      // Expand time ranges into individual hourly slots
+      const expandedSlots: string[] = [];
+      rawSlots.forEach((s: any) => {
+        const startTime = typeof s === 'string' ? s : (s.start || '');
+        const endTime = typeof s === 'string' ? '' : (s.end || '');
+        if (!startTime) return;
+        const startMins = parseTime(startTime);
+        const endMins = endTime ? parseTime(endTime) : startMins + 60;
         for (let m = startMins; m < endMins; m += 60) {
-          slots.push(formatMins(m));
+          expandedSlots.push(formatMins(m));
         }
-        return slots;
-      }) : [];
+      });
+
+      // Remove already-booked slots
       const finalSlots = expandedSlots.filter(slotTime => {
-        return !tutorBookings.some(b => 
-          b.date === bookingSelectedDate && 
-          b.time === slotTime && 
+        return !tutorBookings.some(b =>
+          b.date === bookingSelectedDate &&
+          b.time === slotTime &&
           ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
         );
       });
-      if (finalSlots.length === 0) {
-        setBookingSelectedTime("10:00 AM");
-      } else if (bookingSelectedTime === "10:00 AM") {
-         setBookingSelectedTime("");
+
+      // If tutor has real slots for this day, clear any stale time selection
+      if (finalSlots.length > 0 && bookingSelectedTime === '10:00 AM') {
+        setBookingSelectedTime('');
       }
     }
   }, [bookingSelectedDate, selectedTutor]);
@@ -4791,54 +4830,66 @@ export default function App() {
 
   const getBookingAmount = () => {
     if (!selectedTutor) return 0;
-    
-    const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') || selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
-    const subjectPriceObj = selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject);
-    const getFinal = (base?: any) => Math.ceil((parseFloat(String(base || '0')) || 0) * 1.17);
 
+    const tutorRate = parseFloat(String(selectedTutor?.price || '0')) || 0; // raw tutor hourly rate, e.g. 180
     const planToUse = bookingFormData?.plan || bookingPlan;
+    const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '0'); // hours per day
 
+    // If no duration chosen yet, return 0
+    if (!currentDur) return 0;
+    // If paid and no plan, return 0
+    if (bookingType === 'paid' && !planToUse) return 0;
+
+    // --- Graduate/custom subject pricing (course or fixed monthly) ---
+    const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') ||
+                       selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
+    const subjectPriceObj = selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject);
     if (isGraduate && subjectPriceObj) {
-      const finalPrice = getFinal(subjectPriceObj.price);
-      if (planToUse === 'course' || subjectPriceObj.type === 'course') {
-        return finalPrice;
-      }
-      if (planToUse === 'monthly' || subjectPriceObj.type === 'monthly') {
-        return finalPrice; // Graduate specific monthly/course prices already final
-      }
-      return getFinal(selectedTutor.price) * 30;
+      // Graduate custom pricing: already a fixed fee (not hourly), just add 17% fee
+      const base = parseFloat(String(subjectPriceObj.price || '0')) || 0;
+      return Math.ceil(base * 1.17);
     }
 
-    const finalPerHour = getFinal(selectedTutor?.price);
-    
-    if (planToUse === 'subscription') {
-      return finalPerHour * 365; // Yearly amount (365 days)
-    }
-    if (planToUse === 'monthly') {
-      return finalPerHour * 30; // Monthly amount (30 days)
-    }
-    
-    const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '1');
-    return finalPerHour * currentDur;
+    // --- Standard formula: Base = rate × hours × days, Final = Base × 1.17 ---
+    let days = 1; // default for single session / demo
+    if (planToUse === 'subscription') days = 365;  // Year Plan
+    else if (planToUse === '6months')  days = 180;  // 6 Months Plan
+    else if (planToUse === 'monthly')  days = 30;   // One Month Plan
+
+    const base   = tutorRate * currentDur * days;          // e.g. 180 × 1.5 × 30 = 8100
+    const fee    = base * 0.17;                             // e.g. 8100 × 0.17 = 1377
+    const final  = Math.ceil(base + fee);                   // e.g. ₹9477
+
+    return final;
   };
 
   const calculateTotal = () => {
     if (bookingType === 'demo') return 'Free First Demo Session';
     
-    const amt = getBookingAmount();
     const planToUse = bookingFormData?.plan || bookingPlan;
+    if (!planToUse) return 'Please Select Enrollment Type';
 
+    // Require duration to be selected before showing amount
+    const dur = parseFloat(bookingFormData?.duration || bookingDuration || '0');
+    if (!dur) return 'Please Select Duration';
+
+    const amt = getBookingAmount();
+    if (amt === 0) return 'Please Select Duration';
+    
     if (planToUse === 'course' || selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject)?.type === 'course') {
-      return `Course Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+      return `Course Fee: ₹${amt.toLocaleString('en-IN')}`;
     }
     if (planToUse === 'subscription') {
-      return `Yearly Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+      return `Year Plan: ₹${amt.toLocaleString('en-IN')}`;
+    }
+    if (planToUse === '6months') {
+      return `6 Months Plan: ₹${amt.toLocaleString('en-IN')}`;
     }
     if (planToUse === 'monthly') {
-      return `Monthly Enrollment: ₹${amt.toLocaleString('en-IN')}`;
+      return `One Month Plan: ₹${amt.toLocaleString('en-IN')}`;
     }
     
-    return `Enrollment Total: ₹${amt.toLocaleString('en-IN')}`;
+    return `Session Total: ₹${amt.toLocaleString('en-IN')}`;
   };
 
   // --- Real-time Notes Notification for Student ---
@@ -4909,7 +4960,7 @@ export default function App() {
             const todayDate = new Date(isoToday);
             if (bookingDate < todayDate && !isNaN(bookingDate.getTime())) {
               const bRef = doc(db, 'bookings', b.id);
-              if (b.studentPresent && b.tutorPresent) {
+              if (b.studentPresent && b.tutorPresent && b.topic && b.talkingTime >= 60) {
                 await updateDoc(bRef, { 
                   status: 'completed', 
                   attendance_status: 'attended',
@@ -4956,7 +5007,8 @@ export default function App() {
           // 1b. Completion/Not-Attended Logic (after class end time)
           if (isToday && nowMins > (bMins + durationMins)) {
             const bRef = doc(db, 'bookings', b.id);
-            if (b.studentPresent && b.tutorPresent) {
+            // Require 10 minutes (600s) of interaction and successful join
+            if (b.studentJoined && b.tutorPresent && b.topic && (b.talkingTime || 0) >= 600) {
               await updateDoc(bRef, { 
                 status: 'completed', 
                 attendance_status: 'attended',
@@ -5159,7 +5211,7 @@ export default function App() {
         await updateDoc(doc(db, 'bookings', bookingId), {
           studentJoinTime: serverTimestamp(),
           studentPresent: true,
-          studentJoined: true,
+          // studentJoined: true, // MOVED TO CONNECTION ESTABLISHED
           attendance_status: 'pending'
         });
       }
@@ -5251,6 +5303,9 @@ export default function App() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socketRef.current.emit('offer', { offer, roomId: bookingId });
+      
+      // ✅ SUCCESSFUL CONNECTION ESTABLISHED ✅
+      await updateDoc(doc(db, 'bookings', bookingId), { studentJoined: true });
     });
 
     socketRef.current.on('offer', async (offer: any) => {
@@ -5364,12 +5419,19 @@ export default function App() {
           await updateDoc(bookingRef, {
             studentPresent: false,
             studentLeaveTime: serverTimestamp(),
-            attendance_status: duration >= 12 ? 'attended' : 'not_attended'
+            attendance_status: (duration >= 10 && bookingData.tutorJoined) ? 'attended' : 'not_attended'
           });
         }
       } catch (e) {
         console.error("Error updating leave time:", e);
       }
+    }
+    
+    // Topic check prompt if class was valid
+    const b = bookings.find(bk => bk.id === activeMeetingId);
+    if (b && !b.topic && sessionStatus === 'live') {
+       const t = prompt("What was the main topic covered in today's class?");
+       if (t) await updateDoc(doc(db, 'bookings', b.id), { topic: t });
     }
     setSessionStatus('disconnected');
     setSessionStartTime(null);
@@ -5514,7 +5576,7 @@ export default function App() {
 
       if (bookingFormData?.id) {
         // Update the 'unpaid' booking to 'pending' (for Admin/Tutor review)
-        const isSub = bookingFormData.plan === 'subscription';
+        const isSub = bookingFormData.plan === 'subscription' || bookingFormData.plan === 'monthly' || bookingFormData.plan === '6months';
         const nextBilling = new Date();
         nextBilling.setDate(nextBilling.getDate() + 30);
 
@@ -6434,6 +6496,7 @@ export default function App() {
             setIsBookingModalOpen={setIsBookingModalOpen}
             setBookingPlan={setBookingPlan}
             setBookingDuration={setBookingDuration}
+            setBookingSelectedTime={setBookingSelectedTime}
             openChat={openChat}
           />
         );
@@ -6448,6 +6511,7 @@ export default function App() {
             setBookingType={setBookingType}
             setBookingDuration={setBookingDuration}
             setBookingPlan={setBookingPlan}
+            setBookingSelectedTime={setBookingSelectedTime}
             parseTime={parseTime}
           />
         );
@@ -6710,16 +6774,17 @@ export default function App() {
                 if (isGraduate) {
                   return (
                     <>
-                      <option value="monthly">Monthly Academic Enrollment</option>
+                      <option value="monthly">One Month Plan</option>
                       <option value="course">Full Course Enrollment</option>
                     </>
                   );
                 }
                 return (
                   <>
-                    <option value="" disabled>Choose One</option>
-                    <option value="subscription">Yearly Plan (Pay Monthly)</option>
-                    <option value="monthly">Monthly Academic Enrollment</option>
+                    <option value="" disabled>Choose Type</option>
+                    <option value="subscription">Year Plan (Pay Monthly)</option>
+                    <option value="6months">6 Months Plan (One-time Pay)</option>
+                    <option value="monthly">One Month Plan</option>
                   </>
                 );
               })()}
@@ -6838,7 +6903,12 @@ export default function App() {
                     }
                   }
                 }}
-                onChange={(e) => setBookingSelectedDate(e.target.value)}
+                onChange={(e) => {
+                  const dateVal = e.target.value;
+                  setBookingSelectedDate(dateVal);
+                  // Always clear previous time when date changes
+                  setBookingSelectedTime('');
+                }}
               />
             </div>
             <div className="space-y-3">
@@ -6851,20 +6921,34 @@ export default function App() {
                 onChange={(e) => setBookingSelectedTime(e.target.value)}
               >
                 {(() => {
+                  // Default time slots shown when tutor has no availability or no date picked
+                  const defaultSlots = [
+                    '8:00 AM','9:00 AM','10:00 AM','11:00 AM',
+                    '12:00 PM','1:00 PM','2:00 PM','3:00 PM',
+                    '4:00 PM','5:00 PM','6:00 PM','7:00 PM','8:00 PM'
+                  ];
+
+                  // If no date selected, show full default list
                   if (!bookingSelectedDate) {
-                    return <option value="10:00 AM">10:00 AM</option>;
+                    return (
+                      <>
+                        <option value="" disabled>Select Time</option>
+                        {defaultSlots.map((t, i) => <option key={i} value={t}>{t}</option>)}
+                      </>
+                    );
                   }
-                  
+
+                  // Date selected — try to get tutor's specific slots for that day
                   const dateObj = new Date(bookingSelectedDate);
                   const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
-                  
+
                   const rawSlots = (selectedTutor?.availability || [])
                     .filter((s: any) => {
-                       if (typeof s === 'string') return true;
-                       if (s.status === 'busy') return false;
-                       if (s.date) return s.date === bookingSelectedDate;
-                       if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
-                       return false;
+                      if (typeof s === 'string') return true;
+                      if (s.status === 'busy') return false;
+                      if (s.date) return s.date === bookingSelectedDate;
+                      if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
+                      return false;
                     });
 
                   const expandedSlots: string[] = [];
@@ -6880,21 +6964,20 @@ export default function App() {
                   });
 
                   const finalSlots = expandedSlots.filter(slotTime => {
-                    return !tutorBookings.some(b => 
-                      b.date === bookingSelectedDate && 
-                      b.time === slotTime && 
+                    return !tutorBookings.some(b =>
+                      b.date === bookingSelectedDate &&
+                      b.time === slotTime &&
                       ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
                     );
                   });
 
-                  if (finalSlots.length === 0) {
-                    return <option value="10:00 AM">10:00 AM</option>;
-                  }
+                  // No tutor-specific slots → show default list
+                  const slotsToShow = finalSlots.length > 0 ? finalSlots : defaultSlots;
 
                   return (
                     <>
-                      <option value="" disabled>Choose Time</option>
-                      {finalSlots.map((t, idx) => <option key={idx} value={t}>{t}</option>)}
+                      <option value="" disabled>Select Time</option>
+                      {slotsToShow.map((t, idx) => <option key={idx} value={t}>{t}</option>)}
                     </>
                   );
                 })()}
@@ -6911,6 +6994,7 @@ export default function App() {
                 value={bookingDuration}
                 onChange={(e) => setBookingDuration(e.target.value)}
               >
+                <option value="" disabled>Choose Hours</option>
                 <option value="1">1 Hour</option>
                 <option value="1.5">1.5 Hours</option>
                 <option value="2">2 Hours</option>
@@ -6924,11 +7008,6 @@ export default function App() {
               <p className="text-xl md:text-2xl font-serif font-bold italic">
                 {calculateTotal()}
               </p>
-              {bookingType === 'paid' && bookingPlan && (
-                <p className="text-[8px] font-bold text-primary/20 uppercase tracking-widest mt-1">
-                  {bookingPlan === 'subscription' ? 'Yearly Plan Enrollment (Monthly Billing)' : 'Monthly Academic Enrollment'}
-                </p>
-              )}
             </div>
             <div className="flex flex-col items-end gap-1">
               {currentUser?.class === 'B.Tech' && (
