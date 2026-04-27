@@ -841,7 +841,7 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: i * 0.05 }}
               key={booking.id} 
-              className="course-card p-6 md:p-8 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-12"
+              className="course-card p-4 md:p-6 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-10"
             >
               <div className="flex items-center gap-4 md:gap-8 min-w-[240px]">
                 <Avatar 
@@ -856,17 +856,18 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                 </div>
               </div>
 
-              <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-8 border-t md:border-t-0 md:border-l border-primary/5 pt-4 md:pt-0 md:pl-12">
+              <div className="flex-1 grid grid-cols-2 gap-4 md:gap-12 border-t md:border-t-0 md:border-l border-primary/5 pt-4 md:pt-0 md:pl-10">
                 <div className="flex items-center gap-3 text-primary/60">
-                  <div className="p-2 rounded-lg bg-accent/5 text-accent"><Calendar size={16} /></div>
-                  <div>
-                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Date</p>
-                    <p className="text-xs md:text-sm font-bold text-on-surface">{booking.date}</p>
+                  <div className="p-2 rounded-lg bg-accent/5 text-accent shrink-0"><Calendar size={16} /></div>
+                  <div className="min-w-0">
+                    <p className="text-[8px] md:text-[9px] font-bold uppercase tracking-widest opacity-40 mb-0.5">Date</p>
+                    <p className="text-xs md:text-sm font-bold text-on-surface truncate">{booking.date}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-3 text-primary/60">
-                  <div>
-                    <p className="text-[8px] md:text-[10px] font-bold uppercase tracking-widest opacity-40">Time & Duration</p>
+                  <div className="p-2 rounded-lg bg-primary/5 text-primary shrink-0"><Clock size={16} /></div>
+                  <div className="min-w-0">
+                    <p className="text-[8px] md:text-[9px] font-bold uppercase tracking-widest opacity-40 mb-0.5">Time & Duration</p>
                     <p className="text-xs md:text-sm font-bold text-on-surface whitespace-nowrap">
                       {booking.status === 'completed' || booking.attendance_status === 'attended' ? (
                         <span className="text-slate-500 italic opacity-60">Session Ended</span>
@@ -893,7 +894,7 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                 </div>
               </div>
 
-              <div className="flex flex-col items-end gap-3 md:min-w-[200px] border-t md:border-t-0 border-primary/5 pt-4 md:pt-0">
+              <div className="flex flex-col items-end gap-3 md:min-w-[220px] border-t md:border-t-0 border-primary/5 pt-4 md:pt-0">
                 <div className="flex items-center gap-2">
                   <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
                     booking.status === 'confirmed' ? 'bg-emerald-50 text-emerald-600' :
@@ -934,65 +935,67 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                   )}
 
                   {booking.isSubscription && (
-                    <>
-                      <div className="mt-2 p-3 bg-primary/5 rounded-xl border border-primary/10 w-full min-w-[180px]">
-                        <div className="flex items-center justify-between gap-4">
-                          <div className="flex items-center gap-2">
-                             <RefreshCw size={12} className={cn("text-primary", booking.subscriptionStatus === 'active' ? "animate-spin-slow" : "")} />
-                             <span className="text-[10px] font-bold uppercase tracking-widest text-primary/60">Subscription Active</span>
+                    <div className="w-full flex flex-col gap-2">
+                      <div className="p-3 bg-primary/5 rounded-xl border border-primary/10 w-full">
+                        <div className="flex flex-col gap-2">
+                          <div className="flex items-center justify-between">
+                             <div className="flex items-center gap-2">
+                                <RefreshCw size={12} className={cn("text-primary", booking.subscriptionStatus === 'active' ? "animate-spin-slow" : "")} />
+                                <span className="text-[9px] font-black uppercase tracking-widest text-primary/60">Subscription Active</span>
+                             </div>
                           </div>
                           {booking.nextBillingDate && (
-                             <span className="text-[9px] font-black text-accent uppercase">Next Bill: {
-                               booking.nextBillingDate.seconds 
-                                 ? new Date(booking.nextBillingDate.seconds * 1000).toLocaleDateString()
-                                 : new Date(booking.nextBillingDate).toLocaleDateString()
-                             }</span>
+                             <div className="flex items-center justify-between border-t border-primary/5 mt-2 pt-2">
+                               <span className="text-[8px] font-bold text-primary/30 uppercase">Next Bill</span>
+                               <span className="text-[9px] font-black text-accent uppercase">{
+                                 booking.nextBillingDate.seconds 
+                                   ? new Date(booking.nextBillingDate.seconds * 1000).toLocaleDateString()
+                                   : new Date(booking.nextBillingDate).toLocaleDateString()
+                               }</span>
+                             </div>
                           )}
                         </div>
                       </div>
-                    {(() => {
-                      if (!booking.isSubscription) return null;
-                      const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
-                      if (!paidAt) return null;
+                      {(() => {
+                        const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
+                        if (!paidAt) return null;
 
-                      const now = new Date();
-                      const startDay = paidAt.getDate();
-                      const currentDay = now.getDate();
-                      
-                      // Calculate 3-day window before renewal
-                      const daysUntilRenewal = (startDay - currentDay + 31) % 31;
-                      const isDue = daysUntilRenewal >= 1 && daysUntilRenewal <= 3;
-                      const isExpired = booking.subscriptionStatus === 'expired';
+                        const now = new Date();
+                        const startDay = paidAt.getDate();
+                        const currentDay = now.getDate();
+                        
+                        const daysUntilRenewal = (startDay - currentDay + 31) % 31;
+                        const isDue = daysUntilRenewal >= 1 && daysUntilRenewal <= 3;
+                        const isExpired = booking.subscriptionStatus === 'expired';
 
-                      if (booking.subscriptionStatus === 'active' && isDue) {
-                        return (
-                          <div className="flex flex-col gap-2 mt-2 px-3 py-2 border-l-2 border-amber-500 bg-amber-50 rounded-r-lg">
-                            <div className="flex items-center gap-2">
-                              <Bell size={10} className="text-amber-600 animate-bounce" />
-                              <span className="text-[8px] font-black text-amber-700 uppercase">Renewal Reminder: Upcoming Payment Due on {new Date(now.getFullYear(), now.getMonth(), startDay).toLocaleDateString()}</span>
+                        if (booking.subscriptionStatus === 'active' && isDue) {
+                          return (
+                            <div className="flex flex-col gap-1 px-3 py-2 border-l-2 border-amber-500 bg-amber-50 rounded-r-lg">
+                              <div className="flex items-center gap-2">
+                                <Bell size={10} className="text-amber-600 animate-bounce" />
+                                <span className="text-[8px] font-black text-amber-700 uppercase leading-tight">Renewal Due: {new Date(now.getFullYear(), now.getMonth(), startDay).toLocaleDateString()}</span>
+                              </div>
                             </div>
-                            <p className="text-[7px] font-medium text-amber-600 italic">Please complete payment before the {startDay}th to continue classes with {booking.tutorName}.</p>
-                          </div>
-                        );
-                      }
-                      
-                      if (isExpired) {
-                        return (
-                          <div className="flex items-center gap-2 mt-2 px-3 py-2 border-l-2 border-rose-500 bg-rose-50 rounded-r-lg">
-                            <XCircle size={10} className="text-rose-600" />
-                            <span className="text-[8px] font-black text-rose-700 uppercase">Subscription Expired: Join button disabled due to non-payment.</span>
-                          </div>
-                        );
-                      }
+                          );
+                        }
+                        
+                        if (isExpired) {
+                          return (
+                            <div className="flex items-center gap-2 px-3 py-2 border-l-2 border-rose-500 bg-rose-50 rounded-r-lg">
+                              <XCircle size={10} className="text-rose-600" />
+                              <span className="text-[8px] font-black text-rose-700 uppercase">Payment Pending</span>
+                            </div>
+                          );
+                        }
 
-                      return (
-                        <div className="flex items-center gap-2 mt-2 px-3 py-1.5 border-l-2 border-emerald-500 bg-emerald-50 rounded-r-lg opacity-60">
-                          <CheckCircle size={10} className="text-emerald-500" />
-                          <span className="text-[8px] font-black text-emerald-700 uppercase">Payment Verified: You can continue your classes.</span>
-                        </div>
-                      );
-                    })()}
-                  </>
+                        return (
+                          <div className="flex items-center gap-2 px-3 py-1.5 border-l-2 border-emerald-500 bg-emerald-50 rounded-r-lg opacity-80">
+                            <CheckCircle size={10} className="text-emerald-500" />
+                            <span className="text-[8px] font-black text-emerald-700 uppercase">Verified</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
                   )}
 
                 <div className="flex items-center gap-2">
@@ -3949,6 +3952,14 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
     }, [actualMaxPrice]);
     
     const filteredTutors = tutors.filter(t => {
+      // VISIBILITY GUARD: Tutor MUST have UPI ID and at least one Subject to be visible to students
+      const isProfileComplete = 
+        t.upiId?.trim() && 
+        Array.isArray(t.subjects) && t.subjects.length > 0 &&
+        (t.price || (Array.isArray(t.subjectsPricing) && t.subjectsPricing.length > 0));
+      
+      if (!isProfileComplete) return false;
+
       const matchesSearch = search === '' || (t.name || '').toLowerCase().includes(search.toLowerCase());
       const subjects = t.subjects || [];
       const matchesSubject = subject === 'All' || subjects.includes(subject);
@@ -4078,13 +4089,13 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
               
               <div className="flex-1 min-w-0">
                 <h3 className="text-lg md:text-xl font-serif font-bold italic text-on-surface mb-2 leading-tight truncate">{tutor.name}</h3>
+                <p className="text-accent/60 text-[9px] font-black uppercase tracking-[0.2em] mb-3">
+                  {tutor.experience === 'Fresher' ? 'Fresher' : `${tutor.experience || 'Expert'} Experience`}
+                </p>
                 <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
-                  {(tutor as any).subjects?.slice(0, 2).map((s: string) => (
+                  {(tutor as any).subjects?.slice(0, 3).map((s: string) => (
                     <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
                   ))}
-                  <span className="pill-tag bg-accent/5 text-accent/70 !text-[8px]">
-                    {tutor.experience === 'Fresher' ? 'Fresher' : `${tutor.experience || 'Expert'} Exp`}
-                  </span>
                 </div>
                 <p className="text-primary/60 text-[10px] md:text-xs leading-relaxed mb-4 line-clamp-2">{(tutor as any).bio}</p>
               </div>
@@ -4174,17 +4185,9 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                     <div className="flex items-center gap-2 text-accent font-bold">
                       <Star size={16} fill="currentColor" /> {selectedTutor.rating}
                     </div>
-                    {selectedTutor.experience && (
-                      <>
-                        <span className="hidden sm:inline text-primary/10">|</span>
-                        <span className="text-primary/40 text-[10px] md:text-xs font-bold uppercase tracking-widest">
-                          {selectedTutor.experience === 'Fresher' ? 'Fresher' : `${selectedTutor.experience} Experience`}
-                        </span>
-                      </>
-                    )}
                   </div>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
                   <div>
                     <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Subjects</p>
                     <div className="flex flex-wrap justify-center sm:justify-start gap-2">
@@ -4192,6 +4195,10 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                         <span key={s} className="pill-tag text-[8px] md:text-[9px]">{s}</span>
                       ))}
                     </div>
+                  </div>
+                  <div>
+                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Expertise</p>
+                    <p className="text-xs md:text-sm font-bold">{selectedTutor.experience === 'Fresher' ? 'Fresher' : `${selectedTutor.experience} Years Experience`}</p>
                   </div>
                   <div>
                     <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Next Available</p>
@@ -5568,7 +5575,7 @@ export default function App() {
             tutorId: selectedTutor.id,
             type: 'booking',
             title: 'Enrollment Confirmed',
-            description: `${currentUser?.name} has completed payment for the ${bookingFormData.subject} session. Plan: ${bookingFormData.plan}.`,
+            description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}. Plan: ${bookingFormData.plan?.toUpperCase()}. Tier: ${currentTier?.toUpperCase()}. Features: ${currentTier === 'premium' ? 'Up to 8 Subjects, Assignments, Notes' : currentTier === 'standard' ? 'Up to 3 Subjects, Tutor Notes' : '1 Subject'}.`,
             time: 'Just now',
             read: false,
             createdAt: serverTimestamp()
@@ -6674,20 +6681,10 @@ export default function App() {
             >
               <option value="" disabled>Select Subject</option>
               {(() => {
-                const tLevel = selectedTutor?.targetClasses || '';
-                const tIsGraduate = tLevel.includes('Graduate');
-                const tIsIntermediate = tLevel.includes('Intermediate');
-                const tIsSchool = tLevel.includes('Primary') || tLevel.includes('Middle') || tLevel.includes('Nursery') || tLevel.includes('Secondary');
-
-                // Tier 1: Real-time Firestore subjects
-                let subjects = (selectedTutor?.subjects && selectedTutor.subjects.length > 0) ? [...selectedTutor.subjects] : [];
+                const subjects = (selectedTutor?.subjects && Array.isArray(selectedTutor.subjects)) ? selectedTutor.subjects : [];
                 
-                // Tier 2: Fallback to Level-based defaults if tutor hasn't set any
                 if (subjects.length === 0) {
-                  if (tIsGraduate) subjects = ["Mathematics (B.Tech/B.Sc)", "Java", "Python", "Web Development", "AI/ML", "All Subjects (Graduate)"];
-                  else if (tIsIntermediate) subjects = ["Maths 1A", "Maths 1B", "Physics", "Chemistry", "JEE Mains", "All Subjects (Intermediate)"];
-                  else if (tIsSchool) subjects = ["Telugu", "English", "Mathematics", "Science", "EVS", "All Subjects (Upto 10th)"];
-                  else subjects = ["Mathematics", "English", "Science"]; // Total fallback
+                  return <option value="" disabled>No subjects added by tutor</option>;
                 }
                 
                 return subjects.map(s => <option key={s} value={s}>{s}</option>);
@@ -6875,13 +6872,14 @@ export default function App() {
                 required 
                 value={bookingSelectedTime}
                 onChange={(e) => setBookingSelectedTime(e.target.value)}
+                disabled={!bookingSelectedDate}
               >
                 {(() => {
                   // INTERLINK: Use activeTutorDoc for real-time availability updates from tutor side
                   const latestTutor = activeTutorDoc || tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
                   
                   if (!bookingSelectedDate) {
-                    return <option value="" disabled selected>Select Date First</option>;
+                    return <option value="" disabled selected>Select Time</option>;
                   }
 
                   const [y, m, d_val] = bookingSelectedDate.split('-').map(Number);
@@ -6893,14 +6891,14 @@ export default function App() {
                   
                   const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
                   const now = currentSystemTime;
-                  const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+                  const isoToday = now.toLocaleDateString('en-CA');
                   const isToday = bookingSelectedDate === isoToday;
                   const nowMins = now.getHours() * 60 + now.getMinutes();
 
                   // Helper to apply real-time and booking filters
                   const getFinalSlots = (sourceSlots: string[]) => {
                     const uniqueSorted = Array.from(new Set(sourceSlots)).sort((a, b) => parseTime(a) - parseTime(b));
-                    let filtered = isToday ? uniqueSorted.filter(s => parseTime(s) > nowMins + 5) : uniqueSorted;
+                    let filtered = isToday ? uniqueSorted.filter(s => parseTime(s) >= nowMins) : uniqueSorted;
                     return filtered.filter(slotTime => {
                       const slotStart = parseTime(slotTime);
                       const durationVal = parseFloat(bookingDuration || '1');
@@ -6915,43 +6913,37 @@ export default function App() {
                     });
                   };
 
-                  // 1. First, try to get manual slots defined by the tutor for this day
+                  // 1. SLOT SOURCE (RULE 1)
                   const availability = latestTutor?.availability || [];
                   const daySlotsRaw = availability.filter((s: any) => {
-                    if (typeof s === 'string') return true;
-                    if (s.status === 'busy') return false;
-                    
                     const dayMatch = s.day && s.day.toLowerCase() === selectedDay.toLowerCase();
                     const dateMatch = s.date && s.date === bookingSelectedDate;
-                    
-                    // Interlink Fix: Show slot if either the date matches OR the recurring day matches.
-                    // This prevents slots from being hidden just because they have a stale date property.
                     return dateMatch || dayMatch;
                   });
 
-                  let manualBase: string[] = [];
-                  daySlotsRaw.forEach((s: any) => {
-                    const startTime = typeof s === 'string' ? s : (s.start || '');
-                    const endTime = typeof s === 'string' ? '' : (s.end || '');
-                    if (!startTime) return;
-                    const startMins = parseTime(startTime);
-                    const endMins = endTime ? parseTime(endTime) : startMins + 60;
-                    for (let m = startMins; m < endMins; m += 60) {
-                      manualBase.push(formatMins(m));
-                    }
-                  });
-
-                  let slotsToShow = getFinalSlots(manualBase);
-
-                  // 2. FALLBACK: If NO manual slots exist for this day, or they are all in the past/booked,
-                  // we provide the default 10:00 AM and 5:00 PM options as a safety fallback.
-                  if (slotsToShow.length === 0) {
-                    slotsToShow = getFinalSlots(['10:00 AM', '5:00 PM']);
+                  let baseSlots: string[] = [];
+                  if (daySlotsRaw.length > 0) {
+                    daySlotsRaw.forEach((s: any) => {
+                      const startTime = typeof s === 'string' ? s : (s.start || '');
+                      const endTime = typeof s === 'string' ? '' : (s.end || '');
+                      if (!startTime) return;
+                      const startMins = parseTime(startTime);
+                      const endMins = endTime ? parseTime(endTime) : startMins + 60;
+                      for (let m = startMins; m < endMins; m += 60) {
+                        baseSlots.push(formatMins(m));
+                      }
+                    });
+                  } else {
+                    // Fallback to default slots (RULE 1 & 6)
+                    baseSlots = ['10:00 AM', '5:00 PM'];
                   }
 
-                  // RULE 7: Edge Case - truly nothing left
+                  // 2. Apply real-time filtering (RULE 3)
+                  const slotsToShow = getFinalSlots(baseSlots);
+
+                  // 3. Handle empty state (RULE 4 & 5)
                   if (slotsToShow.length === 0) {
-                    return <option value="" disabled selected>⚠️ No Slots Available for Today</option>;
+                    return <option value="" disabled selected>No slots for today</option>;
                   }
 
                   return (
