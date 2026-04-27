@@ -107,13 +107,24 @@ const formatTime = (ts: any) => {
 };
 
 const parseTime = (t: string) => {
+  if (!t) return 0;
+  // Try AM/PM format (e.g. "10:00 AM")
   const match = t.match(/(\d+):(\d+)\s*(AM|PM)/i);
-  if (!match) return 0;
-  let [_, h, m, ampm] = match;
-  let hours = parseInt(h);
-  if (ampm === 'PM' && hours < 12) hours += 12;
-  if (ampm === 'AM' && hours === 12) hours = 0;
-  return hours * 60 + parseInt(m);
+  if (match) {
+    let [_, h, m, ampm] = match;
+    let hours = parseInt(h);
+    if (ampm.toUpperCase() === 'PM' && hours < 12) hours += 12;
+    if (ampm.toUpperCase() === 'AM' && hours === 12) hours = 0;
+    return hours * 60 + parseInt(m);
+  }
+  // Fallback to 24h format (e.g. "14:30")
+  const parts = t.split(':');
+  if (parts.length >= 2) {
+    const h = parseInt(parts[0]);
+    const m = parseInt(parts[1]);
+    if (!isNaN(h) && !isNaN(m)) return h * 60 + m;
+  }
+  return 0;
 };
 
 const formatMins = (m: number) => {
@@ -3551,7 +3562,7 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
    );
  };
 
-const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onReschedule, tutors, currentUser, parseTime, currentTier }: { 
+const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onReschedule, tutors, currentUser, parseTime, currentTier, openBookingModal }: { 
   setView: (view: View) => void, 
   bookings: Booking[], 
   setSelectedTutor: (tutor: Tutor | null) => void, 
@@ -3560,7 +3571,8 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
   tutors: Tutor[],
   currentUser: StudentProfile | null,
   parseTime: (time: string) => number,
-  currentTier: 'free' | 'standard' | 'premium'
+  currentTier: 'free' | 'standard' | 'premium',
+  openBookingModal: (type: 'demo' | 'paid') => void
 }) => {
   const tier = currentTier;
   const category = currentUser?.category || (currentUser?.class === 'B.Tech' ? 'graduates' : 'schools');
@@ -3912,17 +3924,13 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
   );
 };
 
-const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookings, setBookingType, setIsBookingModalOpen, setBookingPlan, setBookingDuration, setBookingSelectedTime, openChat }: { 
+const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookings, openBookingModal, openChat }: { 
   setView: (view: View) => void, 
   setSelectedTutor: (tutor: Tutor | null) => void,
   tutors: Tutor[],
   currentUser: StudentProfile | null,
   bookings: Booking[],
-  setBookingType: (type: 'demo' | 'paid') => void,
-  setIsBookingModalOpen: (open: boolean) => void,
-  setBookingPlan: (plan: string) => void,
-  setBookingDuration: (duration: string) => void,
-  setBookingSelectedTime: (time: string) => void,
+  openBookingModal: (type: 'demo' | 'paid') => void,
   openChat: (tutorId: string, tutorName: string, tutorAvatar?: string) => void
 }) => {
     const [search, setSearch] = useState('');
@@ -4064,7 +4072,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                   <div className="flex items-center gap-1.5 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-100">
                     <span className="text-emerald-600 text-xs md:text-sm font-black">₹{getEffectivePrice(tutor.price)}<span className="text-[9px] opacity-40">/hr</span></span>
                   </div>
-                  <p className="text-[7px] font-bold uppercase tracking-[0.1em] text-emerald-600/40 mt-1">₹{tutor.price} + 17% fee</p>
+                  {/* Amount removed as per request */}
                 </div>
               </div>
               
@@ -4085,12 +4093,12 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                 <div className="flex gap-2">
                   {(() => {
                     const hasAttendedDemo = bookings.some(b => b.tutorId === tutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                    const hasBookedDemo = hasAttendedDemo; // Only enforce enrollment if they actually attended a demo
+                    const hasBookedDemo = hasAttendedDemo;
 
                     if (!hasBookedDemo) {
                       return (
                         <button 
-                          onClick={() => { setSelectedTutor(tutor); setBookingType('demo'); setIsBookingModalOpen(true); }}
+                          onClick={() => { setSelectedTutor(tutor); openBookingModal('demo'); }}
                           className="flex-1 bg-accent/10 text-accent py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-accent hover:text-white transition-all text-center"
                         >
                           Book Free Demo
@@ -4099,15 +4107,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                     } else {
                       return (
                         <button 
-                          onClick={() => { 
-                            setSelectedTutor(tutor); 
-                            setBookingType('paid'); 
-                            const isGrad = tutor.targetClasses?.toLowerCase().includes('graduate');
-                            setBookingPlan(''); 
-                            setBookingDuration(''); // Force them to choose
-                            setBookingSelectedTime(''); // Force them to choose
-                            setIsBookingModalOpen(true); 
-                          }}
+                          onClick={() => { setSelectedTutor(tutor); openBookingModal('paid'); }}
                           className="flex-1 bg-primary text-background py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:scale-[1.02] active:scale-[0.98] transition-all"
                         >
                           Enroll Now
@@ -4145,17 +4145,12 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
     );
   };
 
-const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openChat, bookings, setBookingType, setBookingDuration, setBookingPlan, setBookingSelectedTime, parseTime }: { 
+const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, bookings }: { 
   selectedTutor: Tutor | null, 
   setView: (view: View) => void, 
-  setIsBookingModalOpen: (open: boolean) => void,
+  openBookingModal: (type: 'demo' | 'paid') => void,
   openChat: (tutorId: string, tutorName: string, avatar: string) => void,
-  bookings: Booking[],
-  setBookingType: (type: 'demo' | 'paid') => void,
-  setBookingDuration: (duration: string) => void,
-  setBookingPlan: (plan: string) => void,
-  setBookingSelectedTime: (time: string) => void,
-  parseTime: (time: string) => number
+  bookings: Booking[]
 }) => {
   if (!selectedTutor) return <div className="text-center py-20 font-bold opacity-20 uppercase tracking-widest">Tutor not found</div>;
     return (
@@ -4294,13 +4289,6 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                   <span className="text-4xl md:text-5xl font-serif font-bold italic text-emerald-400">₹{getEffectivePrice(selectedTutor.price)}</span>
                   <span className="text-emerald-400/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/hr</span>
                 </div>
-                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest">
-                  <span className="text-background/40">₹{selectedTutor.price}/hr</span>
-                  <span className="text-background/20">+</span>
-                  <span className="text-background/40">17% Platform Fee</span>
-                  <span className="text-background/20">=</span>
-                  <span className="text-background/60">₹{getEffectivePrice(selectedTutor.price)}/hr</span>
-                </div>
                 {selectedTutor.upiId && (
                   <div className="flex items-center gap-2 text-background/70 text-[10px] md:text-xs">
                     <span className="font-bold">UPI ID:</span> {selectedTutor.upiId}
@@ -4310,8 +4298,7 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
               <div className="flex flex-col gap-4 mt-6 md:mt-8">
                 {(() => {
                   const hasAttendedDemo = bookings.some(b => b.tutorId === selectedTutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                  const hasBookedDemo = hasAttendedDemo; // Only enforce enrollment if they actually attended a demo
-                  const isGraduateTutor = selectedTutor.targetClasses?.includes('Graduate') || selectedTutor.subjects?.some(s => s.toLowerCase().includes('graduate'));
+                  const hasBookedDemo = hasAttendedDemo;
 
                   if (selectedTutor.subjectsPricing && selectedTutor.subjectsPricing.length > 0) {
                     return (
@@ -4334,21 +4321,14 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                         
                         {!hasBookedDemo ? (
                           <button 
-                            onClick={() => { setBookingType('demo'); setIsBookingModalOpen(true); }}
+                            onClick={() => openBookingModal('demo')}
                             className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
                           >
                             Book Free Demo
                           </button>
                         ) : (
                           <button 
-                            onClick={() => { 
-                              setBookingType('paid'); 
-                              const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') || selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
-                              setBookingPlan(''); 
-                              setBookingDuration(''); // Force them to choose
-                              setBookingSelectedTime(''); // Force them to choose
-                              setIsBookingModalOpen(true); 
-                            }}
+                            onClick={() => openBookingModal('paid')}
                             className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
                           >
                             Enroll Now
@@ -4361,7 +4341,7 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                   if (!hasBookedDemo) {
                     return (
                       <button 
-                        onClick={() => { setBookingType('demo'); setIsBookingModalOpen(true); }}
+                        onClick={() => openBookingModal('demo')}
                         className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
                       >
                         Book Free Demo
@@ -4370,14 +4350,7 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
                   } else {
                     return (
                       <button 
-                        onClick={() => { 
-                          setBookingType('paid'); 
-                          const isGrad = selectedTutor?.targetClasses?.toLowerCase().includes('graduate');
-                          setBookingPlan(''); 
-                          setBookingDuration(''); // Force them to choose
-                          setBookingSelectedTime(''); // Force them to choose
-                          setIsBookingModalOpen(true); 
-                        }}
+                        onClick={() => openBookingModal('paid')}
                         className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
                       >
                         Enroll Now
@@ -4419,7 +4392,6 @@ const TutorProfileView = ({ selectedTutor, setView, setIsBookingModalOpen, openC
 
 export default function App() {
   const [view, setView] = useState<View>(() => {
-    // Try to restore previous view, but default to login if no auth session flag exists
     const savedView = localStorage.getItem('student_view') as View;
     const isLoggedIn = localStorage.getItem('student_logged_in') === 'true';
     if (isLoggedIn && savedView && savedView !== 'login' && savedView !== 'register' && savedView !== 'forgot-password') {
@@ -4436,14 +4408,22 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [authInitialized, setAuthInitialized] = useState(false);
 
-  // Persist view changes
+  const openBookingModal = (type: 'demo' | 'paid') => {
+    setBookingType(type);
+    setBookingSelectedSubject('');
+    setBookingSelectedDate('');
+    setBookingSelectedTime('');
+    setBookingDuration('');
+    setBookingPlan('');
+    setIsBookingModalOpen(true);
+  };
+
   useEffect(() => {
     if (view && !['login', 'register', 'forgot-password'].includes(view)) {
       localStorage.setItem('student_view', view);
     }
   }, [view]);
 
-  // Persist user changes
   useEffect(() => {
     if (currentUser) {
       localStorage.setItem('student_user', JSON.stringify(currentUser));
@@ -4454,7 +4434,6 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // Scroll to top when view changes
   useEffect(() => {
     requestAnimationFrame(() => {
       window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
@@ -4492,19 +4471,14 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (!isMounted) return;
       
-      console.log("Auth state changed:", user ? "User logged in" : "User logged out");
-      
-      // Clear any existing timeout
       if (authTimeout) {
         clearTimeout(authTimeout);
       }
       
       try {
         if (user) {
-          // Firebase User Found
           const docRef = doc(db, 'students', user.uid);
           
-          // Set timeout for the Firestore operation
           const timeoutPromise = new Promise((_, reject) => {
             authTimeout = setTimeout(() => reject(new Error('Firestore timeout')), 8000);
           });
@@ -4521,7 +4495,6 @@ export default function App() {
                 return;
               }
               
-              // Ensure subscription exists (Step 1 implementation)
               if (!userData.subscription) {
                 const defaultPlan = getPlanDefaults('free', userData.studentType || 'school');
                 await updateDoc(docRef, { subscription: defaultPlan });
@@ -4530,7 +4503,6 @@ export default function App() {
 
               setCurrentUser({ id: user.uid, ...userData } as any);
 
-              // If student is on free plan, gently remind them to upgrade
               if (userData.subscription?.tier === 'free') {
                 const planNotifId = `plan_remind_${user.uid}`;
                 setNotifications(prev => {
@@ -4561,7 +4533,6 @@ export default function App() {
               await setDoc(docRef, newUser);
               setCurrentUser(newUser as any);
 
-              // Notify student to choose a plan
               setNotifications(prev => [{
                 id: `plan_prompt_${Date.now()}`,
                 title: 'Welcome to Eduqra! Choose Your Plan',
@@ -4572,7 +4543,6 @@ export default function App() {
                 link: 'settings'
               }, ...prev]);
 
-              // Notify Admin of new student
               addDoc(collection(db, 'admin_notifications'), {
                 type: 'New Student',
                 title: 'New Student Registered',
@@ -4581,7 +4551,6 @@ export default function App() {
                 read: false
               });
             }
-            // Only set to dashboard if we are currently on a login/register page
             setView(prev => ['login', 'register', 'forgot-password'].includes(prev) ? 'dashboard' : (prev === 'blocked' ? 'dashboard' : prev));
           } catch (firestoreError) {
             console.error("Firestore error:", firestoreError);
@@ -4599,17 +4568,12 @@ export default function App() {
             setView(prev => ['login', 'register', 'forgot-password'].includes(prev) ? 'dashboard' : prev);
           }
         } else {
-          // No Firebase User
-          // If we have a test account session, stay logged in
           const isTestAccount = currentUser?.email === 'test@eduqra.com';
           const isLoggedIn = localStorage.getItem('student_logged_in') === 'true';
 
           if (!isTestAccount && !isLoggedIn) {
             setView('login');
             setCurrentUser(null);
-          } else if (!isTestAccount && isLoggedIn && !authInitialized) {
-            // Wait for auth to initialize before giving up
-            // This case is handled by the initial state and finally block
           }
         }
       } catch (err) {
@@ -4626,15 +4590,13 @@ export default function App() {
       }
     });
     
-    // Set a fallback timeout in case onAuthStateChanged doesn't fire
     authTimeout = setTimeout(() => {
       if (isMounted && loading) {
-        console.log("Auth initialization timeout, setting loading to false");
         setLoading(false);
         setAuthInitialized(true);
         setView('login');
       }
-    }, 15000); // 15 second fallback timeout
+    }, 15000);
     
     return () => {
       isMounted = false;
@@ -4645,10 +4607,8 @@ export default function App() {
     };
   }, []);
 
-  // Additional safety check for loading state
   useEffect(() => {
     if (authInitialized && loading) {
-      console.log("Auth initialized but still loading, forcing loading to false");
       setLoading(false);
     }
   }, [authInitialized, loading]);
@@ -4657,7 +4617,6 @@ export default function App() {
   const [tutors, setTutors] = useState<Tutor[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
 
-  // 🛡️ Subscription Cycle & Expiry Logic (Step 4)
   const effectiveSubscription = useMemo(() => {
     if (!currentUser?.subscription) return { tier: 'free' as const, expiresAt: null, isExpired: false };
     const { tier, expiresAt } = currentUser.subscription;
@@ -4675,9 +4634,7 @@ export default function App() {
 
   const currentTier = effectiveSubscription.tier;
 
-  // --- Real-time Data Sync ---
   useEffect(() => {
-    // 1. Fetch APPROVED tutors only — real-time listener from 'users' collection
     const tutorsQuery = query(
       collection(db, 'users'), 
       where('role', '==', 'tutor'),
@@ -4710,15 +4667,11 @@ export default function App() {
     return () => unsubTutors();
   }, []);
 
-  // 2. Real-time bookings for current student — reflects admin confirm/cancel instantly
   useEffect(() => {
     if (!currentUser?.email) return;
-    console.log("Syncing bookings for:", currentUser.email);
     const bQuery = query(collection(db, 'bookings'), where('studentEmail', '==', currentUser.email));
     const unsubBookings = onSnapshot(bQuery, (snap) => {
       const bookingList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Booking));
-      console.log(`Found ${bookingList.length} real bookings`);
-      // Merge with mock data to satisfy "previous all data with present"
       setBookings(bookingList);
     }, (err) => {
       console.error("Error fetching bookings:", err);
@@ -4729,13 +4682,10 @@ export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
 
-  // 3. Real-time notifications for current student
   useEffect(() => {
     if (!currentUser?.id) return;
     const uid = currentUser.id;
-    const email = currentUser?.email || '';
 
-    // Query for notifications directed to this student (by ID)
     const nQuery = query(
       collection(db, 'notifications'), 
       where('userId', '==', uid)
@@ -4747,7 +4697,6 @@ export default function App() {
         ...doc.data() 
       } as any));
       
-      // Sort by time (handle both ISO string and Firestore Timestamp)
       notifList.sort((a, b) => {
          const timeA = a.time?.seconds ? a.time.seconds * 1000 : new Date(a.time).getTime();
          const timeB = b.time?.seconds ? b.time.seconds * 1000 : new Date(b.time).getTime();
@@ -4823,58 +4772,77 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [reschedulingBooking, setReschedulingBooking] = useState<Booking | null>(null);
   const [rescheduleDate, setRescheduleDate] = useState<string>('');
-  const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
+   const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
   const [rescheduleSuccess, setRescheduleSuccess] = useState(false);
-
-
 
   const getBookingAmount = () => {
     if (!selectedTutor) return 0;
 
-    const tutorRate = parseFloat(String(selectedTutor?.price || '0')) || 0; // raw tutor hourly rate, e.g. 180
     const planToUse = bookingFormData?.plan || bookingPlan;
-    const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '0'); // hours per day
+    const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '0');
+    const subject = bookingSelectedSubject || bookingFormData?.subject;
 
-    // If no duration chosen yet, return 0
     if (!currentDur) return 0;
-    // If paid and no plan, return 0
     if (bookingType === 'paid' && !planToUse) return 0;
+    if (!subject) return 0;
 
-    // --- Graduate/custom subject pricing (course or fixed monthly) ---
-    const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate') ||
-                       selectedTutor?.targetClasses?.toLowerCase().includes('b-tech');
-    const subjectPriceObj = selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject);
-    if (isGraduate && subjectPriceObj) {
-      // Graduate custom pricing: already a fixed fee (not hourly), just add 17% fee
-      const base = parseFloat(String(subjectPriceObj.price || '0')) || 0;
-      return Math.ceil(base * 1.17);
+    // Use latest data from tutors list if available to ensure sync
+    const latestTutor = tutors.find(t => t.id === selectedTutor.id) || selectedTutor;
+
+    // Check for subject-specific pricing first (e.g. Math might be 120, Science 150)
+    const subjectPriceObj = latestTutor?.subjectsPricing?.find((sp: any) => sp.subject === subject);
+    let baseRate = parseFloat(String(latestTutor?.price || '0')) || 0;
+    
+    if (subjectPriceObj) {
+      baseRate = parseFloat(String(subjectPriceObj.price || '0')) || 0;
+      // If it's a fixed "course" type (lump sum), return that immediately with fee
+      if (subjectPriceObj.type === 'course') {
+        return Math.ceil(baseRate * 1.17);
+      }
     }
 
     // --- Standard formula: Base = rate × hours × days, Final = Base × 1.17 ---
-    let days = 1; // default for single session / demo
+    let days = 1; 
     if (planToUse === 'subscription') days = 365;  // Year Plan
     else if (planToUse === '6months')  days = 180;  // 6 Months Plan
     else if (planToUse === 'monthly')  days = 30;   // One Month Plan
 
-    const base   = tutorRate * currentDur * days;          // e.g. 180 × 1.5 × 30 = 8100
-    const fee    = base * 0.17;                             // e.g. 8100 × 0.17 = 1377
-    const final  = Math.ceil(base + fee);                   // e.g. ₹9477
+    const base   = baseRate * currentDur * days;
+    const fee    = base * 0.17;
+    return Math.ceil(base + fee);
+  };
 
-    return final;
+  const getPlanFeatures = (plan: string) => {
+    switch (plan) {
+      case 'monthly':
+        return ['Single Subject Access', 'One-on-One Sessions', 'Platform Fee Applied', 'Basic Assignments'];
+      case '6months':
+        return ['Up to 3 Subjects', 'Extra Doubt Classes', 'Tutor Notes Included', 'NO Platform Fee', '20% Refund Policy'];
+      case 'subscription':
+        return ['Up to 8 Subjects', 'Premium Notes & Mock Tests', 'Extra Support', 'NO Platform Fee', '40% Refund Policy'];
+      case 'course':
+        return ['Full Course Lifetime Access', 'Project Support', 'Certificate on Completion', 'Placement Assistance'];
+      default:
+        return [];
+    }
   };
 
   const calculateTotal = () => {
     if (bookingType === 'demo') return 'Free First Demo Session';
     
     const planToUse = bookingFormData?.plan || bookingPlan;
-    if (!planToUse) return 'Please Select Enrollment Type';
-
-    // Require duration to be selected before showing amount
     const dur = parseFloat(bookingFormData?.duration || bookingDuration || '0');
-    if (!dur) return 'Please Select Duration';
+    const subject = bookingSelectedSubject || bookingFormData?.subject;
+    const date = bookingSelectedDate || bookingFormData?.date;
+    const time = bookingSelectedTime || bookingFormData?.time;
+
+    // Requirement: Show total only after ALL fields are selected
+    if (!subject || !planToUse || !dur || !date || !time) {
+      return 'Please Select All Fields To See Total';
+    }
 
     const amt = getBookingAmount();
-    if (amt === 0) return 'Please Select Duration';
+    if (amt === 0) return 'Invalid configuration';
     
     if (planToUse === 'course' || selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject)?.type === 'course') {
       return `Course Fee: ₹${amt.toLocaleString('en-IN')}`;
@@ -5014,59 +4982,15 @@ export default function App() {
                 attendance_status: 'attended',
                 completedAt: serverTimestamp() 
               });
-            } else {
-              await updateDoc(bRef, { 
-                status: 'cancelled', 
-                attendance_status: 'not_attended' 
-              });
             }
           }
           
-          // 1c. Post-Time Auto-Cancel for Pending sessions (if start time passed)
-          if (isToday && nowMins > (bMins + 15) && b.status === 'pending') {
-             await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled', attendance_status: 'not_attended' });
-          }
         }
 
-        // 2. Automatic Cancellation for Unpaid Bookings (30 min timeout) - Check regardless of status here
-        if (b.status === 'unpaid' && b.paymentDeadline) {
-          const deadline = b.paymentDeadline.seconds ? new Date(b.paymentDeadline.seconds * 1000) : new Date(b.paymentDeadline);
-          if (now > deadline) {
-             await updateDoc(doc(db, 'bookings', b.id), { status: 'cancelled', cancellationReason: 'Payment Timeout' });
-          }
-        }
 
-        // 3. Subscription Auto-Cancellation (if next billing date passed without payment)
-        if (b.plan === 'subscription' && b.nextBillingDate && b.status !== 'cancelled') {
-          const billingDeadline = b.nextBillingDate.seconds ? new Date(b.nextBillingDate.seconds * 1000) : new Date(b.nextBillingDate);
-          if (now > billingDeadline) {
-             await updateDoc(doc(db, 'bookings', b.id), { 
-               status: 'cancelled', 
-               subscriptionStatus: 'expired',
-               cancellationReason: 'Subscription Payment Overdue' 
-             });
-               
-               // Notify Tutor
-               await addDoc(collection(db, 'tutor_notifications'), {
-                 tutorId: b.tutorId,
-                 type: 'booking',
-                 title: 'Subscription Cancelled',
-                 description: `Student ${b.studentName}'s subscription for ${b.subject} has been cancelled due to non-payment.`,
-                 time: serverTimestamp(),
-                 read: false
-               });
 
-               // Notify Admin
-               await addDoc(collection(db, 'admin_notifications'), {
-                 type: 'Subscription Cancelled',
-                 title: 'Automatic Cancellation',
-                 message: `Subscription for ${b.studentName} with ${b.tutorName} cancelled (Payment overdue).`,
-                 bookingId: b.id,
-                 time: serverTimestamp(),
-                 read: false
-               });
-          }
-        }
+
+
         // 4. Two-week Review Prompt - ONLY if student has actually ATTENDED at least one class
         const attendedBookings = bookings.filter(b => b.status === 'completed' && b.attendance_status === 'attended');
         const tutorsToReview = new Set(attendedBookings.filter(b => !b.reviewSubmitted).map(b => b.tutorId));
@@ -5707,6 +5631,28 @@ export default function App() {
     }, 1500);
   };
 
+  // --- REAL-TIME SLOT CLOCK ---
+  const [currentSystemTime, setCurrentSystemTime] = useState(new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentSystemTime(new Date()), 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // --- REAL-TIME TUTOR SYNC FOR BOOKING ---
+  const [activeTutorDoc, setActiveTutorDoc] = useState<any>(null);
+  useEffect(() => {
+    if (!isBookingModalOpen || !selectedTutor?.id) {
+      setActiveTutorDoc(null);
+      return;
+    }
+    const unsub = onSnapshot(doc(db, 'users', selectedTutor.id), (snap) => {
+      if (snap.exists()) {
+        setActiveTutorDoc({ id: snap.id, ...snap.data() });
+      }
+    });
+    return () => unsub();
+  }, [isBookingModalOpen, selectedTutor?.id]);
+
 
   // --- REAL-TIME CHAT SYNC (Rename to whatsapp) ---
   useEffect(() => {
@@ -6040,7 +5986,9 @@ export default function App() {
       }
     });
 
-    setRescheduleSlots(slots);
+    // Fallback if no manual slots found: show only 10:00 AM and 5:00 PM
+    const finalSlots = Array.from(new Set(slots)).sort((a, b) => parseTime(a) - parseTime(b));
+    setRescheduleSlots(finalSlots.length > 0 ? finalSlots : ['10:00 AM', '5:00 PM']);
   }, [reschedulingBooking, rescheduleDate, bookings, tutors]);
 
 
@@ -6049,6 +5997,14 @@ export default function App() {
     e.preventDefault();
     const type = bookingType;
     if (!selectedTutor || !currentUser) return;
+    
+    // 🛡️ COMPREHENSIVE FIELD VALIDATION
+    if (!bookingSelectedSubject) { alert("Please select a Subject first."); return; }
+    if (type !== 'demo' && !bookingPlan) { alert("Please choose an Enrollment Plan."); return; }
+    if (!bookingSelectedDate) { alert("Please select a Date."); return; }
+    if (!bookingSelectedTime) { alert("Please select a Time Slot."); return; }
+    if (type !== 'demo' && !bookingDuration) { alert("Please select a Class Duration."); return; }
+
     
     const form = e.target as HTMLFormElement;
     const subject = (form.elements.namedItem('subject') as HTMLSelectElement)?.value || (bookingFormData?.subject || 'General');
@@ -6482,6 +6438,7 @@ export default function App() {
             currentUser={currentUser}
             parseTime={parseTime}
             currentTier={currentTier}
+            openBookingModal={openBookingModal}
           />
         );
       case 'find-tutors':
@@ -6492,11 +6449,7 @@ export default function App() {
             tutors={tutors}
             currentUser={currentUser}
             bookings={bookings}
-            setBookingType={setBookingType}
-            setIsBookingModalOpen={setIsBookingModalOpen}
-            setBookingPlan={setBookingPlan}
-            setBookingDuration={setBookingDuration}
-            setBookingSelectedTime={setBookingSelectedTime}
+            openBookingModal={openBookingModal}
             openChat={openChat}
           />
         );
@@ -6505,14 +6458,9 @@ export default function App() {
           <TutorProfileView 
             selectedTutor={selectedTutor} 
             setView={setView} 
-            setIsBookingModalOpen={setIsBookingModalOpen} 
+            openBookingModal={openBookingModal}
             openChat={openChat}
             bookings={bookings}
-            setBookingType={setBookingType}
-            setBookingDuration={setBookingDuration}
-            setBookingPlan={setBookingPlan}
-            setBookingSelectedTime={setBookingSelectedTime}
-            parseTime={parseTime}
           />
         );
       case 'my-bookings':
@@ -6726,34 +6674,20 @@ export default function App() {
             >
               <option value="" disabled>Select Subject</option>
               {(() => {
-                const btechTechnical = [
-                  "Engineering Mathematics – M1", "Engineering Mathematics – M2", "Engineering Mathematics – M3", "Engineering Mathematics – M4",
-                  "C Programming", "C++", "Java", "Python", "SQL", "PLSQL", "C#", "Data Structures", "DBMS", 
-                  "Operating Systems", "Computer Networks", "Web Development", "React", "Node.js", "AI/ML", 
-                  "Cloud Computing", "Software Engineering", "Discrete Mathematics", "Computer Architecture", 
-                  "Digital Logic", "Microprocessors", "Control Systems", "Signals and Systems", "Theory of Computation", 
-                  "Compiler Design", "Embedded Systems", "VLSI Design"
-                ];
-                
+                const tLevel = selectedTutor?.targetClasses || '';
+                const tIsGraduate = tLevel.includes('Graduate');
+                const tIsIntermediate = tLevel.includes('Intermediate');
+                const tIsSchool = tLevel.includes('Primary') || tLevel.includes('Middle') || tLevel.includes('Nursery') || tLevel.includes('Secondary');
+
                 // Tier 1: Real-time Firestore subjects
                 let subjects = (selectedTutor?.subjects && selectedTutor.subjects.length > 0) ? [...selectedTutor.subjects] : [];
                 
-                // Tier 2: Mock record fallback
+                // Tier 2: Fallback to Level-based defaults if tutor hasn't set any
                 if (subjects.length === 0) {
-                  const mockTutor = MOCK_TUTORS.find(t => t.id === selectedTutor?.id);
-                  if (mockTutor?.subjects && mockTutor.subjects.length > 0) subjects = [...mockTutor.subjects];
-                }
-                
-                // Tier 3: Core subjects global fallback
-                if (subjects.length === 0) {
-                  subjects = currentUser?.class === 'B.Tech' 
-                    ? [...btechTechnical, "Engineering Graphics", "English for Engineers"]
-                    : ["Mathematics", "Physics", "Chemistry", "Computer Science", "English", "Telugu"];
-                } else if (currentUser?.class === 'B.Tech') {
-                  // If we have subjects but student is B.Tech, ensure technical are included if not already there
-                  btechTechnical.forEach(bt => {
-                    if (!subjects.includes(bt)) subjects.push(bt);
-                  });
+                  if (tIsGraduate) subjects = ["Mathematics (B.Tech/B.Sc)", "Java", "Python", "Web Development", "AI/ML", "All Subjects (Graduate)"];
+                  else if (tIsIntermediate) subjects = ["Maths 1A", "Maths 1B", "Physics", "Chemistry", "JEE Mains", "All Subjects (Intermediate)"];
+                  else if (tIsSchool) subjects = ["Telugu", "English", "Mathematics", "Science", "EVS", "All Subjects (Upto 10th)"];
+                  else subjects = ["Mathematics", "English", "Science"]; // Total fallback
                 }
                 
                 return subjects.map(s => <option key={s} value={s}>{s}</option>);
@@ -6781,14 +6715,36 @@ export default function App() {
                 }
                 return (
                   <>
-                    <option value="" disabled>Choose Type</option>
-                    <option value="subscription">Year Plan (Pay Monthly)</option>
+                    <option value="" disabled>Choose Plan Type</option>
+                    <option value="subscription">Year Plan</option>
                     <option value="6months">6 Months Plan (One-time Pay)</option>
                     <option value="monthly">One Month Plan</option>
                   </>
                 );
               })()}
             </select>
+          </div>
+
+          {/* PLAN FEATURES PREVIEW */}
+          <div className="space-y-4">
+            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Plan Features & Benefits</label>
+            <div className="bg-primary/5 rounded-2xl p-4 border border-primary/10 min-h-[80px] flex flex-col justify-center">
+              {bookingPlan ? (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                  {getPlanFeatures(bookingPlan).map((feature, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <div className="w-1 h-1 rounded-full bg-emerald-500 shrink-0" />
+                      <span className="text-[9px] font-black text-primary/60 uppercase tracking-tight leading-none">{feature}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center space-y-1">
+                  <p className="text-[10px] font-black text-primary/20 uppercase">Select a plan to see features</p>
+                  <p className="text-[8px] font-bold text-primary/10 uppercase tracking-[0.2em]">Monthly, 6 Months, or Year Plan</p>
+                </div>
+              )}
+            </div>
           </div>
 
 
@@ -6921,63 +6877,89 @@ export default function App() {
                 onChange={(e) => setBookingSelectedTime(e.target.value)}
               >
                 {(() => {
-                  // Default time slots shown when tutor has no availability or no date picked
-                  const defaultSlots = [
-                    '8:00 AM','9:00 AM','10:00 AM','11:00 AM',
-                    '12:00 PM','1:00 PM','2:00 PM','3:00 PM',
-                    '4:00 PM','5:00 PM','6:00 PM','7:00 PM','8:00 PM'
-                  ];
-
-                  // If no date selected, show full default list
+                  // INTERLINK: Use activeTutorDoc for real-time availability updates from tutor side
+                  const latestTutor = activeTutorDoc || tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
+                  
                   if (!bookingSelectedDate) {
-                    return (
-                      <>
-                        <option value="" disabled>Select Time</option>
-                        {defaultSlots.map((t, i) => <option key={i} value={t}>{t}</option>)}
-                      </>
-                    );
+                    return <option value="" disabled selected>Select Date First</option>;
                   }
 
-                  // Date selected — try to get tutor's specific slots for that day
-                  const dateObj = new Date(bookingSelectedDate);
+                  const [y, m, d_val] = bookingSelectedDate.split('-').map(Number);
+                  const dateObj = new Date(y, m - 1, d_val);
+
+                  if (isNaN(dateObj.getTime())) {
+                    return <option value="" disabled selected>Invalid Date</option>;
+                  }
+                  
                   const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
+                  const now = currentSystemTime;
+                  const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+                  const isToday = bookingSelectedDate === isoToday;
+                  const nowMins = now.getHours() * 60 + now.getMinutes();
 
-                  const rawSlots = (selectedTutor?.availability || [])
-                    .filter((s: any) => {
-                      if (typeof s === 'string') return true;
-                      if (s.status === 'busy') return false;
-                      if (s.date) return s.date === bookingSelectedDate;
-                      if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
-                      return false;
+                  // Helper to apply real-time and booking filters
+                  const getFinalSlots = (sourceSlots: string[]) => {
+                    const uniqueSorted = Array.from(new Set(sourceSlots)).sort((a, b) => parseTime(a) - parseTime(b));
+                    let filtered = isToday ? uniqueSorted.filter(s => parseTime(s) > nowMins + 5) : uniqueSorted;
+                    return filtered.filter(slotTime => {
+                      const slotStart = parseTime(slotTime);
+                      const durationVal = parseFloat(bookingDuration || '1');
+                      const slotEnd = slotStart + (durationVal * 60);
+                      return !tutorBookings.some(b => {
+                        if (b.status === 'cancelled' || b.date !== bookingSelectedDate) return false;
+                        const bStart = parseTime(b.time);
+                        const bDurStr = b.duration?.toString().replace(/ Hours?/, '') || '1';
+                        const bEnd = bStart + (parseFloat(bDurStr) * 60);
+                        return slotStart < bEnd && slotEnd > bStart;
+                      });
                     });
+                  };
 
-                  const expandedSlots: string[] = [];
-                  rawSlots.forEach((s: any) => {
+                  // 1. First, try to get manual slots defined by the tutor for this day
+                  const availability = latestTutor?.availability || [];
+                  const daySlotsRaw = availability.filter((s: any) => {
+                    if (typeof s === 'string') return true;
+                    if (s.status === 'busy') return false;
+                    
+                    const dayMatch = s.day && s.day.toLowerCase() === selectedDay.toLowerCase();
+                    const dateMatch = s.date && s.date === bookingSelectedDate;
+                    
+                    // Interlink Fix: Show slot if either the date matches OR the recurring day matches.
+                    // This prevents slots from being hidden just because they have a stale date property.
+                    return dateMatch || dayMatch;
+                  });
+
+                  let manualBase: string[] = [];
+                  daySlotsRaw.forEach((s: any) => {
                     const startTime = typeof s === 'string' ? s : (s.start || '');
                     const endTime = typeof s === 'string' ? '' : (s.end || '');
                     if (!startTime) return;
                     const startMins = parseTime(startTime);
                     const endMins = endTime ? parseTime(endTime) : startMins + 60;
                     for (let m = startMins; m < endMins; m += 60) {
-                      expandedSlots.push(formatMins(m));
+                      manualBase.push(formatMins(m));
                     }
                   });
 
-                  const finalSlots = expandedSlots.filter(slotTime => {
-                    return !tutorBookings.some(b =>
-                      b.date === bookingSelectedDate &&
-                      b.time === slotTime &&
-                      ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
-                    );
-                  });
+                  let slotsToShow = getFinalSlots(manualBase);
 
-                  // No tutor-specific slots → show default list
-                  const slotsToShow = finalSlots.length > 0 ? finalSlots : defaultSlots;
+                  // 2. FALLBACK: If NO manual slots exist for this day, or they are all in the past/booked,
+                  // we provide the default 10:00 AM and 5:00 PM options as a safety fallback.
+                  if (slotsToShow.length === 0) {
+                    slotsToShow = getFinalSlots(['10:00 AM', '5:00 PM']);
+                  }
+
+                  // RULE 7: Edge Case - truly nothing left
+                  if (slotsToShow.length === 0) {
+                    return <option value="" disabled selected>⚠️ No Slots Available for Today</option>;
+                  }
 
                   return (
                     <>
-                      <option value="" disabled>Select Time</option>
-                      {slotsToShow.map((t, idx) => <option key={idx} value={t}>{t}</option>)}
+                      <option value="" disabled selected>Select Time</option>
+                      {slotsToShow.map((t, idx) => (
+                        <option key={idx} value={t}>{t}</option>
+                      ))}
                     </>
                   );
                 })()}
@@ -7228,7 +7210,7 @@ export default function App() {
                 {rescheduleSlots.length > 0 ? (
                   rescheduleSlots.map(t => <option key={t} value={t}>{t}</option>)
                 ) : (
-                  <option value="" disabled>No slots available for this date</option>
+                  <option value="" disabled selected>⚠️ No Slots Available for this Date</option>
                 )}
               </select>
               <p className="text-[8px] font-bold text-primary/30 uppercase tracking-tight ml-4">
