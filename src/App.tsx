@@ -3036,7 +3036,16 @@ function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation
     );
   };
 
-function SettingsView({ setView, currentUser, setCurrentUser, currentTier, bookings, notifyTutorsOfPlanUpdate, effectiveSubscription }: { setView: (view: View) => void, currentUser: StudentProfile | null, setCurrentUser: (user: StudentProfile | null) => void, currentTier: string, bookings: Booking[], notifyTutorsOfPlanUpdate: any, effectiveSubscription: any }) {
+function SettingsView({ setView, currentUser, setCurrentUser, currentTier, bookings, notifyTutorsOfPlanUpdate, effectiveSubscription, onUpgrade }: { 
+  setView: (view: View) => void, 
+  currentUser: StudentProfile | null, 
+  setCurrentUser: (user: StudentProfile | null) => void, 
+  currentTier: string, 
+  bookings: Booking[], 
+  notifyTutorsOfPlanUpdate: any, 
+  effectiveSubscription: any,
+  onUpgrade: (plan: any) => Promise<void>
+}) {
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [pwdStatus, setPwdStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState('');
@@ -3558,41 +3567,7 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
 
                       <button 
                         disabled={isCurrent}
-                        onClick={async () => {
-                           if (p.tier === 'free') {
-                             alert("You are already on the Free Plan. To cancel your paid plan, contact support.");
-                             return;
-                           }
-                           const subEnd = new Date();
-                           subEnd.setMonth(subEnd.getMonth() + 3);
-                           const subLimit = p.tier === 'free' ? 3 : p.tier === 'standard' ? 5 : 8;
-                           const updatedSub: SubscriptionPlan = {
-                             tier: p.tier as any,
-                             status: 'active',
-                             startDate: new Date().toISOString(),
-                             expiresAt: subEnd.toISOString(),
-                             allowedSubjects: subLimit
-                           };
-                           const uid = auth.currentUser?.uid || currentUser?.id;
-                           if (uid && uid !== 'test_user_id') {
-                             await updateDoc(doc(db, 'students', uid), { subscription: updatedSub });
-                             // 🔔 ADD NOTIFICATION FOR STUDENT DASHBOARD
-                             await addDoc(collection(db, 'notifications'), {
-                               userId: uid,
-                               type: 'update',
-                               title: 'Platform Upgraded Successfully',
-                               message: `Welcome to the ${p.name} plan! Your new features are unlocked for the next 3 months.`,
-                               time: new Date().toISOString(),
-                               read: false
-                             });
-                           }
-                           setCurrentUser({ ...currentUser!, subscription: updatedSub });
-                           
-                           // 🔔 NOTIFY TUTORS
-                           notifyTutorsOfPlanUpdate(currentUser?.name || 'Student', updatedSub.tier, bookings);
-                           alert(`Congratulations! You have upgraded to ${p.name}. Your features are now unlocked.`);
-                           setView('dashboard');
-                        }}
+                        onClick={() => onUpgrade(p)}
                         className={cn(
                           "w-full py-3.5 rounded-xl font-black text-[9px] uppercase tracking-widest transition-all mt-8",
                           isCurrent ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-primary text-white hover:scale-105"
@@ -5492,117 +5467,257 @@ export default function App() {
     setActiveChatId(chatId);
     setView('chat');
   };
-  const processPayment = (upiOption: string) => {
+  const processPayment = async (upiOption: string) => {
     if (!selectedTutor || !bookingFormData) return;
     
     setPaymentStatus('processing');
     
-    // Generate UPI Intent deep link for the authentic mobile flow
-    const durationStr = bookingFormData.duration ? bookingFormData.duration.toString().replace(/ Hours?/, '') : '1';
-    const durationNum = parseFloat(durationStr) || 1;
-    
+    // 1. Calculate amount (matching backend logic)
     const fhpValue = parseFloat(getEffectivePrice(selectedTutor?.price));
     let amountStr = '0';
     if (bookingFormData.type === 'demo') {
       amountStr = '0';
+      setPaymentStatus('success');
+      confirmBookingAfterPayment('demo_pay_id', 'demo_order_id', 0);
+      return;
     } else if (bookingFormData.plan === 'monthly') {
-      const monthTotal = fhpValue * 30;
-      amountStr = monthTotal.toFixed(2);
+      amountStr = (fhpValue * 30).toFixed(2);
     } else {
       const sCount = parseFloat(bookingFormData.duration) || 1;
-      const countTotal = fhpValue * sCount;
-      amountStr = countTotal.toFixed(2);
+      amountStr = (fhpValue * sCount).toFixed(2);
     }
-    const vpa = 'rzp@hdfcbank';
-    const name = encodeURIComponent('Scholar Platform');
-    
-    let deepLink = '';
-    if (upiOption === 'PhonePe') {
-      deepLink = `phonepe://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
-    } else if (upiOption === 'Google Pay') {
-      deepLink = `tez://upi/pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
-    } else if (upiOption === 'Paytm') {
-      deepLink = `paytmmp://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
-    } else {
-      deepLink = `upi://pay?pa=${vpa}&pn=${name}&am=${amountStr}&cu=INR`;
-    }
-    
-    // Attempt to open the installed app (if on mobile, this prompts the user to open PhonePe/GPay)
+
     try {
-      if (deepLink && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
-        window.location.href = deepLink;
-      } else if (deepLink) {
-        console.warn('Deep link redirection skipped on desktop: ', deepLink);
-      }
-    } catch (err) {
-      console.error('Redirection failed:', err);
-    }
-    
-    // Simulate Razorpay checkout process webhook callback from background
-    setTimeout(async () => {
-      // Simulate success
-      const paymentId = 'pay_' + Math.random().toString(36).substr(2, 9);
-      const orderId = 'order_' + Math.random().toString(36).substr(2, 9);
-      
-      setPaymentData({ paymentId, orderId, status: 'success' });
-      setPaymentStatus('success');
-
-      if (bookingFormData?.id) {
-        // Update the 'unpaid' booking to 'pending' (for Admin/Tutor review)
-        const isSub = bookingFormData.plan === 'subscription' || bookingFormData.plan === 'monthly' || bookingFormData.plan === '6months';
-        const nextBilling = new Date();
-        nextBilling.setDate(nextBilling.getDate() + 30);
-
-        await updateDoc(doc(db, 'bookings', bookingFormData.id), {
-          status: 'pending',
-          paymentId: paymentId,
-          orderId: orderId,
+      // 2. Create Order on Backend
+      const orderResponse = await fetch('http://localhost:5001/api/create-razorpay-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
           amount: parseFloat(amountStr),
-          paidAt: serverTimestamp(),
-          isSubscription: isSub,
-          subscriptionStatus: isSub ? 'active' : null,
-          nextBillingDate: isSub ? nextBilling : null
-        });
+          receipt: `rcpt_${bookingFormData.id}`
+        })
+      });
 
-        // Trigger email notification to the student
-        fetch('http://localhost:5001/api/booking-success', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            booking: {
-              ...bookingFormData,
-              studentEmail: currentUser?.email,
-              studentName: currentUser?.name,
-              tutorName: selectedTutor?.name,
-              tutorEmail: selectedTutor?.email
-            }
-          })
-        }).catch(console.error);
+      const orderData = await orderResponse.json();
+      if (!orderResponse.ok) throw new Error(orderData.message || 'Failed to create order');
 
-        // Notify admin of completed payment
-        await addDoc(collection(db, 'admin_notifications'), {
-          type: 'Payment Success',
-          title: 'Enrollment Confirmed',
-          message: `${currentUser?.name} paid ₹${amountStr} for ${bookingFormData.subject}. Booking ID: ${bookingFormData.id}`,
-          bookingId: bookingFormData.id,
-          time: serverTimestamp(),
-          read: false
-        });
+      // 3. Open Razorpay Checkout
+      const options = {
+        key: import.meta.env.VITE_RAZORPAY_KEY_ID, 
+        amount: orderData.amount,
+        currency: orderData.currency,
+        name: "Eduqra",
+        description: `${bookingFormData.subject} with ${selectedTutor.name}`,
+        image: "/logo.png",
+        order_id: orderData.orderId,
+        handler: async function (response: any) {
+          console.log("✅ Payment Successful:", response.razorpay_payment_id);
+          setPaymentData({ 
+            paymentId: response.razorpay_payment_id, 
+            orderId: response.razorpay_order_id, 
+            status: 'success' 
+          });
+          setPaymentStatus('success');
+          await confirmBookingAfterPayment(
+            response.razorpay_payment_id, 
+            response.razorpay_order_id, 
+            parseFloat(amountStr)
+          );
+        },
+        prefill: {
+          name: currentUser?.name || "",
+          email: currentUser?.email || "",
+          contact: currentUser?.mobile || ""
+        },
+        theme: { color: "#000000" },
+        modal: {
+          ondismiss: function() { setPaymentStatus('idle'); }
+        }
+      };
 
-        // Notify tutor of confirmed enrollment
-        await addDoc(collection(db, 'tutor_notifications'), {
-          tutorId: selectedTutor.id,
-          type: 'booking',
-          title: 'Enrollment Confirmed',
-          description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}. Plan: ${bookingFormData.plan?.toUpperCase()}.`,
-          time: 'Just now',
-          read: false,
-          timestamp: serverTimestamp()
-        });
-      }
-    }, 4500);
+      const rzp = new (window as any).Razorpay(options);
+      rzp.open();
+
+    } catch (err: any) {
+      console.error('❌ Payment Error:', err);
+      setPaymentStatus('cancelled');
+      alert("Payment initialization failed: " + err.message);
+    }
   };
 
+  const confirmBookingAfterPayment = async (paymentId: string, orderId: string, amount: number) => {
+    if (!bookingFormData || !selectedTutor) return;
+
+    const isSub = bookingFormData.plan === 'subscription' || bookingFormData.plan === 'monthly' || bookingFormData.plan === '6months';
+    const nextBilling = new Date();
+    nextBilling.setDate(nextBilling.getDate() + 30);
+
+    try {
+      await updateDoc(doc(db, 'bookings', bookingFormData.id), {
+        status: 'pending',
+        paymentId: paymentId,
+        orderId: orderId,
+        amount: amount,
+        paidAt: serverTimestamp(),
+        isSubscription: isSub,
+        subscriptionStatus: isSub ? 'active' : null,
+        nextBillingDate: isSub ? nextBilling : null
+      });
+
+      fetch('http://localhost:5001/api/booking-success', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          booking: {
+            ...bookingFormData,
+            studentEmail: currentUser?.email,
+            studentName: currentUser?.name,
+            tutorName: selectedTutor?.name,
+            tutorEmail: selectedTutor?.email
+          }
+        })
+      }).catch(console.error);
+
+      await addDoc(collection(db, 'admin_notifications'), {
+        type: 'Payment Success',
+        title: 'Enrollment Confirmed',
+        message: `${currentUser?.name} paid ₹${amount} for ${bookingFormData.subject}.`,
+        bookingId: bookingFormData.id,
+        time: serverTimestamp(),
+        read: false
+      });
+
+      await addDoc(collection(db, 'tutor_notifications'), {
+        tutorId: selectedTutor.id,
+        type: 'booking',
+        title: 'Enrollment Confirmed',
+        description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}.`,
+        time: 'Just now',
+        read: false,
+        timestamp: serverTimestamp()
+      });
+    } catch (e) {
+      console.error("Firestore Update Error:", e);
+    }
+  };
+
+
+
+  const processUpgradePayment = async (plan: any) => {
+    if (!currentUser) return;
+    
+    // 1. Calculate amount (matching backend logic)
+    const amountStr = plan.price;
+    if (parseFloat(amountStr) === 0) {
+       // Free plan doesn't need Razorpay
+       const subEnd = new Date();
+       subEnd.setMonth(subEnd.getMonth() + 3);
+       const subLimit = plan.tier === 'free' ? 3 : plan.tier === 'standard' ? 5 : 8;
+       const updatedSub: SubscriptionPlan = {
+         tier: plan.tier,
+         status: 'active',
+         startDate: new Date().toISOString(),
+         expiresAt: subEnd.toISOString(),
+         allowedSubjects: subLimit
+       };
+       const uid = auth.currentUser?.uid || currentUser?.id;
+       if (uid && uid !== 'test_user_id') {
+         await updateDoc(doc(db, 'students', uid), { subscription: updatedSub });
+       }
+       setCurrentUser({ ...currentUser, subscription: updatedSub });
+       alert(`Congratulations! You have upgraded to ${plan.name}.`);
+       return;
+    }
+
+    try {
+      // 2. Create Order on Backend
+      const orderResponse = await fetch('http://localhost:5001/api/create-razorpay-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          amount: parseFloat(amountStr),
+          receipt: `upgrade_${currentUser.email.replace(/\./g, '_')}`
+        })
+      });
+
+      const orderData = await orderResponse.json();
+      if (!orderResponse.ok) throw new Error(orderData.message || 'Failed to create order');
+
+      // 3. Open Razorpay Checkout
+      const options = {
+        key: import.meta.env.VITE_RAZORPAY_KEY_ID, 
+        amount: orderData.amount,
+        currency: orderData.currency,
+        name: "Eduqra Platform Upgrade",
+        description: `Upgrading to ${plan.name} Plan`,
+        image: "/logo.png",
+        order_id: orderData.orderId,
+        handler: async function (response: any) {
+          console.log("✅ Upgrade Payment Successful:", response.razorpay_payment_id);
+          await confirmUpgradeAfterPayment(plan, response.razorpay_payment_id, response.razorpay_order_id);
+        },
+        prefill: {
+          name: currentUser.name || "",
+          email: currentUser.email || "",
+          contact: currentUser.mobile || ""
+        },
+        theme: { color: "#000000" }
+      };
+
+      const rzp = new (window as any).Razorpay(options);
+      rzp.open();
+
+    } catch (err: any) {
+      console.error('❌ Upgrade Error:', err);
+      alert("Upgrade failed: " + err.message);
+    }
+  };
+
+  const confirmUpgradeAfterPayment = async (plan: any, paymentId: string, orderId: string) => {
+    const subEnd = new Date();
+    subEnd.setMonth(subEnd.getMonth() + 3);
+    const subLimit = plan.tier === 'free' ? 3 : plan.tier === 'standard' ? 5 : 8;
+    const updatedSub: SubscriptionPlan = {
+      tier: plan.tier,
+      status: 'active',
+      startDate: new Date().toISOString(),
+      expiresAt: subEnd.toISOString(),
+      allowedSubjects: subLimit
+    };
+
+    const uid = auth.currentUser?.uid || currentUser?.id;
+    if (uid && uid !== 'test_user_id') {
+      await updateDoc(doc(db, 'students', uid), { 
+        subscription: updatedSub,
+        lastUpgradePaymentId: paymentId,
+        lastUpgradeOrderId: orderId
+      });
+
+      // Notify admin
+      await addDoc(collection(db, 'admin_notifications'), {
+        type: 'Upgrade Success',
+        title: 'Platform Upgraded',
+        message: `${currentUser?.name} upgraded to ${plan.name} plan.`,
+        time: serverTimestamp(),
+        read: false
+      });
+
+      // Notify student
+      await addDoc(collection(db, 'notifications'), {
+        userId: uid,
+        type: 'update',
+        title: 'Platform Upgraded Successfully',
+        message: `Welcome to the ${plan.name} plan! Your features are unlocked for 3 months.`,
+        time: new Date().toISOString(),
+        read: false
+      });
+    }
+
+    setCurrentUser({ ...currentUser!, subscription: updatedSub });
+    notifyTutorsOfPlanUpdate(currentUser?.name || 'Student', updatedSub.tier, bookings);
+    alert(`Congratulations! You have upgraded to ${plan.name}.`);
+    setView('dashboard');
+  };
 
   const cancelPayment = () => {
     setPaymentStatus('cancelled');
@@ -6563,7 +6678,16 @@ export default function App() {
           </div>
         );
       case 'settings':
-        return <SettingsView setView={setView} currentUser={currentUser} setCurrentUser={setCurrentUser} currentTier={currentTier} bookings={bookings} notifyTutorsOfPlanUpdate={notifyTutorsOfPlanUpdate} effectiveSubscription={effectiveSubscription} />;
+        return <SettingsView 
+          setView={setView} 
+          currentUser={currentUser} 
+          setCurrentUser={setCurrentUser} 
+          currentTier={currentTier} 
+          bookings={bookings} 
+          notifyTutorsOfPlanUpdate={notifyTutorsOfPlanUpdate} 
+          effectiveSubscription={effectiveSubscription} 
+          onUpgrade={processUpgradePayment}
+        />;
       case 'live-class':
         return <div className="flex-1 bg-[#0A0A0B]" />;
       default:
