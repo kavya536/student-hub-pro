@@ -179,8 +179,8 @@ const getPlanDefaults = (tier: 'free' | 'standard' | 'premium', category: Studen
   const expiresAt = new Date();
   expiresAt.setMonth(startDate.getMonth() + 3); // 3-month duration
 
-  let allowedSubjects = 1;
-  if (tier === 'standard') allowedSubjects = 3;
+  let allowedSubjects = 3;
+  if (tier === 'standard') allowedSubjects = 5;
   if (tier === 'premium') allowedSubjects = 8;
 
   let cat: SubscriptionPlan['category'] = 'schools';
@@ -303,6 +303,7 @@ interface StudentProfile {
 interface Tutor {
   id: string;
   name: string;
+  email?: string;
   avatar: string;
   subjects: string[];
   experience: string;
@@ -1566,18 +1567,23 @@ const RegisterView = ({ setView, setCurrentUser }: {
         const target = n.targetClass || n.class || '';
         const normTarget = normalize(target);
         
-        // Match logic: If note has no specific target class, show to all.
+        const extractNumber = (s: string) => { const m = s.match(/\d+/); return m ? m[0] : null; };
+        const targetNum = extractNumber(normTarget);
+
+        // Match logic: If note has no specific target class or targets 'All', show to all.
         // Otherwise, match against the student's known classes (profile + bookings).
-        const matchesClass = !target || 
+        const matchesClass = !target || normTarget === 'all' || normTarget === 'any' || 
                            studentClasses.some(c => c === normTarget) ||
                            (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
                            (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
                            // Add logic for numbered classes (e.g. "10th" vs "10")
-                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget));
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget)) ||
+                           // robust number matching (e.g. "5th cls" vs "Class 5")
+                           (targetNum && studentClasses.some(c => extractNumber(c) === targetNum));
         
-        // Subject filter: Show all for class if no bookings yet, else refine.
+        // Subject filter: Restrict by subject according to user request
         const matchesSubject = enrolledSubjects.length === 0 || 
-                             !n.subject || 
+                             !n.subject || normalize(n.subject) === 'all' || normalize(n.subject) === 'any' ||
                              normalizedEnrolled.includes(normalize(n.subject)) ||
                              normalizedEnrolled.some(enrolled => normalize(n.subject).includes(enrolled) || enrolled.includes(normalize(n.subject)));
         
@@ -1596,17 +1602,28 @@ const RegisterView = ({ setView, setCurrentUser }: {
       const bookingClasses = Array.from(new Set(bookings.map(b => normalize(b.studentClass || b.class || ''))));
       const profileClass = normalize(currentUser.class);
       const studentClasses = Array.from(new Set([profileClass, ...bookingClasses].filter(Boolean)));
+      const normalizedEnrolled = enrolledSubjects.map(normalize);
 
       const filtered = allPolls.filter((p) => {
         const target = p.targetClass || '';
         const normTarget = normalize(target);
         
-        const matchesClass = !target || 
+        const extractNumber = (s: string) => { const m = s.match(/\d+/); return m ? m[0] : null; };
+        const targetNum = extractNumber(normTarget);
+        
+        const matchesClass = !target || normTarget === 'all' || normTarget === 'any' || 
                            studentClasses.some(c => c === normTarget) ||
                            (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
                            (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
-                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget));
-        return matchesClass;
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget)) ||
+                           (targetNum && studentClasses.some(c => extractNumber(c) === targetNum));
+                           
+        const matchesSubject = enrolledSubjects.length === 0 || 
+                             !p.topic || normalize(p.topic) === 'all' || normalize(p.topic) === 'any' ||
+                             normalizedEnrolled.includes(normalize(p.topic)) ||
+                             normalizedEnrolled.some(enrolled => normalize(p.topic).includes(enrolled) || enrolled.includes(normalize(p.topic)));
+                             
+        return matchesClass && matchesSubject;
       });
       setPolls(filtered);
     });
@@ -3132,6 +3149,25 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
       if (userId && userId !== 'test_user_id') {
         const userRef = doc(db, 'students', userId);
         await setDoc(userRef, updatedData, { merge: true });
+
+        // CASCADE NAME UPDATE SO TUTOR DASHBOARD SEES IT INSTANTLY
+        try {
+          if (currentUser?.email && formData.name) {
+            // Update Bookings
+            const { query, collection, where, getDocs } = await import('firebase/firestore');
+            const bQuery = query(collection(db, 'bookings'), where('studentEmail', '==', currentUser.email));
+            const bSnap = await getDocs(bQuery);
+            bSnap.docs.forEach(d => updateDoc(doc(db, 'bookings', d.id), { studentName: formData.name, name: formData.name }));
+            
+            // Update WhatsApp Chats
+            const cQuery = query(collection(db, 'whatsapp'), where('studentEmail', '==', currentUser.email));
+            const cSnap = await getDocs(cQuery);
+            cSnap.docs.forEach(d => updateDoc(doc(db, 'whatsapp', d.id), { studentName: formData.name }));
+          }
+        } catch (cascadeError) {
+          console.error("Error cascading name update:", cascadeError);
+        }
+
       } else {
         console.log("Mock User Update: Changes applied locally.");
       }
@@ -3529,7 +3565,7 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
                            }
                            const subEnd = new Date();
                            subEnd.setMonth(subEnd.getMonth() + 3);
-                           const subLimit = p.tier === 'free' ? 1 : p.tier === 'standard' ? 3 : 8;
+                           const subLimit = p.tier === 'free' ? 3 : p.tier === 'standard' ? 5 : 8;
                            const updatedSub: SubscriptionPlan = {
                              tier: p.tier as any,
                              status: 'active',
@@ -3540,6 +3576,15 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
                            const uid = auth.currentUser?.uid || currentUser?.id;
                            if (uid && uid !== 'test_user_id') {
                              await updateDoc(doc(db, 'students', uid), { subscription: updatedSub });
+                             // 🔔 ADD NOTIFICATION FOR STUDENT DASHBOARD
+                             await addDoc(collection(db, 'notifications'), {
+                               userId: uid,
+                               type: 'update',
+                               title: 'Platform Upgraded Successfully',
+                               message: `Welcome to the ${p.name} plan! Your new features are unlocked for the next 3 months.`,
+                               time: new Date().toISOString(),
+                               read: false
+                             });
                            }
                            setCurrentUser({ ...currentUser!, subscription: updatedSub });
                            
@@ -5447,9 +5492,6 @@ export default function App() {
     setActiveChatId(chatId);
     setView('chat');
   };
-
-
-
   const processPayment = (upiOption: string) => {
     if (!selectedTutor || !bookingFormData) return;
     
@@ -5522,113 +5564,45 @@ export default function App() {
           nextBillingDate: isSub ? nextBilling : null
         });
 
-        // 🛡️ UPDATE STUDENT SUBSCRIPTION CYCLE (Day 1 of Payment)
-        if (currentUser?.id) {
-          const subStart = new Date();
-          const subEnd = new Date();
-          subEnd.setMonth(subEnd.getMonth() + 3);
-
-          const subLimit = currentTier === 'free' ? 1 : currentTier === 'standard' ? 3 : 8;
-          const updatedSubscription: SubscriptionPlan = {
-            ...currentUser.subscription!,
-            status: 'active',
-            startDate: subStart.toISOString(),
-            expiresAt: subEnd.toISOString(),
-            allowedSubjects: subLimit
-          };
-
-          const userRef = doc(db, 'students', currentUser.id);
-          await updateDoc(userRef, { subscription: updatedSubscription });
-          
-          // Update local state
-          setCurrentUser({ ...currentUser, subscription: updatedSubscription });
-
-          // 🔔 NOTIFY TUTORS
-          notifyTutorsOfPlanUpdate(currentUser.name, updatedSubscription.tier, bookings);
-        }
-
         // Trigger email notification to the student
-        try {
-          sendPlatformEmail(
-            { name: currentUser?.name || 'Student', email: currentUser?.email || '' },
-            'booking_confirm',
-            { 
-              tutorName: selectedTutor.name, 
-              subject: bookingFormData.subject, 
-              timing: `${bookingFormData.date} at ${bookingFormData.time}` 
+        fetch('http://localhost:5001/api/booking-success', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            booking: {
+              ...bookingFormData,
+              studentEmail: currentUser?.email,
+              studentName: currentUser?.name,
+              tutorName: selectedTutor?.name,
+              tutorEmail: selectedTutor?.email
             }
-          );
-        } catch(e) { console.warn("Email dispatch failed:", e) }
+          })
+        }).catch(console.error);
 
-          // Notify admin of completed payment
-          await addDoc(collection(db, 'admin_notifications'), {
-            type: 'Payment Success',
-            title: 'Enrollment Confirmed',
-            message: `${currentUser?.name} paid ₹${amountStr} for ${bookingFormData.subject}. Booking ID: ${bookingFormData.id}`,
-            bookingId: bookingFormData.id,
-            time: serverTimestamp(),
-            read: false
-          });
+        // Notify admin of completed payment
+        await addDoc(collection(db, 'admin_notifications'), {
+          type: 'Payment Success',
+          title: 'Enrollment Confirmed',
+          message: `${currentUser?.name} paid ₹${amountStr} for ${bookingFormData.subject}. Booking ID: ${bookingFormData.id}`,
+          bookingId: bookingFormData.id,
+          time: serverTimestamp(),
+          read: false
+        });
 
-          // Notify tutor of confirmed enrollment
-          await addDoc(collection(db, 'tutor_notifications'), {
-            tutorId: selectedTutor.id,
-            type: 'booking',
-            title: 'Enrollment Confirmed',
-            description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}. Plan: ${bookingFormData.plan?.toUpperCase()}. Tier: ${currentTier?.toUpperCase()}. Features: ${currentTier === 'premium' ? 'Up to 8 Subjects, Assignments, Notes' : currentTier === 'standard' ? 'Up to 3 Subjects, Tutor Notes' : '1 Subject'}.`,
-            time: 'Just now',
-            read: false,
-            createdAt: serverTimestamp()
-          });
-      }
-      
-      setNotifications([{
-        id: `n${Date.now()}`,
-        title: 'Payment Successful',
-        message: `Your booking with ${selectedTutor.name} is confirmed.`,
-        time: 'Just now',
-        type: 'booking',
-        read: false,
-        link: 'my-bookings'
-      }, ...notifications]);
-
-      // 2. Automated welcome chat message
-      const studentEmailKey = currentUser?.email?.replace(/\./g, '_');
-      if (studentEmailKey && selectedTutor) {
-        const chatId = `${selectedTutor.id}_${studentEmailKey}`;
-        const chatRef = doc(db, 'whatsapp', chatId);
-        const autoMsg = `Hi ${selectedTutor.name}, I have just booked a ${bookingFormData.subject} session for ${bookingFormData.date} at ${bookingFormData.time}. Looking forward to it!`;
-        
-        await setDoc(chatRef, {
+        // Notify tutor of confirmed enrollment
+        await addDoc(collection(db, 'tutor_notifications'), {
           tutorId: selectedTutor.id,
-          tutorName: selectedTutor.name,
-          tutorAvatar: selectedTutor.avatar || '',
-          studentEmail: currentUser?.email,
-          studentName: currentUser?.name || 'Student',
-          lastMessage: autoMsg,
-          lastMessageTime: new Date().toISOString(),
-          timestamp: serverTimestamp(),
-          tutorUnreadCount: increment(1)
-        }, { merge: true });
-
-        await addDoc(collection(chatRef, 'messages'), {
-          senderId: currentUser?.email,
-          text: autoMsg,
-          timestamp: serverTimestamp(),
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          date: 'TODAY',
-          deletedBy: []
+          type: 'booking',
+          title: 'Enrollment Confirmed',
+          description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}. Plan: ${bookingFormData.plan?.toUpperCase()}.`,
+          time: 'Just now',
+          read: false,
+          timestamp: serverTimestamp()
         });
       }
-
-      // Close modal after success
-      setTimeout(() => {
-        setIsPaymentModalOpen(false);
-        setView('my-bookings');
-      }, 2500);
-
     }, 4500);
   };
+
 
   const cancelPayment = () => {
     setPaymentStatus('cancelled');
@@ -6044,8 +6018,8 @@ export default function App() {
     const isNewSubject = !activeSubjects.has(subject.toLowerCase());
     const isNewTutor = !activeTutors.has(selectedTutor.id);
 
-    // Subject Limits based on Plan (Fixed 1, 3, 8)
-    const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
+    // Subject Limits based on Plan (Fixed 3, 5, 8)
+    const subjectLimit = tier === 'free' ? 3 : tier === 'standard' ? 5 : 8;
 
     // Rule: Allow multiple tutors as long as within subject count. 
     // Example: 1 tutor 3 subjects OR 3 tutors 1 subject each.
@@ -6722,27 +6696,7 @@ export default function App() {
             </select>
           </div>
 
-          {/* PLAN FEATURES PREVIEW */}
-          <div className="space-y-4">
-            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Plan Features & Benefits</label>
-            <div className="bg-primary/5 rounded-2xl p-4 border border-primary/10 min-h-[80px] flex flex-col justify-center">
-              {bookingPlan ? (
-                <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-                  {getPlanFeatures(bookingPlan).map((feature, idx) => (
-                    <div key={idx} className="flex items-center gap-2">
-                      <div className="w-1 h-1 rounded-full bg-emerald-500 shrink-0" />
-                      <span className="text-[9px] font-black text-primary/60 uppercase tracking-tight leading-none">{feature}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center space-y-1">
-                  <p className="text-[10px] font-black text-primary/20 uppercase">Select a plan to see features</p>
-                  <p className="text-[8px] font-bold text-primary/10 uppercase tracking-[0.2em]">Monthly, 6 Months, or Year Plan</p>
-                </div>
-              )}
-            </div>
-          </div>
+          
 
 
 
