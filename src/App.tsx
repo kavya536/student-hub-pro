@@ -1167,8 +1167,8 @@ const LoginView = ({ setView, setCurrentUser }: {
   setView: (view: View) => void, 
   setCurrentUser: (user: StudentProfile | null) => void 
 }) => {
-  const [email, setEmail] = useState('test@eduqra.com');
-  const [password, setPassword] = useState('EduqraSecure!2024');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -1194,30 +1194,8 @@ const LoginView = ({ setView, setCurrentUser }: {
         return;
       }
 
-      // 🔐 SECURE BYPASS CHECK
-      if (email === "test@eduqra.com") {
-        if (password === "EduqraSecure!2024") {
-          console.log("✅ Test account bypass success");
-          setCurrentUser({
-            name: "Scholar Tester",
-            email: "test@eduqra.com",
-            password: "EduqraSecure!2024",
-            mobile: "9999999999",
-            class: "10",
-            board: "CBSE",
-            notifications: { reminders: true, messages: true, updates: true }
-          } as any);
-          setView("dashboard");
-          setIsLoggingIn(false);
-          return;
-        } else {
-          // If it's test email but WRONG password, block immediately
-          console.log("❌ Test account password mismatch");
-          setError("Invalid email or password.");
-          setIsLoggingIn(false);
-          return;
-        }
-      }
+      // 🔐 SECURE BYPASS CHECK REMOVED
+
 
       // 1. Try to sign in via Firebase
       console.log("📡 Attempting Firebase Sign In for:", email);
@@ -1263,7 +1241,7 @@ const LoginView = ({ setView, setCurrentUser }: {
             <p className="text-[10px] md:text-xs font-bold uppercase tracking-widest text-on-surface-variant opacity-40">Welcome Back</p>
           </div>
           
-          <form onSubmit={handleLogin} className="space-y-6">
+          <form onSubmit={handleLogin} className="space-y-6" autoComplete="off">
             <div className="space-y-2">
               <label className="text-[10px] font-bold uppercase tracking-widest text-primary/40 ml-4">Email Address</label>
               <div className="relative">
@@ -1272,6 +1250,7 @@ const LoginView = ({ setView, setCurrentUser }: {
                   type="email" 
                   className="input-field pl-12"
                   value={email}
+                  autoComplete="off"
                   onChange={(e) => setEmail(e.target.value)} required
                 />
               </div>
@@ -1284,6 +1263,7 @@ const LoginView = ({ setView, setCurrentUser }: {
                   type={showPassword ? "text" : "password"} 
                   className="input-field pl-12 pr-12"
                   value={password}
+                  autoComplete="new-password"
                   onChange={(e) => setPassword(e.target.value)} required
                 />
                 <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-4 top-1/2 -translate-y-1/2 text-primary/20 hover:text-primary transition-colors">
@@ -1459,19 +1439,19 @@ const RegisterView = ({ setView, setCurrentUser }: {
             <p className="text-[10px] md:text-xs font-bold uppercase tracking-widest text-primary/40">Create Your Account</p>
           </div>
           
-          <form onSubmit={handleRegister} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <form onSubmit={handleRegister} className="grid grid-cols-1 md:grid-cols-2 gap-4" autoComplete="off">
             <div className="space-y-2">
               <label className="text-[10px] font-bold uppercase tracking-widest text-primary/40 ml-4">Full Name</label>
-              <input type="text" required className="input-field" value={formData.name} onChange={(e) => setFormData({...formData, name: e.target.value.replace(/[^A-Za-z\s]/g, "")})} placeholder="Alphabets only" />
+              <input type="text" required className="input-field" autoComplete="off" value={formData.name} onChange={(e) => setFormData({...formData, name: e.target.value.replace(/[^A-Za-z\s]/g, "")})} placeholder="Alphabets only" />
             </div>
             <div className="space-y-2">
               <label className="text-[10px] font-bold uppercase tracking-widest text-primary/40 ml-4">Email</label>
-              <input type="email" required className="input-field" value={formData.email} onChange={(e) => setFormData({...formData, email: e.target.value})} placeholder="example@email.com" />
+              <input type="email" required className="input-field" autoComplete="off" value={formData.email} onChange={(e) => setFormData({...formData, email: e.target.value})} placeholder="example@email.com" />
             </div>
             <div className="space-y-2">
               <label className="text-[10px] font-bold uppercase tracking-widest text-primary/40 ml-4">Password</label>
               <div className="relative">
-                <input type={showPassword ? "text" : "password"} required className="input-field pr-12" value={formData.password} onChange={(e) => setFormData({...formData, password: e.target.value})} placeholder="Min 8 chars, 1 Symbol, 1 Num" />
+                <input type={showPassword ? "text" : "password"} required className="input-field pr-12" autoComplete="new-password" value={formData.password} onChange={(e) => setFormData({...formData, password: e.target.value})} placeholder="Min 8 chars, 1 Symbol, 1 Num" />
                 <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-4 top-1/2 -translate-y-1/2 text-primary/20 hover:text-primary transition-colors">
                   {showPassword ? <Eye size={18} /> : <EyeOff size={18} />}
                 </button>
@@ -3143,9 +3123,9 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
 
   const handleSaveProfile = async () => {
     // Determine the ID to use (Real UID or test email as ID)
-    const userId = auth.currentUser?.uid || currentUser?.id || (currentUser?.email === 'test@eduqra.com' ? 'test_user_id' : null);
+    const userId = auth.currentUser?.uid || currentUser?.id || null;
     
-    if (!userId && currentUser?.email !== 'test@eduqra.com') {
+    if (!userId) {
       alert("Session expired. Please log in again.");
       setView('login');
       return;
@@ -3529,7 +3509,7 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
                    features: ['Single Subject Access', 'One-on-One Sessions', 'Monthly Payment Cycle', 'Platform Fee Applicable', 'No Added Extra Classes', 'Assignment Support']
                  },
                  { 
-                   tier: 'standard', name: 'Scholar', price: '599', 
+                   tier: 'standard', name: 'Scholar', price: '9/-', 
                    desc: 'Comprehensive support for multiple core subjects.',
                    features: ['Up to 3 Subjects', 'One-on-One Sessions', '20% Refund Policy (10 days prior)*', 'Extra Doubt Classes', 'Tutor Notes Available', 'No Platform Fee', 'Assignments & Mock Tests']
                  },
@@ -3545,7 +3525,7 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
                    features: ['1 Tutor Only', 'Limited Notes', 'Standard Doubt Portal Access', 'Assignments & Mock Tests (X)', 'Projects (X)']
                  },
                  { 
-                   tier: 'standard', name: 'Achiever', price: '599', 
+                   tier: 'standard', name: 'Achiever', price: '9/-', 
                    desc: 'Balanced support with projects and strategies.',
                    features: ['Up to 3 Subjects', 'Projects (Coming Soon)', 'Entrance Exam Strategy (X)', 'Tutor Notes (Limited)', 'Advanced Doubt Portal']
                  },
@@ -4612,10 +4592,9 @@ export default function App() {
             setView(prev => ['login', 'register', 'forgot-password'].includes(prev) ? 'dashboard' : prev);
           }
         } else {
-          const isTestAccount = currentUser?.email === 'test@eduqra.com';
           const isLoggedIn = localStorage.getItem('student_logged_in') === 'true';
 
-          if (!isTestAccount && !isLoggedIn) {
+          if (!isLoggedIn) {
             setView('login');
             setCurrentUser(null);
           }
