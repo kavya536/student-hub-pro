@@ -201,9 +201,23 @@ import { sendPlatformEmail } from './services/emailService';
 import { ShieldCheck as ShieldCheckIcon } from 'lucide-react';
 
 // Helper for pricing
-const getEffectivePrice = (tutorPrice: any) => {
-  const base = parseFloat(String(tutorPrice) || '0') || 0;
-  return Math.ceil(base * 1.17).toString();
+const getEffectivePrice = (tutor: any) => {
+  if (!tutor) return "0";
+  
+  // 1. Priority: Base hourly rate (this is what students should see as 'starting at')
+  const baseRate = parseFloat(String(tutor.price || tutor.classPricing || '0')) || 0;
+  if (baseRate > 0) {
+    return Math.ceil(baseRate * 1.17).toString();
+  }
+
+  // 2. Fallback: First non-course subject pricing
+  if (Array.isArray(tutor.subjectsPricing) && tutor.subjectsPricing.length > 0) {
+    const hourlyPlan = tutor.subjectsPricing.find((sp: any) => sp.type !== 'course');
+    const firstPrice = parseFloat(String((hourlyPlan || tutor.subjectsPricing[0]).price || '0')) || 0;
+    return Math.ceil(firstPrice * 1.17).toString();
+  }
+
+  return "188"; // Final safety fallback
 };
 
 // Helper to notify tutors when a student changes plans
@@ -317,6 +331,7 @@ interface Tutor {
   subjectsPricing?: { subject: string, price: number, type?: 'monthly' | 'course', durationDays?: number }[];
   targetClasses?: string;
   autoAvailability?: boolean;
+  qualification?: string;
 }
 
 interface Review {
@@ -789,10 +804,11 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
     const [tab, setTab] = useState<'all' | 'confirmed' | 'pending' | 'completed' | 'cancel'>('all');
     
     const filteredBookings = bookings.filter(b => {
-      if (tab === 'all') return true;
-      if (tab === 'confirmed') return b.status === 'confirmed' && b.attendance_status !== 'attended';
+      // Default 'all' view now only shows ACTIVE bookings (not cancelled or completed)
+      if (tab === 'all') return ['pending', 'confirmed', 'live', 'rescheduled'].includes(b.status) && b.attendance_status !== 'attended';
+      if (tab === 'confirmed') return (b.status === 'confirmed' || b.status === 'rescheduled') && b.attendance_status !== 'attended';
       if (tab === 'pending') return b.status === 'pending';
-      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 2);
+      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended');
       if (tab === 'cancel') return b.status === 'cancelled';
       return true;
     });
@@ -3960,7 +3976,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
     const [subject, setSubject] = useState('All');
     
     // Dynamically calculate price options based on current tutors
-    const tutorPrices = tutors.map(t => parseFloat(getEffectivePrice(t.price)));
+    const tutorPrices = tutors.map(t => parseFloat(getEffectivePrice(t)));
     const actualMaxPrice = tutorPrices.length > 0 ? Math.max(...tutorPrices) : 5000;
     
     const [maxPrice, setMaxPrice] = useState(actualMaxPrice > 5000 ? actualMaxPrice : 5000); 
@@ -3984,13 +4000,22 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
       const subjects = t.subjects || [];
       const matchesSubject = subject === 'All' || subjects.includes(subject);
       
-      const effectivePrice = parseFloat(getEffectivePrice(t.price));
+      const effectivePrice = parseFloat(getEffectivePrice(t));
       const matchesPrice = effectivePrice <= maxPrice;
       
-      const matchesClass = classLevel === 'All' || 
-        (t.targetClasses?.includes(classLevel)) ||
-        (classLevel === 'Graduate' && t.targetClasses?.toLowerCase().includes('graduate'));
+      const classMapping: Record<string, string> = {
+        'Nursery - UKG': 'Nursery to UKG',
+        '1-5 Class': 'Primary (1-5)',
+        '6-10 Class': 'Middle School (6-10)',
+        'Intermediate (11-12)': 'Intermediate (11-12)',
+        'Graduate': 'Graduate'
+      };
       
+      const targetSearch = classMapping[classLevel] || classLevel;
+      const matchesClass = classLevel === 'All' || 
+        (t.targetClasses?.includes(targetSearch)) ||
+        (classLevel === 'Graduate' && t.targetClasses?.toLowerCase().includes('graduate'));
+
       return matchesSearch && matchesSubject && matchesPrice && matchesClass;
     });
 
@@ -4101,7 +4126,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                 <Avatar src={tutor.avatar} size="md" mdSize="lg" initials={(tutor.name || '??').substring(0, 2).toUpperCase()} />
                 <div className="flex flex-col items-end">
                   <div className="flex items-center gap-1.5 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-100">
-                    <span className="text-emerald-600 text-xs md:text-sm font-black">₹{getEffectivePrice(tutor.price)}<span className="text-[9px] opacity-40">/hr</span></span>
+                    <span className="text-emerald-600 text-xs md:text-sm font-black">₹{getEffectivePrice(tutor)}<span className="text-[9px] opacity-40">/hr</span></span>
                   </div>
                   {/* Amount removed as per request */}
                 </div>
@@ -4109,13 +4134,14 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
               
               <div className="flex-1 min-w-0">
                 <h3 className="text-lg md:text-xl font-serif font-bold italic text-on-surface mb-2 leading-tight truncate">{tutor.name}</h3>
-                <p className="text-accent/60 text-[9px] font-black uppercase tracking-[0.2em] mb-3">
+                <p className="text-accent/60 text-[9px] font-black uppercase tracking-[0.2em] mb-1">
                   {tutor.experience === 'Fresher' ? 'Fresher' : `${tutor.experience || 'Expert'} Experience`}
                 </p>
                 <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
-                  {(tutor as any).subjects?.slice(0, 3).map((s: string) => (
+                  {(tutor as any).subjects?.slice(0, 1).map((s: string) => (
                     <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
                   ))}
+                  {tutor.subjects.length > 1 && <span className="text-[8px] font-bold text-primary/20">+{tutor.subjects.length - 1} more</span>}
                 </div>
                 <p className="text-primary/60 text-[10px] md:text-xs leading-relaxed mb-4 line-clamp-2">{(tutor as any).bio}</p>
               </div>
@@ -4209,9 +4235,9 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
                   <div>
-                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Subjects</p>
+                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Primary Subject</p>
                     <div className="flex flex-wrap justify-center sm:justify-start gap-2">
-                      {selectedTutor.subjects.map(s => (
+                      {selectedTutor.subjects.slice(0, 1).map(s => (
                         <span key={s} className="pill-tag text-[8px] md:text-[9px]">{s}</span>
                       ))}
                     </div>
@@ -4313,7 +4339,7 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
               <p className="text-background/50 text-[9px] md:text-[10px] font-bold uppercase tracking-widest mb-2">Hourly Rate</p>
               <div className="flex flex-col gap-2">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-4xl md:text-5xl font-serif font-bold italic text-emerald-400">₹{getEffectivePrice(selectedTutor.price)}</span>
+                  <span className="text-4xl md:text-5xl font-serif font-bold italic text-emerald-400">₹{getEffectivePrice(selectedTutor)}</span>
                   <span className="text-emerald-400/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/hr</span>
                 </div>
                 {selectedTutor.upiId && (
@@ -4330,20 +4356,11 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                   if (selectedTutor.subjectsPricing && selectedTutor.subjectsPricing.length > 0) {
                     return (
                       <div className="space-y-4 mb-4">
-                        <p className="text-background/40 text-[9px] font-black uppercase tracking-widest">Enrollment Options</p>
-                        <div className="space-y-2">
-                          {selectedTutor.subjectsPricing.map((sp, idx) => (
-                            <div key={idx} className="p-4 bg-white/10 rounded-2xl border border-white/5 space-y-2 group/price hover:bg-white/15 transition-all">
-                              <div className="flex items-center justify-between">
-                                <span className="text-sm font-bold">{sp.subject}</span>
-                                <span className="text-[9px] font-black px-2 py-0.5 bg-background/10 rounded-md text-background/60 tracking-widest">{sp.type === 'course' ? 'FULL COURSE' : 'MONTHLY'}</span>
-                              </div>
-                              <div className="flex items-baseline justify-between">
-                                <span className="text-xl font-black italic">₹{Math.ceil(sp.price * 1.17).toLocaleString('en-IN')}</span>
-                                {sp.type === 'course' && sp.durationDays && <span className="text-[8px] font-bold text-background/30 uppercase tracking-widest">{sp.durationDays} Days</span>}
-                              </div>
-                            </div>
-                          ))}
+                        <p className="text-background/40 text-[9px] font-black uppercase tracking-widest">Available Subjects</p>
+                        <div className="flex flex-wrap gap-2">
+                           {selectedTutor.subjects.map(s => (
+                             <span key={s} className="px-3 py-1.5 bg-white/5 rounded-lg text-[9px] font-bold border border-white/5">{s}</span>
+                           ))}
                         </div>
                         
                         {!hasBookedDemo ? (
@@ -4682,7 +4699,9 @@ export default function App() {
           avatar: data.avatar || data.profileImage || '',
           bio: data.bio || '',
           experience: data.experience || 'Fresher',
-          reviews: data.reviews || []
+          qualification: data.qualification || '',
+          reviews: data.reviews || [],
+          subjectsPricing: data.subjectsPricing || []
         };
       });
       setTutors(tutorList);
@@ -4816,16 +4835,20 @@ export default function App() {
     // Use latest data from tutors list if available to ensure sync
     const latestTutor = tutors.find(t => t.id === selectedTutor.id) || selectedTutor;
 
-    // Check for subject-specific pricing first (e.g. Math might be 120, Science 150)
-    const subjectPriceObj = latestTutor?.subjectsPricing?.find((sp: any) => sp.subject === subject);
+    // Check for subject-specific pricing first
+    const sp = latestTutor?.subjectsPricing?.find((p: any) => p.subject === subject);
+    const entry = (latestTutor as any)?.pricingEntries?.find((e: any) => e.subject === subject);
+    
     let baseRate = parseFloat(String(latestTutor?.price || '0')) || 0;
     
-    if (subjectPriceObj) {
-      baseRate = parseFloat(String(subjectPriceObj.price || '0')) || 0;
-      // If it's a fixed "course" type (lump sum), return that immediately with fee
-      if (subjectPriceObj.type === 'course') {
-        return Math.ceil(baseRate * 1.17);
+    if (entry && entry.hourlyRate) {
+      baseRate = entry.hourlyRate;
+    } else if (sp) {
+      if (sp.type === 'course') {
+        return Math.ceil(sp.price * 1.17);
       }
+      // If it's stored as monthly price, get hourly rate
+      baseRate = sp.price / 30;
     }
 
     // --- Standard formula: Base = rate × hours × days, Final = Base × 1.17 ---
@@ -6781,11 +6804,29 @@ export default function App() {
               {(() => {
                 const subjects = (selectedTutor?.subjects && Array.isArray(selectedTutor.subjects)) ? selectedTutor.subjects : [];
                 
-                if (subjects.length === 0) {
-                  return <option value="" disabled>No subjects added by tutor</option>;
-                }
-                
-                return subjects.map(s => <option key={s} value={s}>{s}</option>);
+                return subjects.map(s => {
+                  const sp = selectedTutor?.subjectsPricing?.find((p: any) => p.subject === s);
+                  const entry = (selectedTutor as any)?.pricingEntries?.find((e: any) => e.subject === s);
+                  
+                  let displayPrice = 0;
+                  let priceSuffix = '/hr';
+
+                  if (entry && entry.hourlyRate) {
+                    displayPrice = Math.ceil(entry.hourlyRate * 1.17);
+                  } else if (sp) {
+                    if (sp.type === 'course') {
+                      displayPrice = Math.ceil(sp.price * 1.17);
+                      priceSuffix = ' Full Course';
+                    } else {
+                      // If it's a monthly total, divide by 30 to get hourly
+                      displayPrice = Math.ceil((sp.price / 30) * 1.17);
+                    }
+                  } else {
+                    displayPrice = Math.ceil(parseFloat(String(selectedTutor?.price || '0')) * 1.17);
+                  }
+
+                  return <option key={s} value={s}>{s} (₹{displayPrice}{priceSuffix})</option>;
+                });
               })()}
             </select>
           </div>
@@ -7012,8 +7053,8 @@ export default function App() {
                       }
                     });
                   } else {
-                    // Fallback to default slots (RULE 1 & 6)
-                    baseSlots = ['10:00 AM', '5:00 PM'];
+                    // Remove default fallback slots to ensure only tutor-provided slots are shown
+                    baseSlots = [];
                   }
 
                   // 2. Apply real-time filtering (RULE 3)
@@ -7021,7 +7062,7 @@ export default function App() {
 
                   // 3. Handle empty state (RULE 4 & 5)
                   if (slotsToShow.length === 0) {
-                    return <option value="" disabled selected>No slots for today</option>;
+                    return <option value="" disabled selected>No slots available for today</option>;
                   }
 
                   return (
