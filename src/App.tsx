@@ -2087,7 +2087,8 @@ function ForgotPasswordView({ setView }: { setView: (view: View) => void }) {
       setError(null);
       
       try {
-        const response = await fetch('http://localhost:5001/api/auth/reset-password', {
+        const hostname = window.location.hostname;
+        const response = await fetch(`http://${hostname}:5001/api/auth/reset-password`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email })
@@ -5164,7 +5165,8 @@ export default function App() {
     }
 
     // Socket.IO Signaling Setup
-    socketRef.current = io('http://localhost:5001');
+    const hostname = window.location.hostname;
+    socketRef.current = io(`http://${hostname}:5001`);
     
     socketRef.current.emit('join-room', { 
       roomId: bookingId, 
@@ -5544,7 +5546,8 @@ export default function App() {
 
     try {
       // 2. Create Order on Backend
-      const orderResponse = await fetch('http://localhost:5001/api/create-razorpay-order', {
+      const hostname = window.location.hostname;
+      const orderResponse = await fetch(`http://${hostname}:5001/api/create-razorpay-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -5619,7 +5622,8 @@ export default function App() {
         nextBillingDate: isSub ? nextBilling : null
       });
 
-      fetch('http://localhost:5001/api/booking-success', {
+      const hostname = window.location.hostname;
+      fetch(`http://${hostname}:5001/api/booking-success`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -5686,7 +5690,8 @@ export default function App() {
 
     try {
       // 2. Create Order on Backend
-      const orderResponse = await fetch('http://localhost:5001/api/create-razorpay-order', {
+      const hostname = window.location.hostname;
+      const orderResponse = await fetch(`http://${hostname}:5001/api/create-razorpay-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -6779,7 +6784,8 @@ export default function App() {
   const handleResendVerification = async () => {
     if (!currentUser) return;
     try {
-      const response = await fetch('http://localhost:5001/api/auth/send-verification', {
+      const hostname = window.location.hostname;
+      const response = await fetch(`http://${hostname}:5001/api/auth/send-verification`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
