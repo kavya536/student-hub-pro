@@ -4414,6 +4414,48 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
     );
   };
 
+const VerificationPendingView = ({ user, onLogout, onResend }: { user: StudentProfile, onLogout: () => void, onResend: () => void }) => {
+  return (
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center p-6 text-center">
+      <motion.div 
+        initial={{ scale: 0.9, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        className="w-24 h-24 bg-primary/10 rounded-[2rem] flex items-center justify-center mb-8 relative"
+      >
+        <Mail size={40} className="text-primary animate-bounce" />
+        <div className="absolute inset-0 border-4 border-primary/20 border-t-primary rounded-[2rem] animate-spin-slow"></div>
+      </motion.div>
+      <h2 className="text-3xl md:text-5xl font-black mb-4 tracking-tighter text-on-surface">Verify Your Email</h2>
+      <p className="text-primary/60 font-bold max-w-md mb-10 text-sm md:text-base leading-relaxed">
+        We've sent a secure verification link to <span className="text-primary">{user.email}</span>. 
+        Please check your inbox (and spam folder) to activate your account.
+      </p>
+
+      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+        <button 
+          onClick={onResend}
+          className="flex-1 bg-primary text-white font-black py-4 md:py-5 rounded-2xl shadow-xl shadow-primary/20 hover:scale-[1.02] active:scale-95 transition-all text-[10px] md:text-xs uppercase tracking-widest"
+        >
+          Resend Verification Email
+        </button>
+        <button 
+          onClick={onLogout}
+          className="flex-1 bg-slate-100 text-slate-600 font-black py-4 md:py-5 rounded-2xl hover:bg-slate-200 transition-all text-[10px] md:text-xs uppercase tracking-widest"
+        >
+          Sign Out
+        </button>
+      </div>
+      
+      <div className="mt-12 p-6 bg-primary/5 rounded-[2rem] border border-primary/10 max-w-sm">
+        <p className="text-[10px] font-black text-primary/40 uppercase tracking-widest mb-2">Why verify?</p>
+        <p className="text-[11px] text-primary/60 font-bold leading-relaxed">Verification helps us ensure that your academic records and tutor communications are delivered securely to your authorized email address.</p>
+      </div>
+      
+      <p className="mt-8 text-[10px] font-black text-primary/20 uppercase tracking-[0.4em]">Eduqra Security Layer</p>
+    </div>
+  );
+};
+
 export default function App() {
   const [view, setView] = useState<View>(() => {
     const savedView = localStorage.getItem('student_view') as View;
@@ -4525,7 +4567,20 @@ export default function App() {
                 userData.subscription = defaultPlan;
               }
 
-              setCurrentUser({ id: user.uid, ...userData } as any);
+              // EMAIL VERIFICATION CHECK
+              if (userData.email_verified === false) {
+                // Keep them in the current view (likely login/register) but we will block dashboard later
+                setCurrentUser({ id: user.uid, ...userData } as any);
+              } else {
+                // Mark first login as completed
+                if (userData.first_login_completed === false) {
+                  await updateDoc(docRef, { first_login_completed: true });
+                  // Also update in 'users' collection
+                  await updateDoc(doc(db, 'users', user.uid), { first_login_completed: true });
+                  userData.first_login_completed = true;
+                }
+                setCurrentUser({ id: user.uid, ...userData } as any);
+              }
 
               if (userData.subscription?.tier === 'free') {
                 const planNotifId = `plan_remind_${user.uid}`;
@@ -4552,9 +4607,14 @@ export default function App() {
                 class: '10',
                 board: 'CBSE',
                 notifications: { reminders: true, messages: true, updates: true, push: true },
-                subscription: defaultPlan
+                subscription: defaultPlan,
+                email_verified: false,
+                first_login_completed: false,
+                status: 'EMAIL_NOT_VERIFIED'
               };
               await setDoc(docRef, newUser);
+              // Sync to 'users'
+              await setDoc(doc(db, 'users', user.uid), { ...newUser, role: 'student' });
               setCurrentUser(newUser as any);
 
               setNotifications(prev => [{
@@ -5064,14 +5124,158 @@ export default function App() {
   const [sessionStatus, setSessionStatus] = useState<'waiting' | 'connecting' | 'live' | 'disconnected'>('waiting');
   const [liveMessages, setLiveMessages] = useState<{id: string, sender: string, text: string, time: string}[]>([]);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const localVideoRef = useRef<HTMLVideoElement>(null);
-  const screenStreamRef = useRef<MediaStream | null>(null);
   const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
   
+  // WebRTC Refs
   const socketRef = useRef<any>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const [remoteStreams, setRemoteStreams] = useState<{socketId: string, stream: MediaStream, userId: string, userName?: string}[]>([]);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+
+  const startSession = async (bookingId: string) => {
+    const booking = bookings.find(b => b.id === bookingId);
+    if (!booking || !currentUser?.email) return;
+
+    // 🔐 VALIDATE ENTRY (10 min logic) 🔐
+    const now = new Date();
+    const sessionMins = parseTime(booking.time);
+    const nowMins = now.getHours() * 60 + now.getMinutes();
+    const diff = sessionMins - nowMins;
+    const isToday = booking.date === now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) || booking.date === (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0'));
+
+    if (!isToday || diff > 10) {
+      alert("🕒 Class not started yet. You can join 10 minutes before the scheduled time.");
+      return;
+    }
+
+    setView('live-class');
+    setSessionStatus('connecting');
+    setActiveMeetingId(bookingId);
+    
+    // Initialize Local Media
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    } catch (err) {
+      console.error("Camera/Mic Access Denied:", err);
+      alert("Please allow camera and microphone access to join the class.");
+    }
+
+    // Socket.IO Signaling Setup
+    socketRef.current = io('http://localhost:5001');
+    
+    socketRef.current.emit('join-room', { 
+      roomId: bookingId, 
+      userId: currentUser.id, 
+      userName: currentUser.name 
+    });
+
+    // Handle existing users
+    socketRef.current.on('all-users', (users: any[]) => {
+      users.forEach(user => {
+        const pc = createPeerConnection(user.socketId, bookingId);
+        peersRef.current.set(user.socketId, pc);
+        // We are the joiner, we send the offer
+        pc.createOffer().then(offer => {
+          pc.setLocalDescription(offer);
+          socketRef.current.emit('signal', { to: user.socketId, signal: offer });
+        });
+      });
+    });
+
+    // Handle new users joining
+    socketRef.current.on('user-joined', ({ socketId, userId, userName }: any) => {
+      console.log("👤 Peer Joined:", userName);
+      setSessionStatus('live');
+    });
+
+    // Handle incoming signals (Offer/Answer/Candidate)
+    socketRef.current.on('signal', async ({ from, signal }: any) => {
+      let pc = peersRef.current.get(from);
+      
+      if (signal.type === 'offer') {
+        if (!pc) {
+          pc = createPeerConnection(from, bookingId);
+          peersRef.current.set(from, pc);
+        }
+        await pc.setRemoteDescription(new RTCSessionDescription(signal));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socketRef.current.emit('signal', { to: from, signal: answer });
+      } else if (signal.type === 'answer') {
+        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal));
+      } else if (signal.candidate) {
+        if (pc) await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      }
+    });
+
+    socketRef.current.on('receive-message', (data: any) => {
+      setLiveMessages(prev => [...prev, data]);
+    });
+
+    socketRef.current.on('user-left', (socketId: string) => {
+      const pc = peersRef.current.get(socketId);
+      if (pc) pc.close();
+      peersRef.current.delete(socketId);
+      setRemoteStreams(prev => prev.filter(s => s.socketId !== socketId));
+    });
+
+    // Update Firestore Entry
+    try {
+      await updateDoc(doc(db, 'bookings', bookingId), { studentJoined: true });
+    } catch (e) { console.error("Firestore sync error:", e); }
+  };
+
+  const createPeerConnection = (socketId: string, roomId: string) => {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        socketRef.current.emit('signal', { to: socketId, signal: { candidate: e.candidate } });
+      }
+    };
+
+    pc.ontrack = (e) => {
+      setRemoteStreams(prev => {
+        if (prev.find(s => s.socketId === socketId)) return prev;
+        return [...prev, { socketId, stream: e.streams[0], userId: 'remote' }];
+      });
+      setSessionStatus('live');
+    };
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
+    }
+
+    return pc;
+  };
+
+  const endSession = async () => {
+    // 1. Cleanup WebRTC
+    if (socketRef.current) socketRef.current.disconnect();
+    peersRef.current.forEach(pc => pc.close());
+    peersRef.current.clear();
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    setRemoteStreams([]);
+
+    // 2. Update Firestore Status
+    if (activeMeetingId) {
+      try {
+        await updateDoc(doc(db, 'bookings', activeMeetingId), { studentJoined: false });
+      } catch (e) { console.error("Firestore cleanup error:", e); }
+    }
+
+    setSessionStatus('disconnected');
+    setTimeout(() => {
+      setActiveMeetingId(null);
+      setView('dashboard');
+    }, 1500);
+  };
 
   // --- Push Notification Registration ---
   useEffect(() => {
@@ -5136,157 +5340,6 @@ export default function App() {
     }
   };
 
-  const startSession = async (bookingId: string) => {
-    const booking = bookings.find(b => b.id === bookingId);
-    if (!booking || !currentUser?.email) return;
-
-    // 🔐 VALIDATE ENTRY 🔐
-    const isParticipant = booking.participants?.includes(currentUser.email) || booking.studentEmail === currentUser.email;
-    if (!isParticipant) {
-      alert("⛔ Access Denied: You are not a registered participant for this session.");
-      return;
-    }
-
-    setView('live-class');
-    setSessionStatus('connecting');
-    setActiveMeetingId(bookingId);
-    
-    // Track attendance start
-    const emailKey = currentUser.email.replace(/\./g, '_');
-    try {
-      if (booking.isGroup) {
-        await updateDoc(doc(db, 'bookings', bookingId), {
-          [`participantData.${emailKey}.joinTime`]: serverTimestamp(),
-          [`participantData.${emailKey}.status`]: 'pending',
-          studentJoined: true // Legacy flag compatibility
-        });
-      } else {
-        await updateDoc(doc(db, 'bookings', bookingId), {
-          studentJoinTime: serverTimestamp(),
-          studentPresent: true,
-          // studentJoined: true, // MOVED TO CONNECTION ESTABLISHED
-          attendance_status: 'pending'
-        });
-      }
-    } catch (e) {
-      console.error("Error updating attendance:", e);
-    }
-    
-    (window as any).lastMuteSignal = Date.now();
-    
-    const sessionRef = doc(db, 'live_sessions', bookingId);
-    const unsub = onSnapshot(doc(db, 'bookings', bookingId), (snap) => {
-      if (!snap.exists()) return;
-      const data = snap.data();
-      
-      // Sync with status from booking
-      if (data.status === 'live' && (sessionStatus === 'waiting' || sessionStatus === 'connecting')) {
-        setSessionStatus('live');
-        if (data.startedAt) {
-          const startedAt = data.startedAt.seconds ? new Date(data.startedAt.seconds * 1000) : new Date(data.startedAt);
-          setSessionStartTime(startedAt);
-        } else {
-          setSessionStartTime(new Date());
-        }
-      }
-      
-      if (data.status === 'completed') {
-        endSession();
-        return;
-      }
-    });
-
-    const reactUnsub = onSnapshot(collection(db, `live_sessions/${bookingId}/reactions`), (snap) => {
-      snap.docChanges().forEach(change => {
-        if (change.type === 'added') {
-          const reaction = change.doc.data();
-          handleSendLiveMessage(`[REACTION]: ${reaction.emoji}`, true);
-        }
-      });
-    });
-
-    const msgUnsub = onSnapshot(query(collection(db, `live_sessions/${bookingId}/messages`), orderBy('timestamp', 'asc')), (snap) => {
-      const msgs = snap.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        time: doc.data().timestamp?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '...'
-      })) as any[];
-      setLiveMessages(msgs);
-    });
-
-    setTimeout(() => {
-      setSessionStatus(prev => {
-        const currentBooking = bookings.find(b => b.id === bookingId);
-        if (currentBooking?.status === 'live') return 'live';
-        return prev === 'connecting' ? 'waiting' : prev;
-      });
-    }, 2000);
-
-    // Socket.IO WebRTC Signaling Setup
-    socketRef.current = io('http://localhost:5001');
-    socketRef.current.emit('join-room', bookingId);
-
-    const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-    
-    const initPeerConnection = () => {
-      const pc = new RTCPeerConnection(configuration);
-      
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socketRef.current.emit('ice-candidate', { candidate: event.candidate, roomId: bookingId });
-        }
-      };
-
-      pc.ontrack = (event) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-        }
-      };
-
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
-      }
-
-      peerConnectionRef.current = pc;
-      return pc;
-    };
-
-    socketRef.current.on('user-connected', async () => {
-      const pc = initPeerConnection();
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socketRef.current.emit('offer', { offer, roomId: bookingId });
-      
-      // ✅ SUCCESSFUL CONNECTION ESTABLISHED ✅
-      await updateDoc(doc(db, 'bookings', bookingId), { studentJoined: true });
-    });
-
-    socketRef.current.on('offer', async (offer: any) => {
-      const pc = initPeerConnection();
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socketRef.current.emit('answer', { answer, roomId: bookingId });
-    });
-
-    socketRef.current.on('answer', async (answer: any) => {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-      }
-    });
-
-    socketRef.current.on('ice-candidate', async (candidate: any) => {
-      if (peerConnectionRef.current) {
-        try {
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) { console.error("Error adding ice candidate", e); }
-      }
-    });
-
-    return () => {
-
-      unsub();
-      reactUnsub();
       msgUnsub();
     };
   };
@@ -6723,6 +6776,32 @@ export default function App() {
     return renderView();
   }
 
+  const handleResendVerification = async () => {
+    if (!currentUser) return;
+    try {
+      const response = await fetch('http://localhost:5001/api/auth/send-verification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          email: currentUser.email,
+          name: currentUser.name,
+          role: 'student'
+        })
+      });
+      if (response.ok) {
+        alert("Verification link resent! Please check your inbox.");
+      } else {
+        alert("Failed to resend. Please try again later.");
+      }
+    } catch (err) {
+      console.error("Resend error:", err);
+    }
+  };
+
+  if (currentUser && (currentUser as any).email_verified === false) {
+    return <VerificationPendingView user={currentUser} onLogout={confirmLogout} onResend={handleResendVerification} />;
+  }
 
   return (
     <>
@@ -7383,59 +7462,73 @@ export default function App() {
               <div className={`flex-1 p-6 flex flex-col items-center justify-center gap-6 transition-all duration-500 ${(isLiveChatOpen || currentUser?.class === 'B.Tech') ? 'md:pr-[400px]' : ''} ${currentUser?.class === 'B.Tech' ? 'md:pl-[120px]' : ''}`}>
                 
                 {/* Video Grid */}
-                <div className="w-full h-full max-w-6xl grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
-                  {/* Remote Participant (Tutor) */}
-                  <div className="relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center group">
-                    {sessionStatus === 'live' ? (
-                      <>
-                        <video 
-                          ref={remoteVideoRef} 
+                <div className={cn(
+                  "w-full h-full max-w-6xl grid gap-4 md:gap-6 items-stretch",
+                  remoteStreams.length <= 1 ? "grid-cols-1 md:grid-cols-2" : "grid-cols-2 md:grid-cols-3"
+                )}>
+                  {/* Remote Participants */}
+                  {remoteStreams.map((rs, idx) => (
+                    <div key={rs.socketId} className="relative bg-[#1A1A1E] rounded-[1.5rem] md:rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center group">
+                       <video 
+                          ref={(el) => { if (el) el.srcObject = rs.stream; }}
                           autoPlay 
                           playsInline 
                           className="w-full h-full object-cover"
                         />
-                        <div className="absolute inset-x-0 bottom-0 p-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
+                        <div className="absolute inset-x-0 bottom-0 p-4 md:p-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
                           <div className="flex items-center gap-3">
                             <div className="p-1 px-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg backdrop-blur-md">
                               <div className="flex items-center gap-1.5">
                                 <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></div>
-                                <span className="text-[10px] font-bold text-emerald-500 uppercase tracking-widest">Speaker</span>
+                                <span className="text-[10px] font-bold text-emerald-500 uppercase tracking-widest">Participant</span>
                               </div>
                             </div>
-                            <p className="text-sm font-bold text-white/90">Dr. Sarah Jenkins (Tutor)</p>
+                            <p className="text-xs md:text-sm font-bold text-white/90">{rs.userName || 'Tutor'}</p>
                           </div>
                         </div>
-                      </>
-                    ) : sessionStatus === 'waiting' ? (
-                      <div className="text-center space-y-6">
-                        <div className="relative w-24 h-24 mx-auto">
-                          <div className="absolute inset-0 border-2 border-primary/20 rounded-full animate-ping"></div>
-                          <Avatar src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&h=400&fit=crop" size="xl" className="relative z-10 border-0" />
+                    </div>
+                  ))}
+
+                  {/* Fallback if waiting */}
+                  {remoteStreams.length === 0 && (
+                    <div className="relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center group">
+                      {sessionStatus === 'live' ? (
+                        <div className="text-center">
+                          <div className="w-12 h-12 border-4 border-white/5 border-t-primary rounded-full animate-spin mx-auto mb-4"></div>
+                          <p className="text-[10px] font-bold uppercase tracking-widest text-white/20">Establishing video connection...</p>
                         </div>
-                        <div className="space-y-2">
+                      ) : sessionStatus === 'waiting' ? (
+                        <div className="text-center p-8 bg-primary/5 rounded-[3rem] border border-primary/20">
+                          <div className="relative w-24 h-24 mx-auto mb-6">
+                            <div className="absolute inset-0 border-2 border-primary/20 rounded-full animate-ping"></div>
+                            <Avatar src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&h=400&fit=crop" size="xl" className="relative z-10 border-0" />
+                          </div>
                           <p className="text-lg font-serif italic text-white/80">Dr. Sarah Jenkins</p>
-                          <p className="text-[10px] font-bold uppercase tracking-widest text-primary animate-pulse">Waiting for participant...</p>
+                          <p className="text-[10px] font-bold uppercase tracking-widest text-primary animate-pulse mb-6">Waiting for participant...</p>
+                          <button 
+                            onClick={() => activeMeetingId && startSession(activeMeetingId)} 
+                            className="px-8 py-3 bg-primary text-white rounded-2xl font-bold shadow-xl shadow-primary/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
+                          >
+                            Start Session
+                          </button>
                         </div>
-                        <button 
-                          onClick={() => activeMeetingId && startSession(activeMeetingId)} 
-                          className="px-8 py-3 bg-primary text-white rounded-2xl font-bold shadow-xl shadow-primary/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
-                        >
-                          Start Session
-                        </button>
-                      </div>
-                    ) : sessionStatus === 'connecting' ? (
-                      <div className="text-center">
-                        <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                        <p className="text-[10px] font-bold uppercase tracking-widest text-white/40">Securing Connection...</p>
-                      </div>
-                    ) : (
-                      <div className="text-center p-8 bg-rose-500/5 rounded-[3rem] border border-rose-500/20">
-                        <XCircle size={40} className="text-rose-500 mx-auto mb-4" />
-                        <h3 className="text-xl font-bold text-rose-500 mb-2">Session Ended</h3>
-                        <p className="text-sm text-white/40 max-w-xs">The tutor has disconnected from the session.</p>
-                      </div>
-                    )}
-                  </div>
+                      ) : sessionStatus === 'connecting' ? (
+                        <div className="text-center">
+                          <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                          <p className="text-[10px] font-bold uppercase tracking-widest text-white/40">Securing Connection...</p>
+                        </div>
+                      ) : (
+                        <div className="text-center p-8 bg-rose-500/5 rounded-[3rem] border border-rose-500/20">
+                          <XCircle size={40} className="text-rose-500 mx-auto mb-4" />
+                          <h3 className="text-xl font-bold text-rose-500 mb-2">Session Ended</h3>
+                          <p className="text-sm text-white/40 max-w-xs">The tutor has disconnected from the session.</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Local Participant (Self) */}
+                  <div className={`relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center transition-opacity duration-700 ${sessionStatus === 'live' ? 'opacity-100' : 'opacity-40'}`}>
 
                   {/* Local Participant (Self) */}
                   <div className={`relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center transition-opacity duration-700 ${sessionStatus === 'live' ? 'opacity-100' : 'opacity-40'}`}>
