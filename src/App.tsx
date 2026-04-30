@@ -311,6 +311,9 @@ interface StudentProfile {
   displayName?: string;
   photoURL?: string;
   fcmTokens?: string[];
+  email_verified?: boolean;
+  first_login_completed?: boolean;
+  status?: string;
 }
 
 
@@ -5133,6 +5136,8 @@ export default function App() {
   const [remoteStreams, setRemoteStreams] = useState<{socketId: string, stream: MediaStream, userId: string, userName?: string}[]>([]);
   const localStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
 
   const startSession = async (bookingId: string) => {
     const booking = bookings.find(b => b.id === bookingId);
@@ -5254,30 +5259,7 @@ export default function App() {
     return pc;
   };
 
-  const endSession = async () => {
-    // 1. Cleanup WebRTC
-    if (socketRef.current) socketRef.current.disconnect();
-    peersRef.current.forEach(pc => pc.close());
-    peersRef.current.clear();
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(t => t.stop());
-      localStreamRef.current = null;
-    }
-    setRemoteStreams([]);
 
-    // 2. Update Firestore Status
-    if (activeMeetingId) {
-      try {
-        await updateDoc(doc(db, 'bookings', activeMeetingId), { studentJoined: false });
-      } catch (e) { console.error("Firestore cleanup error:", e); }
-    }
-
-    setSessionStatus('disconnected');
-    setTimeout(() => {
-      setActiveMeetingId(null);
-      setView('dashboard');
-    }, 1500);
-  };
 
   // --- Push Notification Registration ---
   useEffect(() => {
@@ -5342,10 +5324,6 @@ export default function App() {
     }
   };
 
-      msgUnsub();
-    };
-  };
-
   useEffect(() => {
     let stream: MediaStream | null = null;
     const startCamera = async () => {
@@ -5399,6 +5377,13 @@ export default function App() {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
+    peersRef.current.forEach(pc => pc.close());
+    peersRef.current.clear();
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    setRemoteStreams([]);
 
     if (activeMeetingId && currentUser?.email) {
 
@@ -7534,8 +7519,6 @@ export default function App() {
                   )}
 
                   {/* Local Participant (Self) */}
-                  <div className={`relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center transition-opacity duration-700 ${sessionStatus === 'live' ? 'opacity-100' : 'opacity-40'}`}>
-
                   {/* Local Participant (Self) */}
                   <div className={`relative bg-[#1A1A1E] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex items-center justify-center transition-opacity duration-700 ${sessionStatus === 'live' ? 'opacity-100' : 'opacity-40'}`}>
                     {isCamOn ? (
