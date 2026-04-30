@@ -6790,7 +6790,7 @@ export default function App() {
     }
   };
 
-  if (currentUser && (currentUser as any).email_verified === false) {
+  if (currentUser && currentUser.email_verified === false) {
     return <VerificationPendingView user={currentUser} onLogout={confirmLogout} onResend={handleResendVerification} />;
   }
 
