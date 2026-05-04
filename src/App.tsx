@@ -57,7 +57,11 @@ import {
   RotateCcw,
   Briefcase,
   FileCheck,
-  ShieldCheck
+  ShieldCheck,
+  CreditCard,
+  Wallet,
+  AlertCircle,
+  MousePointer2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -179,8 +183,8 @@ const getPlanDefaults = (tier: 'free' | 'standard' | 'premium', category: Studen
   const expiresAt = new Date();
   expiresAt.setMonth(startDate.getMonth() + 3); // 3-month duration
 
-  let allowedSubjects = 3;
-  if (tier === 'standard') allowedSubjects = 5;
+  let allowedSubjects = 1;
+  if (tier === 'standard') allowedSubjects = 3;
   if (tier === 'premium') allowedSubjects = 8;
 
   let cat: SubscriptionPlan['category'] = 'schools';
@@ -199,6 +203,107 @@ const getPlanDefaults = (tier: 'free' | 'standard' | 'premium', category: Studen
 
 import { sendPlatformEmail } from './services/emailService';
 import { ShieldCheck as ShieldCheckIcon } from 'lucide-react';
+
+// Centralized Subject Master System
+const SUBJECT_MASTER: Record<string, { name: string, aliases: string[] }> = {
+  'mathematics': {
+    name: 'Mathematics',
+    aliases: ['maths', 'math', 'mathemathics', 'calculus', 'algebra', 'maths 1a', 'maths 1b', 'maths 2a', 'maths 2b', 'discrete mathematics', 'mathematics (b.tech/b.sc)']
+  },
+  'physics': {
+    name: 'Physics',
+    aliases: ['phisics', 'phys']
+  },
+  'chemistry': {
+    name: 'Chemistry',
+    aliases: ['chemestry', 'chem']
+  },
+  'biology': {
+    name: 'Biology',
+    aliases: ['bio', 'biological sciences']
+  },
+  'computer_science': {
+    name: 'Computer Science',
+    aliases: ['cs', 'computer', 'programming', 'it', 'java', 'python', 'c programming', 'html/css', 'javascript', 'react.js', 'node.js', 'sql/mysql', 'postgresql', 'artificial intelligence', 'machine learning']
+  },
+  'english': {
+    name: 'English',
+    aliases: ['english language', 'literature']
+  },
+  'social_studies': {
+    name: 'Social Studies',
+    aliases: ['sst', 'social science', 'history', 'geography', 'civics']
+  },
+  'hindi': {
+    name: 'Hindi',
+    aliases: []
+  },
+  'sanskrit': {
+    name: 'Sanskrit',
+    aliases: []
+  },
+  'telugu': {
+    name: 'Telugu',
+    aliases: []
+  },
+  'business_studies': {
+    name: 'Business Studies',
+    aliases: ['business', 'bst']
+  },
+  'accountancy': {
+    name: 'Accountancy',
+    aliases: ['accounts', 'accounting']
+  },
+  'economics': {
+    name: 'Economics',
+    aliases: ['eco']
+  },
+  'science': {
+    name: 'Science',
+    aliases: ['general science']
+  },
+  'evs': {
+    name: 'EVS',
+    aliases: ['environmental science']
+  }
+};
+
+const normalizeSubject = (input: string): string => {
+  if (!input) return '';
+  const normalized = input.trim().toLowerCase();
+  
+  // 1. Direct match with ID
+  if (SUBJECT_MASTER[normalized]) return normalized;
+  
+  // 2. Match with Name
+  for (const [id, data] of Object.entries(SUBJECT_MASTER)) {
+    if (data.name.toLowerCase() === normalized) return id;
+  }
+  
+  // 3. Match with Aliases
+  for (const [id, data] of Object.entries(SUBJECT_MASTER)) {
+    if (data.aliases.some(alias => alias.toLowerCase() === normalized)) return id;
+  }
+  
+  // 4. Partial match as fallback (optional, but good for UX)
+  for (const [id, data] of Object.entries(SUBJECT_MASTER)) {
+    if (normalized.includes(data.name.toLowerCase()) || data.name.toLowerCase().includes(normalized)) return id;
+  }
+
+  return normalized; // Return as-is if no match found (though master list should be comprehensive)
+};
+
+const getSubjectName = (id: string): string => {
+  if (!id || typeof id !== 'string') return 'General Session';
+  return SUBJECT_MASTER[id]?.name || id.charAt(0).toUpperCase() + id.slice(1);
+};
+
+const formatDateLocal = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
 
 // Helper for pricing
 const getEffectivePrice = (tutor: any) => {
@@ -261,7 +366,7 @@ const cn = (...inputs: ClassValue[]) => {
   return twMerge(clsx(inputs));
 };
 
-type View = 'dashboard' | 'find-tutors' | 'tutor-profile' | 'my-bookings' | 'payments' | 'chat' | 'reviews' | 'progress' | 'notes' | 'settings' | 'login' | 'register' | 'forgot-password' | 'live-class' | 'blocked' | 'projects' | 'assignments';
+type View = 'dashboard' | 'find-tutors' | 'tutor-profile' | 'my-bookings' | 'payments' | 'chat' | 'reviews' | 'progress' | 'notes' | 'settings' | 'login' | 'register' | 'forgot-password' | 'live-class' | 'blocked' | 'projects' | 'assignments' | 'verify-email';
 
 interface LearningGoal {
   id: string;
@@ -313,7 +418,10 @@ interface StudentProfile {
   fcmTokens?: string[];
   email_verified?: boolean;
   first_login_completed?: boolean;
+  upiId?: string;
+  registrationDate?: string;
   status?: string;
+  walletBalance?: number;
 }
 
 
@@ -400,6 +508,10 @@ interface Booking {
   subscriptionStatus?: 'active' | 'expired' | 'cancelled';
   nextBillingDate?: any;
   talkingTime?: number; // in seconds
+  cancellationReason?: string;
+  wantsNewTutor?: boolean;
+  tierAtBooking?: string;
+  attendedCount?: number;
 }
 
 interface Poll {
@@ -872,7 +984,7 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                 />
                 <div>
                   <h4 className="font-bold text-lg md:text-xl truncate max-w-[160px]">{booking.tutorName}</h4>
-                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest">{booking.subject}</p>
+                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest">{getSubjectName(booking.subject)}</p>
                 </div>
               </div>
 
@@ -1202,7 +1314,17 @@ const LoginView = ({ setView, setCurrentUser }: {
 
       // 1. Try to sign in via Firebase
       console.log("📡 Attempting Firebase Sign In for:", email);
-      await signInWithEmailAndPassword(auth, email, password);
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      
+      // Update password in Firestore to keep it in sync
+      const uid = userCredential.user.uid;
+      try {
+        await updateDoc(doc(db, 'students', uid), { password: password });
+        await updateDoc(doc(db, 'users', uid), { password: password });
+      } catch (e) {
+        console.warn("Failed to sync password to Firestore:", e);
+      }
+      
       // View transition is handled by onAuthStateChanged listener at the top of the file
     } catch (err: any) {
       console.error("⛔ Student Auth Failure:", err.code || err.message);
@@ -1369,7 +1491,7 @@ const RegisterView = ({ setView, setCurrentUser }: {
       return;
     }
 
-    const passRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@$!%*?&#])[A-Za-z\\d@$!%*?&#]{8,}$/;
+    const passRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#])[A-Za-z\d@$!%*?&#]{8,}$/;
     if (!passRegex.test(formData.password)) {
       setError("Incorrect password format.");
       setIsSubmitting(false);
@@ -1396,7 +1518,8 @@ const RegisterView = ({ setView, setCurrentUser }: {
         class: formData.class,
         board: formData.board,
         studentType: formData.studentType,
-        status: 'active',
+        status: 'EMAIL_NOT_VERIFIED',
+        email_verified: false,
         createdAt: serverTimestamp(),
         notifications: { reminders: true, messages: true, updates: true }
       };
@@ -2091,7 +2214,8 @@ function ForgotPasswordView({ setView }: { setView: (view: View) => void }) {
       
       try {
         const hostname = window.location.hostname;
-        const response = await fetch(`http://${hostname}:5001/api/auth/reset-password`, {
+        const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
+        const response = await fetch(`${backendBaseUrl}/api/auth/reset-password`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email })
@@ -2316,6 +2440,7 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
           </div>
         </div>
       </div>
+
     </aside>
   </>
 );
@@ -2747,7 +2872,7 @@ function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation
                    </div>
 
                    <h3 className="text-xl font-serif font-black italic tracking-tight text-on-surface mb-0.5">{tutor.name}</h3>
-                   <p className="text-[9px] font-black text-primary/40 uppercase tracking-[0.2em] mb-4">{(tutor.subjects || []).slice(0, 1).join(' • ')}</p>
+                   <p className="text-[9px] font-black text-primary/40 uppercase tracking-[0.2em] mb-4">{(tutor.subjects || []).slice(0, 1).map((s: string) => getSubjectName(s)).join(' • ')}</p>
 
                    {/* Stats Area - Compacter */}
                    <div className="w-full bg-primary/5 rounded-[1.5rem] p-4 mb-6 flex items-center justify-around border border-primary/5">
@@ -3057,7 +3182,8 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
     class: currentUser?.class || '',
     board: currentUser?.board || '',
     email: currentUser?.email || '',
-    photoURL: currentUser?.photoURL || ''
+    photoURL: currentUser?.photoURL || '',
+    upiId: currentUser?.upiId || ''
   });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3089,7 +3215,8 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
         class: currentUser.class || '',
         board: currentUser.board || '',
         email: currentUser.email || '',
-        photoURL: currentUser.photoURL || ''
+        photoURL: currentUser.photoURL || '',
+        upiId: currentUser.upiId || ''
       });
       setPrefState({
         reminders: currentUser.notifications?.reminders ?? true,
@@ -3151,7 +3278,8 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
         mobile: formData.mobile,
         class: formData.class,
         board: formData.board,
-        photoURL: formData.photoURL
+        photoURL: formData.photoURL,
+        upiId: formData.upiId
       };
 
       // Only attempt Firestore write if NOT a mock user without a real UID
@@ -3346,6 +3474,22 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
             disabled
             className="input-field text-sm md:text-base text-black/50 bg-slate-100/50 cursor-not-allowed" 
           />
+        </div>
+
+        <div className="space-y-3">
+          <label className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">UPI ID (Required for Transactions)</label>
+          <div className="relative">
+            <CreditCard className="absolute left-4 top-1/2 -translate-y-1/2 text-primary/20" size={18} />
+            <input 
+              type="text" 
+              value={formData.upiId}
+              onChange={(e) => handleInputChange('upiId', e.target.value)}
+              placeholder="e.g. username@bank"
+              className="input-field pl-12 text-sm md:text-base text-black bg-white/50 border-accent/20 focus:border-accent"
+              required
+            />
+          </div>
+          <p className="text-[9px] text-primary/40 font-medium ml-1">This ID will be used for all academic payment verifications.</p>
         </div>
 
         <div className="pt-6 border-t border-primary/5 flex items-center gap-4">
@@ -3606,97 +3750,87 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
     if (category === 'graduates') {
       // Graduates & Colleges
       if (tier === 'free') {
-        list.push({ name: 'Single Specialization', status: 'v' });
+        list.push({ name: 'Single Subject Only', status: 'v' });
         list.push({ name: 'One-on-One Sessions', status: 'v' });
-        list.push({ name: 'Industry Insights', status: 'v' });
         list.push({ name: 'Platform Fee Applies', status: 'v' });
+        list.push({ name: 'Tutor Notes Vault', status: 'x' });
         list.push({ name: 'Refunds', status: 'x' });
         list.push({ name: 'Group Sessions', status: 'v' });
-        list.push({ name: 'Internship Leads', status: 'x' });
+        list.push({ name: 'Polls & Assignments', status: 'x' });
       } else if (tier === 'standard') {
         list.push({ name: 'Up to 3 Specialized Subjects', status: 'v' });
         list.push({ name: 'One-on-One Mentoring', status: 'v' });
-        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Notes & Doubt Classes', status: 'v' });
         list.push({ name: 'Extra Lab Sessions', status: 'v' });
         list.push({ name: 'No Platform Fee', status: 'v' });
         list.push({ name: 'Group Sessions', status: 'v' });
-        list.push({ name: 'Limited Tutor Notes', status: 'v' });
+        list.push({ name: 'Refund Policy (20%)', status: 'v' });
         list.push({ name: 'Assignments & Mock Tests', status: 'x' });
         list.push({ name: 'Placement Prep', status: 'x' });
         list.push({ name: 'Projects', status: 'x' });
       } else if (tier === 'premium') {
-        list.push({ name: 'All Semester Subjects', status: 'v' });
-        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
+        list.push({ name: 'Up to 8 Subjects', status: 'v' });
+        list.push({ name: 'Full Project Guidance', status: 'v' });
         list.push({ name: 'Group Sessions Included', status: 'v' });
         list.push({ name: 'Extra Classes + Projects', status: 'v' });
         list.push({ name: 'Placement Prep', status: 'v' });
-        list.push({ name: 'No Platform Fee', status: 'v' });
         list.push({ name: 'Premium Tutor Notes', status: 'v' });
         list.push({ name: 'Assignments & Mock Tests', status: 'v' });
-        list.push({ name: 'Topic wise tests', status: 'v' });
+        list.push({ name: 'Polls & Topic wise tests', status: 'v' });
         list.push({ name: 'Doubt Sessions', status: 'v' });
+        list.push({ name: 'Priority Support', status: 'v' });
       }
     } else if (category === 'intermediate') {
       // Intermediate (11-12)
       if (tier === 'free') {
-        list.push({ name: 'Single Subject Access', status: 'v' });
+        list.push({ name: 'Single Subject Only', status: 'v' });
         list.push({ name: 'One-on-One Sessions', status: 'v' });
         list.push({ name: 'Platform Fee Applicable', status: 'v' });
-        list.push({ name: 'Digital Resources', status: 'v' });
+        list.push({ name: 'Tutor Notes', status: 'x' });
         list.push({ name: 'Refund Policy', status: 'x' });
         list.push({ name: 'Extra Classes', status: 'x' });
-        list.push({ name: 'Group Sessions', status: 'v' });
-        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
-        list.push({ name: 'Projects', status: 'x' });
+        list.push({ name: 'Polls & Mock Tests', status: 'x' });
       } else if (tier === 'standard') {
         list.push({ name: 'Up to 3 Subjects', status: 'v' });
         list.push({ name: 'One-on-One Sessions', status: 'v' });
-        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
-        list.push({ name: 'Extra Doubt Classes', status: 'v' });
+        list.push({ name: 'Doubt Classes & Notes', status: 'v' });
+        list.push({ name: 'Refund Policy (20%)', status: 'v' });
         list.push({ name: 'No Platform Fee', status: 'v' });
         list.push({ name: 'Group Sessions', status: 'v' });
         list.push({ name: 'Limited Tutor Notes', status: 'v' });
         list.push({ name: 'Assignments & Mock Tests', status: 'x' });
         list.push({ name: 'Projects', status: 'x' });
-        list.push({ name: 'Entrance Exam Strategy', status: 'x' });
+        list.push({ name: 'Entrance Strategy', status: 'x' });
       } else if (tier === 'premium') {
-        list.push({ name: 'All Subjects Included', status: 'v' });
-        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
-        list.push({ name: 'Extra Doubt Classes', status: 'v' });
-        list.push({ name: 'Unlimited Extra Classes', status: 'v' });
-        list.push({ name: 'Group Sessions Included', status: 'v' });
-        list.push({ name: 'Assignments & Mock Tests', status: 'v' });
+        list.push({ name: 'Up to 8 Subjects', status: 'v' });
+        list.push({ name: 'Premium Notes & Polls', status: 'v' });
+        list.push({ name: 'Mock Tests & Assignments', status: 'v' });
         list.push({ name: 'Entrance Exam Strategy', status: 'v' });
-        list.push({ name: 'Premium Tutor Notes', status: 'v' });
-        list.push({ name: 'Projects', status: 'v' });
+        list.push({ name: 'Extra Classes (Unlimited)', status: 'v' });
         list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'Topic-wise Analysis', status: 'v' });
+        list.push({ name: 'Scholarship Guidance', status: 'v' });
       }
     } else {
-      // Schools (K-10)
+      // Schools
       if (tier === 'free') {
-        list.push({ name: 'Single Subject Access', status: 'v' });
-        list.push({ name: 'One-on-One Sessions', status: 'v' });
-        list.push({ name: 'Monthly Payment Cycle', status: 'v' });
-        list.push({ name: 'Platform Fee Applicable', status: 'v' });
-        list.push({ name: 'No Added Extra Classes', status: 'x' });
-        list.push({ name: 'Non-Refundable Plan', status: 'x' });
-        list.push({ name: 'Assignment Support', status: 'x' });
+        list.push({ name: 'Single Subject Only', status: 'v' });
+        list.push({ name: 'Tutor Notes', status: 'x' });
+        list.push({ name: 'Doubt Classes', status: 'x' });
+        list.push({ name: 'Mock Tests', status: 'x' });
+        list.push({ name: 'Polls', status: 'x' });
       } else if (tier === 'standard') {
         list.push({ name: 'Up to 3 Subjects', status: 'v' });
-        list.push({ name: 'One-on-One Sessions', status: 'v' });
-        list.push({ name: '20% Refund Policy (10 days prior)*', status: 'v' });
-        list.push({ name: 'Extra Doubt Classes', status: 'v' });
-        list.push({ name: 'Tutor Notes Available', status: 'v' });
-        list.push({ name: 'No Platform Fee', status: 'v' });
-        list.push({ name: 'Assignments & Mock Tests', status: 'x' });
+        list.push({ name: 'Tutor Notes & Doubt Classes', status: 'v' });
+        list.push({ name: 'Group Sessions', status: 'v' });
+        list.push({ name: 'Assignments', status: 'x' });
+        list.push({ name: 'Mock Tests', status: 'x' });
       } else if (tier === 'premium') {
-        list.push({ name: 'One-on-One Sessions', status: 'v' });
         list.push({ name: 'Up to 8 Subjects', status: 'v' });
-        list.push({ name: '40% Refund Policy (10 days prior)*', status: 'v' });
-        list.push({ name: 'Extra Classes Available', status: 'v' });
-        list.push({ name: 'Premium Tutor Notes', status: 'v' });
-        list.push({ name: 'Assignments & Mock Tests', status: 'v' });
-        list.push({ name: 'No Platform Fee', status: 'v' });
+        list.push({ name: 'All Features Unlocked', status: 'v' });
+        list.push({ name: 'Premium Notes & Polls', status: 'v' });
+        list.push({ name: 'Mock Tests & Reports', status: 'v' });
+        list.push({ name: 'Extra Classes', status: 'v' });
       }
     }
     return list;
@@ -3974,7 +4108,6 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
     const filteredTutors = tutors.filter(t => {
       // VISIBILITY GUARD: Tutor MUST have UPI ID and at least one Subject to be visible to students
       const isProfileComplete = 
-        t.upiId?.trim() && 
         Array.isArray(t.subjects) && t.subjects.length > 0 &&
         (t.price || (Array.isArray(t.subjectsPricing) && t.subjectsPricing.length > 0));
       
@@ -4123,7 +4256,7 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                 </p>
                 <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
                   {(tutor as any).subjects?.slice(0, 1).map((s: string) => (
-                    <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
+                    <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{getSubjectName(s)}</span>
                   ))}
                   {tutor.subjects.length > 1 && <span className="text-[8px] font-bold text-primary/20">+{tutor.subjects.length - 1} more</span>}
                 </div>
@@ -4326,11 +4459,6 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                   <span className="text-4xl md:text-5xl font-serif font-bold italic text-emerald-400">₹{getEffectivePrice(selectedTutor)}</span>
                   <span className="text-emerald-400/50 font-bold uppercase tracking-widest text-[9px] md:text-[10px]">/hr</span>
                 </div>
-                {selectedTutor.upiId && (
-                  <div className="flex items-center gap-2 text-background/70 text-[10px] md:text-xs">
-                    <span className="font-bold">UPI ID:</span> {selectedTutor.upiId}
-                  </div>
-                )}
               </div>
               <div className="flex flex-col gap-4 mt-6 md:mt-8">
                 {(() => {
@@ -4431,8 +4559,8 @@ const VerificationPendingView = ({ user, onLogout, onResend }: { user: StudentPr
       </motion.div>
       <h2 className="text-3xl md:text-5xl font-black mb-4 tracking-tighter text-on-surface">Verify Your Email</h2>
       <p className="text-primary/60 font-bold max-w-md mb-10 text-sm md:text-base leading-relaxed">
-        We've sent a secure verification link to <span className="text-primary">{user.email}</span>. 
-        Please check your inbox (and spam folder) to activate your account.
+        We sent email verification to your <span className="text-primary">{user.email}</span>. 
+        Please check your inbox and click the link to login and access your dashboard.
       </p>
 
       <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
@@ -4477,6 +4605,9 @@ export default function App() {
   });
   const [loading, setLoading] = useState(true);
   const [authInitialized, setAuthInitialized] = useState(false);
+  const [showUpiGate, setShowUpiGate] = useState(false);
+  const [gateUpiInput, setGateUpiInput] = useState('');
+  const [isUpdatingGateUpi, setIsUpdatingGateUpi] = useState(false);
 
   const openBookingModal = (type: 'demo' | 'paid') => {
     setBookingType(type);
@@ -4485,6 +4616,7 @@ export default function App() {
     setBookingSelectedTime('');
     setBookingDuration('');
     setBookingPlan('');
+    setBookingFormData(null);
     setIsBookingModalOpen(true);
   };
 
@@ -4557,7 +4689,7 @@ export default function App() {
             const docSnap = await Promise.race([getDoc(docRef), timeoutPromise]) as any;
             clearTimeout(authTimeout);
             
-            if (docSnap.exists) {
+            if (docSnap.exists()) {
               const userData = docSnap.data();
               if (userData.status === 'blocked') {
                 setView('blocked');
@@ -4571,19 +4703,28 @@ export default function App() {
                 userData.subscription = defaultPlan;
               }
 
-              // EMAIL VERIFICATION CHECK
-              if (userData.email_verified === false) {
-                // Keep them in the current view (likely login/register) but we will block dashboard later
-                setCurrentUser({ id: user.uid, ...userData } as any);
+              // EMAIL VERIFICATION SYNC & CHECK
+              if (userData.email_verified === false && user.emailVerified) {
+                await updateDoc(docRef, { email_verified: true, status: 'active' });
+                await updateDoc(doc(db, 'users', user.uid), { email_verified: true });
+                userData.email_verified = true;
+                userData.status = 'active';
+              }
+
+              setCurrentUser({ id: user.uid, ...userData } as any);
+
+              // 🛡️ EMAIL VERIFICATION GATE
+              // Only gate if email_verified is explicitly false (new/unverified users)
+              // This allows grandfathering existing users who don't have the field yet.
+              if (userData.email_verified === false && !['login', 'register', 'forgot-password'].includes(view)) {
+                setView('verify-email');
               } else {
                 // Mark first login as completed
-                if (userData.first_login_completed === false) {
+                if (userData.first_login_completed === false && userData.email_verified === true) {
                   await updateDoc(docRef, { first_login_completed: true });
-                  // Also update in 'users' collection
                   await updateDoc(doc(db, 'users', user.uid), { first_login_completed: true });
                   userData.first_login_completed = true;
                 }
-                setCurrentUser({ id: user.uid, ...userData } as any);
               }
 
               if (userData.subscription?.tier === 'free') {
@@ -4614,6 +4755,7 @@ export default function App() {
                 subscription: defaultPlan,
                 email_verified: false,
                 first_login_completed: false,
+                registrationDate: new Date().toISOString(),
                 status: 'EMAIL_NOT_VERIFIED'
               };
               await setDoc(docRef, newUser);
@@ -4703,6 +4845,39 @@ export default function App() {
   const [selectedTutor, setSelectedTutor] = useState<Tutor|null>(null);
   const [tutors, setTutors] = useState<Tutor[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
+
+  const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  const handleResendVerification = async () => {
+    if (!currentUser?.email) return;
+    try {
+      const hostname = window.location.hostname;
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
+      const response = await fetch(`${backendBaseUrl}/api/auth/send-verification`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          email: currentUser.email,
+          name: currentUser.name,
+          role: 'student'
+        })
+      });
+      if (response.ok) {
+        showToast("Resend link sent to your mail");
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        showToast(`Failed to resend: ${errorData.message || 'Server error'}`, 'error');
+      }
+    } catch (err) {
+      console.error("Resend error:", err);
+      showToast("Connection error: Could not reach verification server.", "error");
+    }
+  };
 
   const effectiveSubscription = useMemo(() => {
     if (!currentUser?.subscription) return { tier: 'free' as const, expiresAt: null, isExpired: false };
@@ -4721,6 +4896,34 @@ export default function App() {
 
   const currentTier = effectiveSubscription.tier;
 
+  // 🛡️ MANDATORY UPI ID GATE
+  useEffect(() => {
+    if (currentUser && !currentUser.upiId && !['login', 'register', 'forgot-password', 'blocked'].includes(view)) {
+      setShowUpiGate(true);
+    } else {
+      setShowUpiGate(false);
+    }
+  }, [currentUser?.upiId, view]);
+
+  const handleGateUpiSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!gateUpiInput.trim() || !currentUser?.id) return;
+    
+    setIsUpdatingGateUpi(true);
+    try {
+      const userRef = doc(db, 'students', currentUser.id);
+      await updateDoc(userRef, { upiId: gateUpiInput.trim() });
+      setCurrentUser({ ...currentUser, upiId: gateUpiInput.trim() });
+      setShowUpiGate(false);
+      setGateUpiInput('');
+    } catch (err) {
+      console.error("Error updating UPI via gate:", err);
+      alert("Failed to update UPI ID. Please try again.");
+    } finally {
+      setIsUpdatingGateUpi(false);
+    }
+  };
+
   useEffect(() => {
     const tutorsQuery = query(
       collection(db, 'users'), 
@@ -4737,7 +4940,7 @@ export default function App() {
           availability: data.availability || [],
           rating: data.rating || 5.0,
           price: data.classPricing || data.price || 160,
-          upiId: data.upiId || '',
+          // Removed sensitive fields (upiId, phone) for Single Source security
           classTaught: data.classTaught || '',
           avatar: data.avatar || data.profileImage || '',
           bio: data.bio || '',
@@ -4806,7 +5009,7 @@ export default function App() {
   const [bookingSelectedDate, setBookingSelectedDate] = useState<string>('');
   const [bookingSelectedSubject, setBookingSelectedSubject] = useState<string>('');
   const [bookingSelectedTime, setBookingSelectedTime] = useState<string>('');
-  const [bookingDuration, setBookingDuration] = useState('1');
+  const [bookingDuration, setBookingDuration] = useState('');
   const [bookingType, setBookingType] = useState<'demo' | 'paid'>('paid');
   
   useEffect(() => {
@@ -4861,8 +5064,9 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [reschedulingBooking, setReschedulingBooking] = useState<Booking | null>(null);
   const [rescheduleDate, setRescheduleDate] = useState<string>('');
-   const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
+  const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
   const [rescheduleSuccess, setRescheduleSuccess] = useState(false);
+  const [rescheduleReason, setRescheduleReason] = useState('');
 
   const getBookingAmount = () => {
     if (!selectedTutor) return 0;
@@ -4896,9 +5100,10 @@ export default function App() {
 
     // --- Standard formula: Base = rate × hours × days, Final = Base × 1.17 ---
     let days = 1; 
-    if (planToUse === 'subscription') days = 365;  // Year Plan
-    else if (planToUse === '6months')  days = 180;  // 6 Months Plan
-    else if (planToUse === 'monthly')  days = 30;   // One Month Plan
+    if (planToUse === '6months') days = 180;
+    else if (planToUse === '3months') days = 90;
+    else if (planToUse === '1month' || planToUse === 'monthly') days = 30;
+    else if (planToUse === 'subscription') days = 365; // Keep for legacy compatibility
 
     const base   = baseRate * currentDur * days;
     const fee    = base * 0.17;
@@ -4907,10 +5112,13 @@ export default function App() {
 
   const getPlanFeatures = (plan: string) => {
     switch (plan) {
+      case '1month':
       case 'monthly':
         return ['Single Subject Access', 'One-on-One Sessions', 'Platform Fee Applied', 'Basic Assignments'];
+      case '3months':
+        return ['Up to 2 Subjects', 'Doubt Classes Included', 'Tutor Notes', 'Reduced Platform Fee', '10% Refund Policy'];
       case '6months':
-        return ['Up to 3 Subjects', 'Extra Doubt Classes', 'Tutor Notes Included', 'NO Platform Fee', '20% Refund Policy'];
+        return ['Up to 4 Subjects', 'Extra Doubt Classes', 'Full Notes Access', 'NO Platform Fee', '25% Refund Policy'];
       case 'subscription':
         return ['Up to 8 Subjects', 'Premium Notes & Mock Tests', 'Extra Support', 'NO Platform Fee', '40% Refund Policy'];
       case 'course':
@@ -4936,21 +5144,35 @@ export default function App() {
 
     const amt = getBookingAmount();
     if (amt === 0) return 'Invalid configuration';
+
+    const walletFunds = currentUser?.walletBalance || 0;
+    const isWalletUsed = walletFunds > 0;
+    const finalPayable = Math.max(0, amt - walletFunds);
     
+    let planLabel = 'Enrollment Total';
     if (planToUse === 'course' || selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject)?.type === 'course') {
-      return `Course Fee: ₹${amt.toLocaleString('en-IN')}`;
+      planLabel = 'Course Fee';
+    } else if (planToUse === 'subscription') {
+      planLabel = 'Year Plan';
+    } else if (planToUse === '6months') {
+      planLabel = '6 Months Plan';
+    } else if (planToUse === 'monthly' || planToUse === '1month' || planToUse === '3months') {
+      planLabel = planToUse === '1month' ? 'One Month Plan' : planToUse === '3months' ? 'Three Months Plan' : 'Plan Total';
     }
-    if (planToUse === 'subscription') {
-      return `Year Plan: ₹${amt.toLocaleString('en-IN')}`;
-    }
-    if (planToUse === '6months') {
-      return `6 Months Plan: ₹${amt.toLocaleString('en-IN')}`;
-    }
-    if (planToUse === 'monthly') {
-      return `One Month Plan: ₹${amt.toLocaleString('en-IN')}`;
+
+    if (isWalletUsed) {
+      return (
+        <div className="flex flex-col gap-1 items-end">
+          <span className="text-[10px] text-slate-400 font-bold uppercase line-through">₹{amt.toLocaleString('en-IN')}</span>
+          <span className="text-emerald-500 text-[10px] font-black uppercase tracking-widest flex items-center gap-1">
+             <Wallet size={10} /> - ₹{Math.min(amt, walletFunds).toLocaleString('en-IN')} Wallet Applied
+          </span>
+          <span className="text-primary font-black">Net Total: ₹{finalPayable.toLocaleString('en-IN')}</span>
+        </div>
+      );
     }
     
-    return `Session Total: ₹${amt.toLocaleString('en-IN')}`;
+    return `${planLabel}: ₹${amt.toLocaleString('en-IN')}`;
   };
 
   // --- Real-time Notes Notification for Student ---
@@ -5025,6 +5247,7 @@ export default function App() {
                 await updateDoc(bRef, { 
                   status: 'completed', 
                   attendance_status: 'attended',
+                  attendedCount: increment(1),
                   completedAt: serverTimestamp() 
                 });
               } else {
@@ -5073,6 +5296,7 @@ export default function App() {
               await updateDoc(bRef, { 
                 status: 'completed', 
                 attendance_status: 'attended',
+                attendedCount: increment(1),
                 completedAt: serverTimestamp() 
               });
             }
@@ -5514,30 +5738,49 @@ export default function App() {
     
     setPaymentStatus('processing');
     
-    // 1. Calculate amount (matching backend logic)
-    const fhpValue = parseFloat(getEffectivePrice(selectedTutor?.price));
-    let amountStr = '0';
-    if (bookingFormData.type === 'demo') {
-      amountStr = '0';
+    // 1. Calculate amount (using centralized getBookingAmount helper)
+    const grossAmount = getBookingAmount();
+    let amountStr = grossAmount.toString();
+
+    let finalAmount = parseFloat(amountStr);
+    const walletFunds = currentUser?.walletBalance || 0;
+    const useWallet = walletFunds > 0;
+    
+    if (useWallet) {
+      if (walletFunds >= finalAmount) {
+        // Fully covered by wallet
+        finalAmount = 0;
+      } else {
+        finalAmount -= walletFunds;
+      }
+    }
+
+    if (finalAmount === 0) {
       setPaymentStatus('success');
-      confirmBookingAfterPayment('demo_pay_id', 'demo_order_id', 0);
+      confirmBookingAfterPayment('wallet_pay_id', 'wallet_order_id', grossAmount);
       return;
-    } else if (bookingFormData.plan === 'monthly') {
-      amountStr = (fhpValue * 30).toFixed(2);
-    } else {
-      const sCount = parseFloat(bookingFormData.duration) || 1;
-      amountStr = (fhpValue * sCount).toFixed(2);
     }
 
     try {
       // 2. Create Order on Backend
       const hostname = window.location.hostname;
-      const orderResponse = await fetch(`http://${hostname}:5001/api/create-razorpay-order`, {
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
+      const orderResponse = await fetch(`${backendBaseUrl}/api/create-razorpay-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          amount: parseFloat(amountStr),
-          receipt: `rcpt_${bookingFormData.id}`
+          amount: finalAmount,
+          receipt: `rcpt_${bookingFormData.id}`,
+          notes: {
+            bookingId: bookingFormData.id,
+            studentId: currentUser?.id,
+            studentEmail: currentUser?.email,
+            subject: bookingFormData.subject,
+            tutorId: selectedTutor.id,
+            tutorName: selectedTutor.name,
+            plan: bookingFormData.plan,
+            type: bookingFormData.type
+          }
         })
       });
 
@@ -5550,8 +5793,8 @@ export default function App() {
         amount: orderData.amount,
         currency: orderData.currency,
         name: "Eduqra",
-        description: `${bookingFormData.subject} with ${selectedTutor.name}`,
-        image: "/logo.png",
+        description: `${getSubjectName(bookingFormData.subject)} with ${selectedTutor.name}`,
+        // image: "/logo.png", // Disabled to avoid CORS error on localhost
         order_id: orderData.orderId,
         handler: async function (response: any) {
           console.log("✅ Payment Successful:", response.razorpay_payment_id);
@@ -5561,11 +5804,11 @@ export default function App() {
             status: 'success' 
           });
           setPaymentStatus('success');
-          await confirmBookingAfterPayment(
-            response.razorpay_payment_id, 
-            response.razorpay_order_id, 
-            parseFloat(amountStr)
-          );
+      await confirmBookingAfterPayment(
+        response.razorpay_payment_id, 
+        response.razorpay_order_id, 
+        grossAmount
+      );
         },
         prefill: {
           name: currentUser?.name || "",
@@ -5584,7 +5827,7 @@ export default function App() {
     } catch (err: any) {
       console.error('❌ Payment Error:', err);
       setPaymentStatus('cancelled');
-      alert("Payment initialization failed: " + err.message);
+      showToast("Payment initialization failed: " + err.message, "error");
     }
   };
 
@@ -5596,6 +5839,10 @@ export default function App() {
     nextBilling.setDate(nextBilling.getDate() + 30);
 
     try {
+      const isWalletUsed = paymentId === 'wallet_pay_id';
+      const walletFunds = currentUser?.walletBalance || 0;
+      const appliedWalletAmount = isWalletUsed ? amount : Math.min(walletFunds, amount + walletFunds); // This is simplified
+
       await updateDoc(doc(db, 'bookings', bookingFormData.id), {
         status: 'pending',
         paymentId: paymentId,
@@ -5604,11 +5851,23 @@ export default function App() {
         paidAt: serverTimestamp(),
         isSubscription: isSub,
         subscriptionStatus: isSub ? 'active' : null,
-        nextBillingDate: isSub ? nextBilling : null
+        nextBillingDate: isSub ? nextBilling : null,
+        walletUsed: appliedWalletAmount > 0,
+        walletAmount: appliedWalletAmount,
+        tierAtBooking: currentUser?.subscription?.tier || 'free'
       });
 
+      // Deduct from student wallet if used
+      if (currentUser?.id && walletFunds > 0) {
+        const deduction = isWalletUsed ? amount : walletFunds; 
+        await updateDoc(doc(db, 'students', currentUser.id), {
+          walletBalance: increment(-Math.min(deduction, walletFunds))
+        });
+      }
+
       const hostname = window.location.hostname;
-      fetch(`http://${hostname}:5001/api/booking-success`, {
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
+      fetch(`${backendBaseUrl}/api/booking-success`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -5625,7 +5884,7 @@ export default function App() {
       await addDoc(collection(db, 'admin_notifications'), {
         type: 'Payment Success',
         title: 'Enrollment Confirmed',
-        message: `${currentUser?.name} paid ₹${amount} for ${bookingFormData.subject}.`,
+        message: `${currentUser?.name} paid ₹${amount} for ${getSubjectName(bookingFormData.subject)}.`,
         bookingId: bookingFormData.id,
         time: serverTimestamp(),
         read: false
@@ -5635,7 +5894,7 @@ export default function App() {
         tutorId: selectedTutor.id,
         type: 'booking',
         title: 'Enrollment Confirmed',
-        description: `${currentUser?.name} has enrolled for ${bookingFormData.subject}.`,
+        description: `${currentUser?.name} has enrolled for ${getSubjectName(bookingFormData.subject)}.`,
         time: 'Just now',
         read: false,
         timestamp: serverTimestamp()
@@ -5676,12 +5935,20 @@ export default function App() {
     try {
       // 2. Create Order on Backend
       const hostname = window.location.hostname;
-      const orderResponse = await fetch(`http://${hostname}:5001/api/create-razorpay-order`, {
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
+      const orderResponse = await fetch(`${backendBaseUrl}/api/create-razorpay-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           amount: parseFloat(amountStr),
-          receipt: `upgrade_${currentUser.email.replace(/\./g, '_')}`
+          receipt: `upgrade_${currentUser.email.replace(/\./g, '_')}`,
+          notes: {
+            studentId: currentUser.id,
+            studentEmail: currentUser.email,
+            type: 'upgrade',
+            planName: plan.name,
+            planId: plan.id
+          }
         })
       });
 
@@ -5695,7 +5962,7 @@ export default function App() {
         currency: orderData.currency,
         name: "Eduqra Platform Upgrade",
         description: `Upgrading to ${plan.name} Plan`,
-        image: "/logo.png",
+        // image: "/logo.png", // Disabled to avoid CORS error on localhost
         order_id: orderData.orderId,
         handler: async function (response: any) {
           console.log("✅ Upgrade Payment Successful:", response.razorpay_payment_id);
@@ -5721,7 +5988,7 @@ export default function App() {
   const confirmUpgradeAfterPayment = async (plan: any, paymentId: string, orderId: string) => {
     const subEnd = new Date();
     subEnd.setMonth(subEnd.getMonth() + 3);
-    const subLimit = plan.tier === 'free' ? 3 : plan.tier === 'standard' ? 5 : 8;
+    const subLimit = plan.tier === 'free' ? 1 : plan.tier === 'standard' ? 3 : 8;
     const updatedSub: SubscriptionPlan = {
       tier: plan.tier,
       status: 'active',
@@ -6050,7 +6317,7 @@ export default function App() {
     const isSunday = new Date(initialDate).getDay() === 0;
 
     const now = new Date();
-    const isToday = initialDate === now.toISOString().split('T')[0];
+    const isToday = initialDate === formatDateLocal(now);
 
     // Find the student's NEXT confirmed class to set a hard deadline
     const studentBookings = bookings
@@ -6127,9 +6394,9 @@ export default function App() {
       }
     });
 
-    // Fallback if no manual slots found: show only 10:00 AM and 5:00 PM
+    // Fallback if no manual slots found
     const finalSlots = Array.from(new Set(slots)).sort((a, b) => parseTime(a) - parseTime(b));
-    setRescheduleSlots(finalSlots.length > 0 ? finalSlots : ['10:00 AM', '5:00 PM']);
+    setRescheduleSlots(finalSlots);
   }, [reschedulingBooking, rescheduleDate, bookings, tutors]);
 
 
@@ -6148,7 +6415,8 @@ export default function App() {
 
     
     const form = e.target as HTMLFormElement;
-    const subject = (form.elements.namedItem('subject') as HTMLSelectElement)?.value || (bookingFormData?.subject || 'General');
+    const rawSubject = (form.elements.namedItem('subject') as HTMLSelectElement)?.value || (bookingFormData?.subject || 'General');
+    const subject = normalizeSubject(rawSubject);
     const date = (form.elements.namedItem('date') as HTMLInputElement)?.value || (bookingFormData?.date || '');
     const time = (form.elements.namedItem('time') as HTMLSelectElement)?.value || bookingSelectedTime || (bookingFormData?.time || '');
     const duration = (form.elements.namedItem('duration') as HTMLSelectElement)?.value || (bookingFormData?.duration || '1 Hour');
@@ -6178,18 +6446,26 @@ export default function App() {
     const isNewSubject = !activeSubjects.has(subject.toLowerCase());
     const isNewTutor = !activeTutors.has(selectedTutor.id);
 
-    // Subject Limits based on Plan (Fixed 3, 5, 8)
-    const subjectLimit = tier === 'free' ? 3 : tier === 'standard' ? 5 : 8;
+    // Subject Limits based on Plan (User Request: Free:1, Standard:3, Premium:8)
+    const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
 
     // Rule: Allow multiple tutors as long as within subject count. 
     // Example: 1 tutor 3 subjects OR 3 tutors 1 subject each.
     if (isNewSubject && activeSubjects.size >= subjectLimit) {
-       alert(`⚠️ ${tier.charAt(0).toUpperCase() + tier.slice(1)} Plan Subject Limit: You have reached your ${subjectLimit}-subject limit. Upgrade to a higher plan for more subjects!`);
+       alert(`🚀 Upgrade for More Subjects! 
+       
+You are currently on the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan which allows up to ${subjectLimit} unique subject${subjectLimit > 1 ? 's' : ''}. 
+
+To book "${subject}" or add more subjects, please upgrade your plan in Settings for a professional academic experience!`);
        return;
     }
 
     if (isNewTutor && activeTutors.size >= subjectLimit) {
-       alert(`⚠️ ${tier.charAt(0).toUpperCase() + tier.slice(1)} Plan Tutor Limit: You can book as many tutors as your subject count (${subjectLimit}). Cancel a session or upgrade to add another tutor.`);
+       alert(`🚀 Unlock More Tutors!
+       
+On the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan, you can book with up to ${subjectLimit} different tutor${subjectLimit > 1 ? 's' : ''}. 
+
+To explore more expert tutors, kindly upgrade your plan in the Settings section.`);
        return;
     }
 
@@ -6419,6 +6695,8 @@ export default function App() {
   const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
   const [cancelBooking, setCancelBooking] = useState<Booking | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [wantsNewTutor, setWantsNewTutor] = useState(false);
 
   const calculateRefund = (booking: Booking) => {
     if (!booking.amount) return { eligible: false, refundAmount: 0, reason: "No payment found" };
@@ -6426,6 +6704,7 @@ export default function App() {
     const platformFeeRate = 0.17;
     const totalAmount = booking.amount;
     const platformFee = totalAmount * platformFeeRate;
+    const originalAmount = totalAmount - platformFee;
     
     // Calculate days since payment
     const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
@@ -6435,50 +6714,96 @@ export default function App() {
     const diffTime = Math.abs(now.getTime() - paidAt.getTime());
     const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
 
-    // Plan-Specific Flags
-    const isSubscription = booking.isSubscription || booking.plan === 'subscription';
-    const isMonthly = booking.plan === 'monthly';
-    const isCourse = booking.plan?.startsWith('course_');
+    // Get Tier - prioritize tierAtBooking if saved, else fallback to current user's tier
+    const tier = (booking as any).tierAtBooking || currentUser?.subscription?.tier || 'free';
+    const attendedClasses = (booking as any).attendedCount || 0;
 
-    // Visibility & Eligibility Thresholds
-    // Subscriptions: Always visible/eligible (any time)
-    // Monthly/Course: Only eligible within first 15 days
-    const isWithinWindow = diffDays <= 15;
+    let eligible = false;
+    let refundAmount = 0;
+    let reason = "";
+    let deductionType = "";
 
-    if (!isSubscription && !isWithinWindow) {
-      return { eligible: false, refundAmount: 0, reason: "Cancellation window (15 days) has expired for this plan type." };
+    if (tier === 'free') {
+      if (diffDays <= 3) {
+        eligible = true;
+        refundAmount = originalAmount; // Refund base amount if within 3 days
+        reason = "Within 3-day window (Free Tier)";
+      } else {
+        eligible = false;
+        refundAmount = 0;
+        reason = "Refund window (3 days) expired for Free Tier.";
+      }
+    } else if (tier === 'standard' || tier === 'premium') {
+      if (diffDays <= 3 && attendedClasses <= 3) {
+        // First 3 days (after attending ≤3 classes)
+        // Rule: total paid amount minus (completed days cost + 3% deduction)
+        // completed days cost = originalAmount * (attended / totalDays) - assuming duration is total days
+        const totalDays = parseFloat(booking.duration || '1') * 30; // Assuming duration is months
+        const completedDaysCost = originalAmount * (attendedClasses / totalDays);
+        const deduction = totalAmount * 0.03;
+        refundAmount = totalAmount - completedDaysCost - deduction;
+        eligible = refundAmount > 0;
+        reason = "Early Cancellation window (≤3 days/classes)";
+        deductionType = "Pro-rated + 3% Fee";
+      } else if (diffDays > 3) {
+        // Last 10 days of the plan check
+        const totalDurationDays = 90; // 3 month plan
+        const daysLeft = totalDurationDays - diffDays;
+
+        if (daysLeft > 10) {
+          const refundPercent = tier === 'premium' ? 0.40 : 0.20;
+          refundAmount = originalAmount * refundPercent;
+          eligible = true;
+          reason = `Flat ${refundPercent * 100}% Refund (${tier.toUpperCase()} Tier)`;
+          deductionType = `Standard Tier Deduction`;
+        } else {
+          eligible = false;
+          refundAmount = 0;
+          reason = "No refund in the last 10 days of the plan.";
+        }
+      } else {
+        // Case where diffDays <= 3 but attended > 3 classes
+        const refundPercent = tier === 'premium' ? 0.40 : 0.20;
+        refundAmount = originalAmount * refundPercent;
+        eligible = true;
+        reason = `Flat ${refundPercent * 100}% Refund (Classes > 3)`;
+      }
     }
 
-    // Refund Split Rules: Tutor 50%, Platform 17%, Student 33% (Remaining)
-    // This applies to all eligible cancellations
-    const tutorShare = totalAmount * 0.5;
-    const refundAmount = totalAmount - tutorShare - platformFee;
-
     return { 
-      eligible: refundAmount > 0, 
+      eligible: eligible && refundAmount > 0, 
       refundAmount: Math.max(0, Math.floor(refundAmount)),
+      reason,
       breakdown: { 
         platformFee: Math.floor(platformFee), 
-        tutorShare: Math.floor(tutorShare), 
+        originalAmount: Math.floor(originalAmount),
+        tutorShare: Math.floor(originalAmount * 0.5), // Standard 50% split assumption for display
         diffDays, 
-        type: isSubscription ? 'subscription' : (isMonthly ? 'monthly' : 'course')
+        attendedClasses,
+        tier,
+        deductionType
       }
     };
   };
 
   const handleRequestCancellation = async () => {
-    if (!cancelBooking) return;
+    if (!cancelBooking || !cancelReason) {
+      alert("Please provide a reason for cancellation.");
+      return;
+    }
     setIsCancelling(true);
     try {
       await updateDoc(doc(db, 'bookings', cancelBooking.id), { 
         status: 'pending_cancellation',
+        cancellationReason: cancelReason,
+        wantsNewTutor: wantsNewTutor,
         cancellationRequestedAt: serverTimestamp()
       });
       // 1. Notify Admin
       await addDoc(collection(db, 'admin_notifications'), {
         type: 'Cancellation Request',
         title: 'Booking Cancellation Requested',
-        message: `${currentUser?.name} has requested to cancel their session for ${cancelBooking.subject} with ${cancelBooking.tutorName}.`,
+        message: `${currentUser?.name} has requested to cancel their session for ${getSubjectName(cancelBooking.subject)} with ${cancelBooking.tutorName}.`,
         bookingId: cancelBooking.id,
         time: serverTimestamp(),
         read: false
@@ -6489,7 +6814,7 @@ export default function App() {
         tutorId: cancelBooking.tutorId,
         type: 'update',
         title: 'Cancellation Requested',
-        description: `${currentUser?.name} requested to cancel the ${cancelBooking.subject} session on ${cancelBooking.date}.`,
+        description: `${currentUser?.name} requested to cancel the ${getSubjectName(cancelBooking.subject)} session on ${cancelBooking.date}.`,
         time: 'Just now',
         read: false,
         createdAt: serverTimestamp()
@@ -6540,10 +6865,52 @@ export default function App() {
             </div>
           </div>
         );
+      case 'verify-email':
+        return (
+          <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6 text-center">
+            <div className="relative mb-12">
+              <div className="w-32 h-32 bg-primary/5 rounded-full flex items-center justify-center">
+                <div className="w-24 h-24 bg-white rounded-full shadow-xl flex items-center justify-center relative">
+                  <div className="absolute inset-[-8px] border-[3px] border-primary/20 border-t-primary rounded-full animate-spin-slow"></div>
+                  <div className="w-16 h-16 bg-primary/5 rounded-full flex items-center justify-center">
+                    <ShieldCheck size={32} className="text-primary" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <h2 className="text-4xl md:text-5xl font-serif font-black italic mb-6 tracking-tighter text-slate-900">Verify Your Email</h2>
+            
+            <p className="text-slate-500 font-bold max-w-md mb-12 text-lg leading-relaxed">
+              We sent email verification to your <span className="text-slate-900 underline decoration-primary/30">{currentUser?.email}</span>. <br/>
+              Please check your inbox and click the link to login and enter your dashboard.
+            </p>
+
+            <div className="flex flex-col gap-4 w-full max-w-xs">
+              <button 
+                onClick={handleResendVerification}
+                className="w-full bg-primary text-white font-black py-5 rounded-[2rem] shadow-2xl shadow-primary/20 hover:scale-[1.02] active:scale-95 transition-all text-xs uppercase tracking-widest"
+              >
+                Resend Magic Link
+              </button>
+              <button 
+                onClick={confirmLogout}
+                className="w-full bg-slate-50 text-slate-400 font-black py-5 rounded-[2rem] hover:bg-slate-100 transition-all text-xs uppercase tracking-widest"
+              >
+                Sign Out
+              </button>
+            </div>
+
+            <p className="mt-16 text-[10px] font-black text-slate-300 uppercase tracking-[0.3em]">
+              Eduqra Scholar Security
+            </p>
+          </div>
+        );
       case 'payments':
         return (
           <PaymentsView 
             bookings={bookings}
+            currentUser={currentUser}
             onPay={(booking) => {
               const tutor = tutors.find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId);
               setSelectedTutor(tutor || null);
@@ -6644,6 +7011,7 @@ export default function App() {
             bookings={bookings}
             tutors={tutors}
             openChat={openChat}
+            currentTier={currentTier}
           />
         );
       case 'reviews':
@@ -6766,29 +7134,6 @@ export default function App() {
     return renderView();
   }
 
-  const handleResendVerification = async () => {
-    if (!currentUser) return;
-    try {
-      const hostname = window.location.hostname;
-      const response = await fetch(`http://${hostname}:5001/api/auth/send-verification`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          email: currentUser.email,
-          name: currentUser.name,
-          role: 'student'
-        })
-      });
-      if (response.ok) {
-        alert("Verification link resent! Please check your inbox.");
-      } else {
-        alert("Failed to resend. Please try again later.");
-      }
-    } catch (err) {
-      console.error("Resend error:", err);
-    }
-  };
 
   if (currentUser && currentUser.email_verified === false) {
     return <VerificationPendingView user={currentUser} onLogout={confirmLogout} onResend={handleResendVerification} />;
@@ -6854,8 +7199,10 @@ export default function App() {
                 const subjects = (selectedTutor?.subjects && Array.isArray(selectedTutor.subjects)) ? selectedTutor.subjects : [];
                 
                 return subjects.map(s => {
-                  const sp = selectedTutor?.subjectsPricing?.find((p: any) => p.subject === s);
-                  const entry = (selectedTutor as any)?.pricingEntries?.find((e: any) => e.subject === s);
+                  const standardizedId = normalizeSubject(s);
+                  const displayName = getSubjectName(standardizedId);
+                  const sp = selectedTutor?.subjectsPricing?.find((p: any) => normalizeSubject(p.subject) === standardizedId);
+                  const entry = (selectedTutor as any)?.pricingEntries?.find((e: any) => normalizeSubject(e.subject) === standardizedId);
                   
                   let displayPrice = 0;
                   let priceSuffix = '/hr';
@@ -6874,7 +7221,7 @@ export default function App() {
                     displayPrice = Math.ceil(parseFloat(String(selectedTutor?.price || '0')) * 1.17);
                   }
 
-                  return <option key={s} value={s}>{s} (₹{displayPrice}{priceSuffix})</option>;
+                  return <option key={s} value={standardizedId}>{displayName} (₹{displayPrice}{priceSuffix})</option>;
                 });
               })()}
             </select>
@@ -6889,21 +7236,47 @@ export default function App() {
               onChange={(e: any) => setBookingPlan(e.target.value)}
             >
               {(() => {
-                const isGraduate = selectedTutor?.targetClasses?.toLowerCase().includes('graduate');
-                if (isGraduate) {
+                const targetClasses = (selectedTutor?.targetClasses || '').toLowerCase();
+                const isHigherEd = targetClasses.includes('graduate') || 
+                                   targetClasses.includes('intermediate') || 
+                                   targetClasses.includes('b.tech') || 
+                                   targetClasses.includes('degree') ||
+                                   targetClasses.includes('btech') ||
+                                   targetClasses.includes('college');
+
+                const cls = currentUser?.class || '';
+                const gradeNum = parseInt(cls.replace(/\D/g, ''));
+                const isSchoolUnder10 = !isNaN(gradeNum) && gradeNum <= 10;
+
+                if (isHigherEd) {
                   return (
                     <>
-                      <option value="monthly">One Month Plan</option>
+                      <option value="" disabled>Choose Plan Type</option>
+                      <option value="1month">One Month Plan</option>
+                      <option value="3months">Three Months Plan</option>
+                      <option value="6months">Six Months Plan</option>
                       <option value="course">Full Course Enrollment</option>
                     </>
                   );
                 }
+
+                if (isSchoolUnder10) {
+                  return (
+                    <>
+                      <option value="" disabled>Choose Plan Type</option>
+                      <option value="1month">One Month Plan</option>
+                      <option value="3months">Three Months Plan</option>
+                      <option value="6months">Six Months Plan</option>
+                    </>
+                  );
+                }
+
                 return (
                   <>
                     <option value="" disabled>Choose Plan Type</option>
-                    <option value="subscription">Year Plan</option>
-                    <option value="6months">6 Months Plan (One-time Pay)</option>
-                    <option value="monthly">One Month Plan</option>
+                    <option value="1month">1-Month Plan</option>
+                    <option value="3months">3-Months Plan</option>
+                    <option value="6months">6-Months Plan</option>
                   </>
                 );
               })()}
@@ -7010,7 +7383,7 @@ export default function App() {
                 type="date" 
                 className="input-field" 
                 required 
-                min={new Date().toISOString().split('T')[0]} 
+                min={formatDateLocal(new Date())} 
                 max="2099-12-31"
                 value={bookingSelectedDate}
                 onInput={(e) => {
@@ -7033,6 +7406,23 @@ export default function App() {
               />
             </div>
             <div className="space-y-3">
+              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Daily Duration</label>
+              <select 
+                name="duration" 
+                className="input-field" 
+                required 
+                value={bookingDuration}
+                onChange={(e) => setBookingDuration(e.target.value)}
+              >
+                <option value="" disabled>Choose Hours</option>
+                <option value="1">1 Hour</option>
+                <option value="1.5">1.5 Hours</option>
+                <option value="2">2 Hours</option>
+                <option value="3">3 Hours</option>
+              </select>
+            </div>
+
+            <div className="space-y-3">
               <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Select Time</label>
               <select 
                 name="time" 
@@ -7040,21 +7430,21 @@ export default function App() {
                 required 
                 value={bookingSelectedTime}
                 onChange={(e) => setBookingSelectedTime(e.target.value)}
-                disabled={!bookingSelectedDate}
+                disabled={!bookingSelectedDate || !bookingDuration}
               >
                 {(() => {
                   // INTERLINK: Use activeTutorDoc for real-time availability updates from tutor side
                   const latestTutor = activeTutorDoc || tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
                   
-                  if (!bookingSelectedDate) {
-                    return <option value="" disabled selected>Select Time</option>;
+                  if (!bookingSelectedDate || !bookingDuration) {
+                    return <option value="" disabled>{!bookingSelectedDate ? 'Select Date First' : 'Choose Hours First'}</option>;
                   }
 
                   const [y, m, d_val] = bookingSelectedDate.split('-').map(Number);
                   const dateObj = new Date(y, m - 1, d_val);
 
                   if (isNaN(dateObj.getTime())) {
-                    return <option value="" disabled selected>Invalid Date</option>;
+                    return <option value="" disabled>Invalid Date</option>;
                   }
                   
                   const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
@@ -7102,21 +7492,18 @@ export default function App() {
                       }
                     });
                   } else {
-                    // Remove default fallback slots to ensure only tutor-provided slots are shown
                     baseSlots = [];
                   }
 
-                  // 2. Apply real-time filtering (RULE 3)
                   const slotsToShow = getFinalSlots(baseSlots);
 
-                  // 3. Handle empty state (RULE 4 & 5)
                   if (slotsToShow.length === 0) {
-                    return <option value="" disabled selected>No slots available for today</option>;
+                    return <option value="" disabled>No slots available for this duration</option>;
                   }
 
                   return (
                     <>
-                      <option value="" disabled selected>Select Time</option>
+                      <option value="" disabled>Select Time</option>
                       {slotsToShow.map((t, idx) => (
                         <option key={idx} value={t}>{t}</option>
                       ))}
@@ -7126,24 +7513,7 @@ export default function App() {
               </select>
             </div>
           </div>
-          {bookingType === 'paid' && (
-            <div className="space-y-3">
-              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Daily Duration</label>
-              <select 
-                name="duration" 
-                className="input-field" 
-                required 
-                value={bookingDuration}
-                onChange={(e) => setBookingDuration(e.target.value)}
-              >
-                <option value="" disabled>Choose Hours</option>
-                <option value="1">1 Hour</option>
-                <option value="1.5">1.5 Hours</option>
-                <option value="2">2 Hours</option>
-                <option value="3">3 Hours</option>
-              </select>
-            </div>
-          )}
+
           <div className="pt-8 flex items-center justify-between border-t border-primary/5">
             <div>
               <p className="text-[10px] font-bold text-primary/30 uppercase tracking-widest">Enrollment Total</p>
@@ -7179,11 +7549,13 @@ export default function App() {
             </div>
             <h3 className="text-xl font-bold font-serif italic text-on-surface">Scholar</h3>
             <div className="text-center">
-              <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-2">{bookingFormData?.subject} with {selectedTutor?.name}</p>
+              <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-2">{getSubjectName(bookingFormData?.subject)} with {selectedTutor?.name}</p>
               <div className="text-3xl font-black text-primary mt-2 flex items-center justify-center gap-1">
                 <span>₹</span>
                 {(() => {
-                  return getBookingAmount().toFixed(2);
+                  const amt = getBookingAmount();
+                  const walletFunds = currentUser?.walletBalance || 0;
+                  return Math.max(0, amt - walletFunds).toFixed(2);
                 })()}
               </div>
               <p className="text-[10px] font-bold text-primary/40 mt-1">{currentUser?.email || 'student@scholar.com'}</p>
@@ -7213,7 +7585,7 @@ export default function App() {
                     </div>
                     <span className="font-bold text-sm text-on-surface">{upi}</span>
                   </div>
-                  <ChevronRight size={16} className="text-primary/30" />
+                  <MousePointer2 size={16} className="text-primary/30" />
                 </button>
               ))}
             </div>
@@ -7287,6 +7659,7 @@ export default function App() {
             const form = e.target as HTMLFormElement;
             const date = (form.elements.namedItem('date') as HTMLInputElement).value;
             const time = (form.elements.namedItem('time') as HTMLSelectElement).value;
+            const reason = rescheduleReason || 'No reason provided';
             
             if (reschedulingBooking?.id) {
               try {
@@ -7294,7 +7667,8 @@ export default function App() {
                 const oldBookingRef = doc(db, 'bookings', reschedulingBooking.id);
                 await updateDoc(oldBookingRef, { 
                   status: 'cancelled', 
-                  isRescheduled: true 
+                  isRescheduled: true,
+                  rescheduleReason: reason
                 });
 
                 // 2. Create a NEW booking for the new slot
@@ -7305,18 +7679,19 @@ export default function App() {
                   time,
                   status: 'confirmed', // Assuming the student picks from tutor's available slots
                   isRescheduled: false,
-                  rescheduledFrom: id 
+                  rescheduledFrom: id,
+                  rescheduleReason: reason
                 });
 
                 // 3. Notify the Tutor automatically
                 await addDoc(collection(db, 'tutor_notifications'), {
                   tutorId: reschedulingBooking.tutorId,
                   studentId: currentUser.email, // Using email as ID for easier lookup in this system
-                  studentName: currentUser.displayName || 'Student',
-                  studentAvatar: currentUser.photoURL || '',
+                  studentName: currentUser.displayName || currentUser.name || 'Student',
+                  studentAvatar: currentUser.photoURL || currentUser.avatar || '',
                   type: 'booking',
                   title: 'Session Rescheduled',
-                  description: `${currentUser.displayName || 'Student'} has rescheduled their ${reschedulingBooking.subject} session to ${date} at ${time}.`,
+                  description: `${currentUser.displayName || currentUser.name || 'Student'} has rescheduled their ${getSubjectName(reschedulingBooking.subject)} session to ${date} at ${time}. Reason: ${reason}`,
                   bookingId: newBookingRef.id,
                   time: 'Just now',
                   read: false,
@@ -7327,6 +7702,7 @@ export default function App() {
                 setTimeout(() => {
                   setReschedulingBooking(null);
                   setRescheduleDate('');
+                  setRescheduleReason('');
                   setRescheduleSuccess(false);
                 }, 3000);
               } catch (err) {
@@ -7336,6 +7712,7 @@ export default function App() {
 
             setReschedulingBooking(null);
             setRescheduleDate('');
+            setRescheduleReason('');
           }} 
           className="space-y-8"
         >
@@ -7347,7 +7724,7 @@ export default function App() {
                 type="date" 
                 className="input-field" 
                 required 
-                min={new Date().toISOString().split('T')[0]} 
+                min={formatDateLocal(new Date())} 
                 max="2099-12-31"
                 value={rescheduleDate} 
                 onInput={(e) => {
@@ -7377,6 +7754,17 @@ export default function App() {
                 * Slots are based on tutor's free time
               </p>
             </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Reason for Rescheduling</label>
+            <textarea 
+              className="input-field min-h-[100px] py-4"
+              placeholder="Please provide a valid reason for rescheduling this session..."
+              value={rescheduleReason}
+              onChange={(e) => setRescheduleReason(e.target.value)}
+              required
+            />
           </div>
           <div className="pt-8 flex justify-end">
             <button 
@@ -7736,10 +8124,43 @@ export default function App() {
                   <AlertTriangle size={36} className="text-rose-600" />
                 </div>
                 <h3 className="text-3xl font-serif font-black italic text-slate-900 mb-4 tracking-tight">Cancel This Booking?</h3>
-                <p className="text-slate-500 font-medium mb-10 leading-relaxed px-4">
-                  Are you sure you want to request cancellation for your <span className="text-slate-900 font-black tracking-tight">{cancelBooking.subject}</span> course? 
-                  This will stop all upcoming classes under this booking.
-                </p>
+                
+                <div className="space-y-6 mb-8 text-left">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Reason for Cancellation</label>
+                    <select 
+                      className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-4 px-6 outline-none focus:ring-2 focus:ring-primary/20 transition-all font-bold text-sm"
+                      value={cancelReason}
+                      onChange={(e) => setCancelReason(e.target.value)}
+                    >
+                      <option value="">Select a reason...</option>
+                      <option value="Schedule Conflict">Schedule Conflict</option>
+                      <option value="Tutor Not Suitable">Tutor Not Suitable</option>
+                      <option value="Subject Changed">Subject Changed</option>
+                      <option value="Personal Reasons">Personal Reasons</option>
+                      <option value="Other">Other</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center justify-between p-6 bg-primary/5 rounded-2xl border border-primary/10">
+                    <div>
+                      <h4 className="text-sm font-black text-primary tracking-tight">Book a different tutor?</h4>
+                      <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-1">We'll add refund to your wallet</p>
+                    </div>
+                    <button 
+                      onClick={() => setWantsNewTutor(!wantsNewTutor)}
+                      className={cn(
+                        "w-12 h-6 rounded-full transition-all relative",
+                        wantsNewTutor ? "bg-primary" : "bg-slate-200"
+                      )}
+                    >
+                      <motion.div 
+                        animate={{ x: wantsNewTutor ? 24 : 4 }}
+                        className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                      />
+                    </button>
+                  </div>
+                </div>
 
                 {/* Refund Information */}
                 <div className="bg-slate-50 rounded-[2rem] p-8 mb-10 border border-slate-100 text-left">
@@ -7811,6 +8232,97 @@ export default function App() {
           </div>
         )}
       </AnimatePresence>
+
+      {/* 🔐 MANDATORY UPI ID GATE MODAL */}
+      <AnimatePresence>
+        {showUpiGate && (
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-slate-900/80 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-lg bg-white rounded-[2.5rem] shadow-2xl overflow-hidden"
+            >
+              <div className="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-primary via-accent to-primary"></div>
+              
+              <div className="p-8 md:p-12">
+                <div className="w-20 h-20 bg-primary/5 rounded-3xl flex items-center justify-center mb-8 mx-auto">
+                   <Wallet size={40} className="text-primary animate-pulse" />
+                </div>
+                
+                <div className="text-center mb-10">
+                  <h2 className="text-3xl font-serif font-black italic text-slate-800 mb-4">Add Your UPI ID</h2>
+                  <p className="text-slate-500 font-medium leading-relaxed">
+                    To access your dashboard and schedule classes, please provide your primary UPI ID. This is required for secure academic transaction verifications.
+                  </p>
+                </div>
+
+                <form onSubmit={handleGateUpiSubmit} className="space-y-6">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-primary/30 ml-1">Your UPI ID (e.g. name@bank)</label>
+                    <div className="relative">
+                      <CreditCard className="absolute left-4 top-1/2 -translate-y-1/2 text-primary/20" size={20} />
+                      <input 
+                        type="text" 
+                        required
+                        placeholder="username@okaxis"
+                        value={gateUpiInput}
+                        onChange={(e) => setGateUpiInput(e.target.value)}
+                        className="w-full h-16 pl-12 pr-6 bg-slate-50 border-2 border-slate-100 rounded-2xl font-bold text-lg focus:border-primary focus:bg-white transition-all outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <button 
+                    type="submit"
+                    disabled={isUpdatingGateUpi || !gateUpiInput.trim()}
+                    className="w-full h-16 bg-primary text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-2xl shadow-primary/20 hover:scale-[1.02] active:scale-98 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:grayscale"
+                  >
+                    {isUpdatingGateUpi ? (
+                      <>
+                        <RefreshCw size={18} className="animate-spin" />
+                        Processing...
+                      </>
+                    ) : (
+                      <>
+                        Continue to Dashboard
+                        <ArrowRight size={18} />
+                      </>
+                    )}
+                  </button>
+                </form>
+
+                <div className="mt-8 pt-8 border-t border-slate-50 text-center">
+                   <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Eduqra Scholar • Secure Verification</p>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9, y: 20 }}
+            className={cn(
+              "fixed bottom-10 left-1/2 -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl font-black text-[10px] uppercase tracking-widest flex items-center gap-3 border transition-all",
+              toast.type === 'error' ? "bg-rose-500 text-white border-rose-400" : "bg-primary text-white border-primary/20"
+            )}
+          >
+            {toast.type === 'error' ? <AlertTriangle size={16} /> : <CheckCircle size={16} />}
+            {toast.message}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </>
   );
 }
@@ -7836,6 +8348,7 @@ interface ChatViewProps {
   bookings: Booking[];
   tutors: Tutor[];
   openChat: (tutorId: string) => Promise<void>;
+  currentTier: string;
 }
 function ChatView({
   chats,
@@ -7856,7 +8369,8 @@ function ChatView({
   bookings,
   tutors,
   openChat,
-  baseSendMessage
+  baseSendMessage,
+  currentTier
 }: ChatViewProps) {
   const [chatSearch, setChatSearch] = useState('');
   const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
@@ -8384,10 +8898,18 @@ function ChatView({
                           className="absolute bottom-full left-4 mb-4 w-64 bg-white rounded-2xl shadow-xl border border-surface-variant p-3 z-50 overflow-hidden"
                         >
                           <div className="grid grid-cols-1 gap-1">
-                            {attachmentOptions.map((opt) => (
+                            {attachmentOptions.map((opt) => {
+                              // LOCK POLLS FOR NON-PREMIUM
+                              const isLocked = opt.label === 'Poll' && currentTier !== 'premium';
+                              
+                              return (
                               <button 
                                 key={opt.label}
                                 onClick={() => {
+                                  if (isLocked) {
+                                    alert("🌟 Premium Feature: Polls are exclusive to our Elite Premium scholars. Upgrade now to interact with polls!");
+                                    return;
+                                  }
                                   setIsAttachmentMenuOpen(false);
                                   if (opt.label === 'Document') {
                                     fileInputRef.current?.click();
@@ -8401,14 +8923,22 @@ function ChatView({
                                     setIsPollModalOpen(true);
                                   }
                                 }}
-                                className="flex items-center gap-3 p-3 hover:bg-slate-50 rounded-xl transition-all group"
+                                className={cn(
+                                  "flex items-center gap-3 p-3 hover:bg-slate-50 rounded-xl transition-all group relative",
+                                  isLocked && "opacity-50 grayscale-[0.5]"
+                                )}
                               >
                                 <div className={cn("w-8 h-8 rounded-full flex items-center justify-center text-white shadow-sm transition-transform group-hover:scale-110", opt.color)}>
                                   <opt.icon size={14} />
                                 </div>
-                                <span className="text-sm font-bold text-on-surface/70 group-hover:text-primary">{opt.label}</span>
+                                <div className="flex flex-col items-start">
+                                  <span className="text-sm font-bold text-on-surface/70 group-hover:text-primary">{opt.label}</span>
+                                  {isLocked && <span className="text-[8px] font-black text-rose-500 uppercase tracking-widest">Premium Only</span>}
+                                </div>
+                                {isLocked && <Lock className="absolute right-4 text-slate-300" size={14} />}
                               </button>
-                            ))}
+                              );
+                            })}
                           </div>
                         </motion.div>
                       )}
@@ -8669,88 +9199,299 @@ function ChatView({
           </motion.div>
         )}
       </AnimatePresence>
-      
     </div>
   );
 };
-const PaymentsView = ({ bookings, onPay }: { 
+const PaymentsView = ({ bookings, onPay, currentUser }: { 
   bookings: Booking[], 
-  onPay: (booking: Booking) => void 
+  onPay: (booking: Booking) => void,
+  currentUser: StudentProfile | null
 }) => {
-  const pendingBookings = bookings.filter(b => b.status === 'unpaid' || b.status === 'pending');
+  const unpaidBookings = bookings.filter(b => b.status === 'unpaid');
   
+  const paymentHistory = [...bookings].sort((a, b) => {
+    const dateA = a.paidAt?.seconds ? a.paidAt.seconds * 1000 : (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : new Date(a.date).getTime());
+    const dateB = b.paidAt?.seconds ? b.paidAt.seconds * 1000 : (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : new Date(b.date).getTime());
+    return dateB - dateA;
+  });
+
+  const totalInvested = bookings
+    .filter(b => b.paymentId || ['confirmed', 'completed', 'live', 'rescheduled'].includes(b.status))
+    .reduce((acc, b) => acc + (b.amount || 0), 0);
+    
+  const pendingDues = unpaidBookings.reduce((acc, b) => acc + (b.amount || 0), 0);
+
   return (
     <motion.div 
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      className="space-y-12"
+      className="space-y-8 pb-20"
     >
-      <div className="flex flex-col md:flex-row items-center justify-between gap-6 mb-8 mt-2">
+      <div className="flex flex-col md:flex-row items-center justify-between gap-6 mb-4 mt-2">
         <div>
-          <h2 className="text-3xl md:text-5xl font-black tracking-tighter">Payments & Billing</h2>
-          <p className="text-sm font-bold text-primary/40 mt-1">Manage your course transactions securely.</p>
+          <h2 className="text-xl md:text-3xl font-black tracking-tighter">Payments & Billing</h2>
+          <p className="text-xs font-bold text-primary/40 mt-0.5">Real-time financial overview of your academic journey.</p>
         </div>
-        <div className="bg-primary/5 px-6 py-4 rounded-2xl flex items-center gap-3 border border-primary/10 shadow-sm">
-          <Lock className="text-primary w-5 h-5" />
+        <div className="bg-primary/5 px-5 py-3 rounded-xl flex items-center gap-3 border border-primary/10 shadow-sm">
+          <Lock className="text-primary w-4 h-4" />
           <div>
-            <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest">Gateway</p>
-            <p className="font-bold text-sm tracking-tight text-primary">Razorpay Secure</p>
+            <p className="text-[9px] font-bold text-primary/40 uppercase tracking-widest">Gateway</p>
+            <p className="font-bold text-xs tracking-tight text-primary">Razorpay Secure</p>
           </div>
         </div>
       </div>
 
-      <section className="space-y-6">
-        <h3 className="text-xl md:text-2xl font-serif font-bold italic border-b border-primary/5 pb-4">Unpaid Sessions</h3>
-        {pendingBookings.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {pendingBookings.map((booking, i) => (
+      {/* Summary Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        {/* Wallet Balance */}
+        <motion.div 
+          whileHover={{ y: -2 }}
+          className="bg-primary text-white p-4 rounded-2xl border border-primary/20 shadow-xl shadow-primary/20 relative group overflow-hidden"
+        >
+          <div className="flex items-center gap-3 relative z-10">
+            <div className="w-10 h-10 bg-white/20 backdrop-blur-md rounded-xl flex items-center justify-center text-white border border-white/20 shadow-inner">
+               <Wallet size={18} />
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-[0.15em] text-white/60">Wallet Balance</p>
+              <h3 className="text-xl font-black text-white tracking-tight">₹{(currentUser?.walletBalance || 0).toLocaleString('en-IN')}</h3>
+            </div>
+          </div>
+          <div className="absolute top-0 right-0 w-24 h-24 bg-white/10 blur-3xl rounded-full -mr-12 -mt-12"></div>
+        </motion.div>
+
+        {/* Total Invested */}
+        <motion.div 
+          whileHover={{ y: -2 }}
+          className="bg-white/60 backdrop-blur-md p-4 rounded-2xl border border-slate-100 shadow-sm relative group overflow-hidden"
+        >
+          <div className="flex items-center gap-3 relative z-10">
+            <div className="w-10 h-10 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-500 border border-emerald-100 shadow-inner">
+               <DollarSign size={18} />
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-[0.15em] text-slate-400">Total Invested</p>
+              <h3 className="text-xl font-black text-slate-900 tracking-tight">₹{totalInvested.toLocaleString('en-IN')}</h3>
+            </div>
+          </div>
+          <div className="absolute top-0 right-0 w-16 h-16 bg-emerald-500/5 blur-2xl rounded-full"></div>
+        </motion.div>
+
+        {/* Pending Dues */}
+        <motion.div 
+          whileHover={{ y: -2 }}
+          className="bg-white/60 backdrop-blur-md p-4 rounded-2xl border border-slate-100 shadow-sm relative group overflow-hidden"
+        >
+          <div className="flex items-center gap-3 relative z-10">
+            <div className="w-10 h-10 bg-rose-50 rounded-xl flex items-center justify-center text-rose-500 border border-rose-100 shadow-inner">
+               <RefreshCw size={18} className={pendingDues > 0 ? "animate-spin-slow" : ""} />
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-[0.15em] text-slate-400">Pending Dues</p>
+              <h3 className="text-xl font-black text-slate-900 tracking-tight">₹{pendingDues.toLocaleString('en-IN')}</h3>
+            </div>
+          </div>
+          <div className="absolute top-0 right-0 w-16 h-16 bg-rose-500/5 blur-2xl rounded-full"></div>
+        </motion.div>
+
+        {/* Current Plan */}
+        <motion.div 
+          whileHover={{ y: -2 }}
+          className="bg-white/60 backdrop-blur-md p-4 rounded-2xl border border-slate-100 shadow-sm relative group overflow-hidden"
+        >
+          <div className="flex items-center gap-3 relative z-10">
+            <div className="w-10 h-10 bg-primary/5 rounded-xl flex items-center justify-center text-primary border border-primary/10 shadow-inner">
+               <Award size={18} />
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-[0.15em] text-slate-400">Active Tier</p>
+              <h3 className="text-xl font-black text-slate-900 tracking-tight capitalize">{currentUser?.subscription?.tier || 'Free'}</h3>
+            </div>
+          </div>
+          <div className="absolute top-0 right-0 w-16 h-16 bg-primary/5 blur-2xl rounded-full"></div>
+        </motion.div>
+      </div>
+
+      {/* Unpaid Sessions Section */}
+      <section className="space-y-4">
+        <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-rose-50 flex items-center justify-center text-rose-500 shadow-inner">
+              <DollarSign size={20} />
+            </div>
+            <div>
+              <h3 className="text-lg md:text-xl font-black text-slate-900 tracking-tight">Pending Actions</h3>
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">Unpaid Course Sessions</p>
+            </div>
+          </div>
+          {unpaidBookings.length > 0 && (
+            <span className="bg-rose-500 text-white text-[10px] font-black px-3 py-1 rounded-full shadow-lg shadow-rose-500/20 animate-pulse">
+              {unpaidBookings.length} ACTION REQUIRED
+            </span>
+          )}
+        </div>
+        
+        {unpaidBookings.length > 0 ? (
+          <div className="grid grid-cols-1 gap-3">
+            {unpaidBookings.map((booking, i) => (
               <motion.div 
-                initial={{ opacity: 0, y: 20 }}
+                initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: i * 0.05 }}
                 key={booking.id}
-                className="bg-white/60 backdrop-blur-md rounded-[2rem] p-6 border border-rose-100 shadow-xl relative overflow-hidden group hover:-translate-y-1 hover:shadow-rose-100 transition-all flex flex-col"
+                className="bg-white rounded-2xl p-4 border border-slate-100 flex flex-col md:flex-row items-center justify-between gap-4 group hover:border-primary/20 transition-all shadow-sm hover:shadow-md overflow-hidden relative"
               >
-                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-rose-400 to-primary"></div>
-                <div className="flex justify-between items-start mb-4">
-                  <div>
-                    <h4 className="font-bold text-lg leading-tight">{booking.subject}</h4>
-                    <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-1">with {booking.tutorName}</p>
+                {/* Horizontal Accent */}
+                <div className="absolute left-0 top-0 bottom-0 w-1 bg-rose-500 opacity-20 group-hover:opacity-100 transition-opacity"></div>
+                
+                <div className="flex items-center gap-4 w-full md:w-auto pl-2">
+                  <div className="w-14 h-14 rounded-2xl bg-slate-50 flex items-center justify-center text-slate-400 shrink-0 border border-slate-100 group-hover:text-primary group-hover:bg-primary/5 transition-colors">
+                    <BookOpen size={24} />
                   </div>
-                  <Badge variant="unpaid">Unpaid</Badge>
+                  <div className="min-w-0">
+                    <h4 className="font-black text-sm text-slate-900 truncate tracking-tight">{getSubjectName(booking.subject)}</h4>
+                    <div className="flex items-center gap-2 mt-1">
+                       <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Tutor: {booking.tutorName}</span>
+                       <div className="w-1 h-1 rounded-full bg-slate-200"></div>
+                       <span className="text-[8px] font-black text-rose-500 uppercase tracking-widest">Awaiting Payment</span>
+                    </div>
+                  </div>
                 </div>
                 
-                <div className="space-y-2 mb-6 flex-1">
-                  <div className="flex items-center gap-2 text-xs font-bold text-primary/60">
-                    <Calendar size={14} className="text-accent" /> {booking.date}
+                <div className="flex items-center justify-between md:justify-end gap-10 w-full md:w-auto border-t md:border-t-0 pt-4 md:pt-0 border-slate-50 pl-2">
+                  <div className="flex flex-col">
+                    <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest mb-1">Session Date</span>
+                    <div className="flex items-center gap-2">
+                       <Calendar size={12} className="text-primary/40" />
+                       <span className="text-xs font-bold text-slate-600 tracking-tight">{booking.date}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 text-[10px] font-bold text-primary/40 uppercase tracking-widest">
-                    <Clock size={14} /> {booking.time} • {booking.duration}
+                  
+                  <div className="flex flex-col text-right">
+                    <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest mb-1">Payable</span>
+                    <span className="text-lg font-black text-slate-900 tracking-tighter">₹{(booking.amount || 0).toLocaleString('en-IN')}</span>
                   </div>
-                </div>
 
-                <div className="pt-4 border-t border-primary/5 flex items-center justify-between">
-                  <div>
-                    <p className="text-[9px] font-bold text-primary/30 uppercase tracking-widest">Total Price</p>
-                    <p className="text-2xl font-serif font-bold italic text-primary">₹{(booking.amount || 0).toLocaleString('en-IN')}</p>
-                  </div>
                   <button 
                     onClick={() => onPay(booking)}
-                    className="bg-primary text-background px-6 py-3 rounded-xl font-bold hover:scale-105 transition-transform shadow-lg text-xs tracking-wide flex items-center gap-2"
+                    className="bg-primary text-white h-12 px-6 rounded-xl font-black text-[10px] uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-primary/20 flex items-center gap-2"
                   >
-                    <DollarSign size={14} /> Pay Now
+                    <MousePointer2 size={14} /> Checkout
                   </button>
                 </div>
               </motion.div>
             ))}
           </div>
         ) : (
-          <div className="text-center py-24 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
-            <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto mb-4 opacity-70" />
-            <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">All caught up! No pending payments.</p>
+          <div className="text-center py-16 bg-slate-50/50 rounded-[2.5rem] border-2 border-dashed border-slate-100">
+            <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center mx-auto mb-4 shadow-sm">
+              <CheckCircle2 className="w-8 h-8 text-emerald-500 opacity-20" />
+            </div>
+            <p className="text-slate-400 font-black uppercase tracking-[0.2em] text-[10px]">Your account is fully settled</p>
           </div>
         )}
       </section>
+
+      {/* Comprehensive History Section */}
+      <section className="space-y-6">
+        <div className="flex items-center gap-3 border-b border-primary/5 pb-4">
+          <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
+            <Clock className="text-primary" size={20} />
+          </div>
+          <h3 className="text-xl md:text-2xl font-serif font-bold italic">Transaction Passbook</h3>
+        </div>
+
+        <div className="bg-white/60 backdrop-blur-md rounded-[2.5rem] border border-primary/5 shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr className="bg-primary/[0.02]">
+                  <th className="text-left px-8 py-5 text-[9px] font-black text-primary/40 uppercase tracking-widest">Transaction ID</th>
+                  <th className="text-left px-8 py-5 text-[9px] font-black text-primary/40 uppercase tracking-widest">Date</th>
+                  <th className="text-left px-8 py-5 text-[9px] font-black text-primary/40 uppercase tracking-widest">Tutor / Type</th>
+                  <th className="text-left px-8 py-5 text-[9px] font-black text-primary/40 uppercase tracking-widest">Amount</th>
+                  <th className="text-right px-8 py-5 text-[9px] font-black text-primary/40 uppercase tracking-widest">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-primary/5">
+                {paymentHistory.length > 0 ? (
+                  paymentHistory.map((txn) => (
+                    <tr key={txn.id} className="hover:bg-primary/[0.01] transition-colors group">
+                      <td className="px-8 py-5">
+                        <p className="text-xs font-black text-primary truncate max-w-[120px]">{txn.paymentId || '---'}</p>
+                        <p className="text-[8px] font-bold text-primary/30 uppercase tracking-tighter">Ref: {txn.orderId || txn.id}</p>
+                      </td>
+                      <td className="px-8 py-5 text-xs font-bold text-primary/60">
+                        {txn.paidAt ? (
+                          txn.paidAt.seconds 
+                            ? new Date(txn.paidAt.seconds * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                            : new Date(txn.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                        ) : txn.date}
+                      </td>
+                      <td className="px-8 py-5">
+                        <p className="text-xs font-black text-primary">{txn.tutorName}</p>
+                        <div className="flex items-center gap-2 mt-0.5">
+                           <span className={cn(
+                             "text-[8px] font-black px-1.5 py-0.5 rounded uppercase tracking-widest border",
+                             txn.type === 'demo' ? "bg-amber-50 text-amber-600 border-amber-100" : "bg-blue-50 text-blue-600 border-blue-100"
+                           )}>
+                             {txn.type || 'Session'}
+                           </span>
+                           <p className="text-[9px] font-bold text-primary/40 uppercase tracking-widest">{getSubjectName(txn.subject)}</p>
+                        </div>
+                      </td>
+                      <td className="px-8 py-5 text-xs font-black text-primary">₹{(txn.amount || 0).toLocaleString('en-IN')}</td>
+                      <td className="px-8 py-5 text-right">
+                        <span className={cn(
+                          "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest border",
+                          txn.status === 'completed' || txn.status === 'confirmed' || txn.status === 'live'
+                            ? "bg-emerald-50 text-emerald-600 border-emerald-100" 
+                            : txn.status === 'pending' || txn.status === 'pending_cancellation'
+                            ? "bg-amber-50 text-amber-600 border-amber-100"
+                            : txn.status === 'unpaid'
+                            ? "bg-rose-50 text-rose-600 border-rose-100"
+                            : "bg-slate-50 text-slate-500 border-slate-100"
+                        )}>
+                          {['completed', 'confirmed', 'live'].includes(txn.status) ? (
+                            <CheckCircle2 size={10} />
+                          ) : ['pending', 'pending_cancellation'].includes(txn.status) ? (
+                            <RefreshCw size={10} className="animate-spin-slow" />
+                          ) : txn.status === 'unpaid' ? (
+                            <AlertCircle size={10} />
+                          ) : (
+                            <Clock size={10} />
+                          )}
+                          {['completed', 'confirmed', 'live'].includes(txn.status) ? 'Paid' : txn.status.replace('_', ' ')}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={5} className="px-8 py-20 text-center">
+                      <p className="text-primary/20 font-black uppercase tracking-widest text-[10px]">No transaction history found</p>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      {/* Security Footer */}
+      <div className="bg-primary/5 p-8 rounded-[3rem] border border-primary/10 flex items-start gap-5">
+        <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center shadow-sm shrink-0">
+          <ShieldCheckIcon className="text-primary" size={24} />
+        </div>
+        <div>
+          <h4 className="font-black text-sm text-primary mb-1">Secure Transactions Guaranteed</h4>
+          <p className="text-[11px] text-primary/60 font-medium leading-relaxed max-w-3xl">
+            All payments are processed through Razorpay's secure encrypted gateway. Eduqra does not store your card or bank details. 
+            For any billing discrepancies, please contact support with your Transaction ID.
+          </p>
+        </div>
+      </div>
     </motion.div>
   );
 };
