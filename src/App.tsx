@@ -7663,36 +7663,27 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
             
             if (reschedulingBooking?.id) {
               try {
-                // 1. Mark existing booking as rescheduled/cancelled
-                const oldBookingRef = doc(db, 'bookings', reschedulingBooking.id);
-                await updateDoc(oldBookingRef, { 
-                  status: 'cancelled', 
-                  isRescheduled: true,
-                  rescheduleReason: reason
-                });
-
-                // 2. Create a NEW booking for the new slot
-                const { id, ...bookingData } = reschedulingBooking;
-                const newBookingRef = await addDoc(collection(db, 'bookings'), {
-                  ...bookingData,
+                // 1. Update existing booking IN-PLACE with new time and status
+                const bookingRef = doc(db, 'bookings', reschedulingBooking.id);
+                await updateDoc(bookingRef, { 
                   date,
                   time,
-                  status: 'confirmed', // Assuming the student picks from tutor's available slots
-                  isRescheduled: false,
-                  rescheduledFrom: id,
-                  rescheduleReason: reason
+                  status: 'confirmed', 
+                  isRescheduled: true,
+                  rescheduleReason: reason,
+                  updatedAt: serverTimestamp()
                 });
 
-                // 3. Notify the Tutor automatically
+                // 2. Notify the Tutor automatically
                 await addDoc(collection(db, 'tutor_notifications'), {
                   tutorId: reschedulingBooking.tutorId,
-                  studentId: currentUser.email, // Using email as ID for easier lookup in this system
+                  studentId: currentUser.email, 
                   studentName: currentUser.displayName || currentUser.name || 'Student',
                   studentAvatar: currentUser.photoURL || currentUser.avatar || '',
                   type: 'booking',
                   title: 'Session Rescheduled',
                   description: `${currentUser.displayName || currentUser.name || 'Student'} has rescheduled their ${getSubjectName(reschedulingBooking.subject)} session to ${date} at ${time}. Reason: ${reason}`,
-                  bookingId: newBookingRef.id,
+                  bookingId: reschedulingBooking.id,
                   time: 'Just now',
                   read: false,
                   timestamp: serverTimestamp()
@@ -7709,10 +7700,6 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                 console.error("Error in rescheduling process:", err);
               }
             }
-
-            setReschedulingBooking(null);
-            setRescheduleDate('');
-            setRescheduleReason('');
           }} 
           className="space-y-8"
         >
