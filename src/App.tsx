@@ -916,15 +916,22 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
   setIsCancelModalOpen: (open: boolean) => void,
   calculateRefund: (booking: Booking) => any
 }) => {
-    const [tab, setTab] = useState<'all' | 'confirmed' | 'pending' | 'completed' | 'cancel'>('all');
+    const [tab, setTab] = useState<'all' | 'confirmed' | 'completed' | 'not_conducted'>('all');
     
     const filteredBookings = bookings.filter(b => {
-      // Default 'all' view now only shows ACTIVE bookings (not cancelled or completed)
-      if (tab === 'all') return ['pending', 'confirmed', 'live', 'rescheduled'].includes(b.status) && b.attendance_status !== 'attended';
-      if (tab === 'confirmed') return (b.status === 'confirmed' || b.status === 'rescheduled') && b.attendance_status !== 'attended';
-      if (tab === 'pending') return b.status === 'pending';
-      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended');
-      if (tab === 'cancel') return b.status === 'cancelled';
+      // Default 'all' view shows all active bookings + past classes? 
+      // User says "all here inside show all". I'll show everything here.
+      if (tab === 'all') return true; 
+      
+      // 'confirmed' -> after booking slot of student then if tutor conform means show here
+      if (tab === 'confirmed') return ['confirmed', 'rescheduled', 'pending', 'live'].includes(b.status) && !['completed', 'cancelled'].includes(b.status) && b.attendance_status !== 'attended';
+      
+      // 'completed' -> store if class is conducted both are attend here show
+      if (tab === 'completed') return (b.status === 'completed' || b.attendance_status === 'attended') && !['not_attended', 'not_conducted'].includes(b.attendance_status);
+      
+      // 'not_conducted' -> if studnet not attend or not conducted classes show here
+      if (tab === 'not_conducted') return b.status === 'completed' && ['not_attended', 'not_conducted'].includes(b.attendance_status || '');
+      
       return true;
     });
 
@@ -936,13 +943,18 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
             animate={{ opacity: 1, scale: 1 }}
             className="flex bg-primary/5 p-1 rounded-xl md:p-1.5 md:rounded-2xl w-full sm:w-fit overflow-x-auto no-scrollbar"
           >
-            {['all', 'confirmed', 'pending', 'completed', 'cancel'].map(t => (
+            {[
+              { id: 'all', label: 'All' },
+              { id: 'confirmed', label: 'Confirmed' },
+              { id: 'completed', label: 'Completed' },
+              { id: 'not_conducted', label: 'Not Attend/Not Conduct' }
+            ].map(t => (
               <button 
-                key={t}
-                onClick={() => setTab(t as any)}
-                className={`flex-1 sm:flex-none px-4 md:px-8 py-2 md:py-3 rounded-lg md:rounded-xl text-[8px] md:text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${tab === t ? 'bg-primary text-background shadow-xl' : 'text-primary/40 hover:bg-primary/5'}`}
+                key={t.id}
+                onClick={() => setTab(t.id as any)}
+                className={`flex-1 sm:flex-none px-4 md:px-6 py-2 md:py-3 rounded-lg md:rounded-xl text-[8px] md:text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${tab === t.id ? 'bg-primary text-background shadow-xl' : 'text-primary/40 hover:bg-primary/5'}`}
               >
-                {t === 'cancel' ? 'Cancelled' : t}
+                {t.label}
               </button>
             ))}
           </motion.div>
@@ -1038,19 +1050,15 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                     {booking.isRescheduled || booking.status === 'rescheduled' ? 'Rescheduled' : booking.status}
                   </span>
                   
-                    {((booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && booking.tutorJoined && booking.studentJoined && booking.topic) ? (
+                    {booking.attendance_status === 'attended' ? (
                       <span className="px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center gap-1.5">
                         <CheckCircle size={10} /> Attended
                       </span>
-                    ) : (booking.status === 'completed' || booking.status === 'confirmed') && booking.attendance_status && (
-                      <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
-                        booking.attendance_status === 'attended' || booking.attendance_status === 'pending'
-                          ? 'bg-blue-50 text-blue-600' 
-                          : 'bg-red-50 text-red-600'
-                      }`}>
-                        {booking.attendance_status === 'not_attended' ? 'Not Attended' : 'Attended'}
+                    ) : booking.attendance_status ? (
+                      <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest bg-rose-50 text-rose-600`}>
+                        {booking.attendance_status === 'not_conducted' ? 'Not Conducted' : 'Not Attended'}
                       </span>
-                    )}
+                    ) : null}
                   </div>
 
                   {booking.topic && (
