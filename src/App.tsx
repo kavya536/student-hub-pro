@@ -1190,10 +1190,9 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                     const durationHrs = parseFloat(booking.duration || '1');
                     const durationMins = durationHrs * 60;
                     
-                    // Join Now only visible: 10 mins before start → until class end time
                     const isInJoinWindow = diffMins <= 10 && nowMins <= (sessionMins + durationMins);
                     const isCompleted = nowMins > (sessionMins + durationMins);
-                    const gracePeriodMins = 60;
+                    const gracePeriodMins = 0; // Strictly active per end time for rejoin only
                     const isWayPastEnd = nowMins > (sessionMins + durationMins + gracePeriodMins);
                     const isSubscriptionExpired = booking.isSubscription && booking.subscriptionStatus === 'expired';
                     
