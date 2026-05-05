@@ -1192,10 +1192,11 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                     
                     // Join Now only visible: 10 mins before start → until class end time
                     const isInJoinWindow = diffMins <= 10 && nowMins <= (sessionMins + durationMins);
-                    const isCompleted = nowMins > (sessionMins + durationMins);
+                    const gracePeriodMins = 60;
+                    const isWayPastEnd = nowMins > (sessionMins + durationMins + gracePeriodMins);
                     const isSubscriptionExpired = booking.isSubscription && booking.subscriptionStatus === 'expired';
                     
-                    if (isInJoinWindow || booking.status === 'live') {
+                    if ((isInJoinWindow || booking.status === 'live') && !isWayPastEnd) {
                       if (isSubscriptionExpired) {
                         return (
                           <div className="flex flex-col gap-2 w-full sm:w-auto">
