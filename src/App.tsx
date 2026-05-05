@@ -5395,12 +5395,14 @@ export default function App() {
 
     // Socket.IO Signaling Setup
     const hostname = window.location.hostname;
-    socketRef.current = io(`http://${hostname}:5001`);
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    socketRef.current = io(`${protocol}//${hostname}:5001`);
     
     socketRef.current.emit('join-room', { 
       roomId: bookingId, 
       userId: currentUser.id, 
-      userName: currentUser.name 
+      userName: currentUser.name,
+      role: 'student'
     });
 
     // Handle existing users
@@ -5417,9 +5419,13 @@ export default function App() {
     });
 
     // Handle new users joining
-    socketRef.current.on('user-joined', ({ socketId, userId, userName }: any) => {
-      console.log("👤 Peer Joined:", userName);
+    socketRef.current.on('user-joined', ({ socketId, userId, userName, role }: any) => {
+      console.log(`👤 ${role === 'tutor' ? 'Tutor' : 'Student'} Joined:`, userName);
       setSessionStatus('live');
+    });
+
+    socketRef.current.on('user-media-toggled', ({ socketId, type, enabled }: any) => {
+      console.log(`🎥 Media Toggled by ${socketId}: ${type} is now ${enabled}`);
     });
 
     // Handle incoming signals (Offer/Answer/Candidate)
@@ -5446,7 +5452,7 @@ export default function App() {
       setLiveMessages(prev => [...prev, data]);
     });
 
-    socketRef.current.on('user-left', (socketId: string) => {
+    socketRef.current.on('user-left', ({ socketId }: any) => {
       const pc = peersRef.current.get(socketId);
       if (pc) pc.close();
       peersRef.current.delete(socketId);
@@ -5459,8 +5465,34 @@ export default function App() {
     } catch (e) { console.error("Firestore sync error:", e); }
   };
 
+  // Sync Media Status to Room (Dynamic UI)
+  useEffect(() => {
+    if (socketRef.current && sessionStatus === 'live' && activeMeetingId) {
+      socketRef.current.emit('toggle-media', {
+        roomId: activeMeetingId,
+        type: 'audio',
+        enabled: isMicOn
+      });
+    }
+  }, [isMicOn]);
+
+  useEffect(() => {
+    if (socketRef.current && sessionStatus === 'live' && activeMeetingId) {
+      socketRef.current.emit('toggle-media', {
+        roomId: activeMeetingId,
+        type: 'video',
+        enabled: isCamOn
+      });
+    }
+  }, [isCamOn]);
+
   const createPeerConnection = (socketId: string, roomId: string) => {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const pc = new RTCPeerConnection({ 
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ] 
+    });
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {

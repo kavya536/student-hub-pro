@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port=3006",
+    "dev": "vite --host --port=3006",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
@@ -33,6 +33,7 @@
     "@types/node": "^22.14.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
