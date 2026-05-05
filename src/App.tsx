@@ -7706,9 +7706,10 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                   updatedAt: serverTimestamp()
                 });
 
-                // 2. Notify the Tutor automatically
+                // 2. Notify the Tutor automatically (FIXED: match Tutor Dashboard listener)
                 await addDoc(collection(db, 'tutor_notifications'), {
                   tutorId: reschedulingBooking.tutorId,
+                  userId: currentUser.id || currentUser.email, // Standardize on userId
                   studentId: currentUser.email, 
                   studentName: currentUser.displayName || currentUser.name || 'Student',
                   studentAvatar: currentUser.photoURL || currentUser.avatar || '',
@@ -7718,7 +7719,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                   bookingId: reschedulingBooking.id,
                   time: 'Just now',
                   read: false,
-                  timestamp: serverTimestamp()
+                  createdAt: serverTimestamp() // Required for Tutor Dashboard sorting
                 });
 
                 setRescheduleSuccess(true);
