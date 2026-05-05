@@ -7712,7 +7712,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                   userId: currentUser.id || currentUser.email, // Standardize on userId
                   studentId: currentUser.email, 
                   studentName: currentUser.displayName || currentUser.name || 'Student',
-                  studentAvatar: currentUser.photoURL || currentUser.avatar || '',
+                  studentAvatar: currentUser.photoURL || '',
                   type: 'booking',
                   title: 'Session Rescheduled',
                   description: `${currentUser.displayName || currentUser.name || 'Student'} has rescheduled their ${getSubjectName(reschedulingBooking.subject)} session to ${date} at ${time}. Reason: ${reason}`,
