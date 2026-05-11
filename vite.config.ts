@@ -23,7 +23,7 @@ export default defineConfig(({mode}) => {
         overlay: false
       } : false,
       port: 3006,
-      https: true,
+      https: {},
     },
   };
 });

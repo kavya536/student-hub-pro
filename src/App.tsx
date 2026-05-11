@@ -61,7 +61,10 @@ import {
   CreditCard,
   Wallet,
   AlertCircle,
-  MousePointer2
+  MousePointer2,
+  ShieldAlert,
+  HelpCircle,
+  Info
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -465,8 +468,10 @@ interface Booking {
   time: string;
   duration: string;
   status: 'pending' | 'confirmed' | 'cancelled' | 'completed' | 'rescheduled' | 'unpaid' | 'live' | 'pending_cancellation';
+  studentReason?: string;
+  requestType?: string;
   isRescheduled?: boolean;
-  attendance_status?: 'attended' | 'not_attended' | 'pending';
+  attendance_status?: 'attended' | 'not_attended' | 'pending' | 'not_conducted';
   studentPresent?: boolean;
   studentJoinTime?: any;
   studentLeaveTime?: any;
@@ -476,6 +481,12 @@ interface Booking {
   tutorPresent?: boolean;
   tutorJoinTime?: any;
   tutorLeaveTime?: any;
+  cancellationReason?: string;
+  bookedAnotherTutor?: boolean;
+  alreadyGotRefund?: boolean;
+  cancellationRequestedAt?: any;
+  cancellationAdminStatus?: 'pending' | 'approved' | 'rejected';
+  refundStatus?: 'pending' | 'completed' | 'not_requested';
   durationConducted?: number; // in minutes
   completedAt?: any;
   plan?: string;
@@ -500,7 +511,7 @@ interface Booking {
     [email: string]: {
       joinTime: any;
       leaveTime: any;
-      status: 'attended' | 'not_attended' | 'pending';
+      status: 'attended' | 'not_attended' | 'pending' | 'not_conducted';
     }
   };
   startedAt?: any;
@@ -508,10 +519,13 @@ interface Booking {
   subscriptionStatus?: 'active' | 'expired' | 'cancelled';
   nextBillingDate?: any;
   talkingTime?: number; // in seconds
-  cancellationReason?: string;
-  wantsNewTutor?: boolean;
   tierAtBooking?: string;
   attendedCount?: number;
+  autoRefunded?: boolean;
+  refundAmount?: number;
+  wantsRefund?: boolean;
+  deletedByStudent?: boolean;
+  isLateFreeCancellation?: boolean;
 }
 
 interface Poll {
@@ -808,7 +822,8 @@ const Badge = ({ children, variant }: { children: React.ReactNode, variant: Book
     completed: 'bg-primary/10 text-primary/70',
     live: 'bg-emerald-500 text-white animate-pulse shadow-lg shadow-emerald-500/20',
     rescheduled: 'bg-blue-50 text-blue-600',
-    unpaid: 'bg-rose-50 text-rose-600'
+    unpaid: 'bg-rose-50 text-rose-600',
+
   };
   return <span className={`pill-tag ${classes[variant] || 'bg-slate-100'}`}>{children}</span>;
 };
@@ -901,7 +916,10 @@ const getReputation = (id: string | number, realReviews: any[] = []) => {
   };
 };
 
-const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView, setSelectedTutor, tutors, startSession, parseTime, currentUser, setCancelBooking, setIsCancelModalOpen, calculateRefund }: { 
+const MyBookingsView = ({ 
+  bookings, setBookings, openChat, onReschedule, setView, setSelectedTutor, tutors, startSession, parseTime, currentUser, 
+  showToast 
+}: { 
   bookings: Booking[], 
   setBookings: (bookings: Booking[]) => void,
   openChat: (tutorId: string) => void, 
@@ -912,15 +930,150 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
   startSession: (id: string) => void,
   parseTime: (time: string) => number,
   currentUser: StudentProfile | null,
-  setCancelBooking: (booking: Booking | null) => void,
-  setIsCancelModalOpen: (open: boolean) => void,
-  calculateRefund: (booking: Booking) => any
+  showToast: (msg: string, type: 'success' | 'error' | 'info') => void
 }) => {
     const [tab, setTab] = useState<'all' | 'confirmed' | 'completed' | 'not_conducted'>('all');
+    const [selectedBookingForCancellation, setSelectedBookingForCancellation] = useState<Booking | null>(null);
+    const [isCancellationModalOpen, setIsCancellationModalOpen] = useState(false);
+    const [cancellationStep, setCancellationStep] = useState(1);
+    const [cancellationForm, setCancellationForm] = useState({
+      reason: '',
+      bookAnother: null as 'yes' | 'no' | null,
+      wantsRefund: null as 'yes' | 'no' | null
+    });
+    const [cancellationError, setCancellationError] = useState('');
+    const [isSubmittingCancellation, setIsSubmittingCancellation] = useState(false);
+    const [selectedBookingId, setSelectedBookingId] = useState<string>('');
+    const [cancellationSubmitted, setCancellationSubmitted] = useState(false);
+    const [justDeletedIds, setJustDeletedIds] = useState<string[]>([]);
+
+    const handleDeleteBooking = async (bookingId: string) => {
+      setJustDeletedIds(prev => [...prev, bookingId]);
+      
+      setTimeout(async () => {
+        try {
+          await updateDoc(doc(db, 'bookings', bookingId), {
+            deletedByStudent: true
+          });
+          // Small delay before clearing the ID to ensure Firestore sync doesn't cause a flicker
+          setTimeout(() => {
+            setJustDeletedIds(prev => prev.filter(id => id !== bookingId));
+          }, 500);
+        } catch (err) {
+          console.error("Delete error:", err);
+          showToast("Failed to remove session.", "error");
+          setJustDeletedIds(prev => prev.filter(id => id !== bookingId));
+        }
+      }, 3000);
+    };
+
+    const handleCancellationSubmit = async () => {
+      const selectedTutorId = selectedBookingId;
+      const tutorBookings = bookings.filter(b => b.tutorId === selectedTutorId && ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+      if (tutorBookings.length === 0 || !currentUser) return;
+      
+      const firstBooking = tutorBookings[0];
+      const bookingDate = new Date(firstBooking.createdAt?.toMillis ? firstBooking.createdAt.toMillis() : (firstBooking.createdAt || firstBooking.date));
+      const now = new Date();
+      const daysSinceEnrollment = (now.getTime() - bookingDate.getTime()) / (1000 * 60 * 60 * 24);
+      
+      const isFreePlan = currentUser.subscription?.tier === 'free';
+      const isBefore3Days = daysSinceEnrollment < 3;
+      const isPolicyEligible = !(isFreePlan && !isBefore3Days);
+
+      setIsSubmittingCancellation(true);
+      try {
+        const batchUpdates = tutorBookings.map(async (b) => {
+          const bookingRef = doc(db, 'bookings', b.id);
+          const updateData = {
+            status: 'pending_cancellation' as any,
+            cancellationReason: cancellationForm.reason,
+            bookedAnotherTutor: isPolicyEligible ? (cancellationForm.bookAnother === 'yes') : false,
+            wantsRefund: isPolicyEligible ? (cancellationForm.wantsRefund === 'yes') : false,
+            cancellationRequestedAt: serverTimestamp(),
+            cancellationAdminStatus: 'pending' as 'pending',
+            isPolicyEligible,
+            cancelledTutorId: selectedTutorId
+          };
+          return updateDoc(bookingRef, updateData);
+        });
+        
+        await Promise.all(batchUpdates);
+
+        // Notify Admin
+        await addDoc(collection(db, 'admin_notifications'), {
+          type: 'cancellation_request',
+          title: 'Class Cancellation Request',
+          message: `${currentUser.name} requested cancellation for tutor ${tutorBookings[0].tutorName}.`,
+          studentId: currentUser.id,
+          tutorId: selectedTutorId,
+          details: {
+            ...cancellationForm,
+            isFreePlan,
+            isBefore3Days,
+            isPolicyEligible,
+            requestTime: now.toISOString()
+          },
+          read: false,
+          createdAt: serverTimestamp()
+        });
+
+        showToast("Cancellation request submitted! You will get an update within 24 hours.", "success");
+        setCancellationSubmitted(true);
+        // Reset remaining state but keep selected ID for success message context if needed
+        setCancellationForm({ reason: '', bookAnother: null, wantsRefund: null });
+        setCancellationStep(1);
+      } catch (err) {
+        console.error("Cancellation error:", err);
+        showToast("Failed to submit request.", "error");
+      } finally {
+        setIsSubmittingCancellation(false);
+      }
+    };
     
+    const hasActiveEnrollments = bookings.some(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+
+    const getActiveTutors = () => {
+      const uniqueTutors = new Map();
+      bookings
+        .filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status))
+        .forEach(b => {
+          if (!uniqueTutors.has(b.tutorId)) {
+            uniqueTutors.set(b.tutorId, { id: b.tutorId, name: b.tutorName });
+          }
+        });
+      return Array.from(uniqueTutors.values());
+    };
+
+    const activeTutors = getActiveTutors();
+
+    // Auto-update status after 24 hours logic
+    useEffect(() => {
+      const checkAutoApprovals = async () => {
+        const now = Date.now();
+        const pending = bookings.filter(b => b.status === 'pending_cancellation' && b.cancellationRequestedAt);
+        
+        for (const b of pending) {
+          const reqDate = b.cancellationRequestedAt?.toDate ? b.cancellationRequestedAt.toDate() : new Date(b.cancellationRequestedAt);
+          const hoursPassed = (now - reqDate.getTime()) / (1000 * 60 * 60);
+          
+          if (hoursPassed >= 24 && b.cancellationAdminStatus !== 'rejected') {
+            await updateDoc(doc(db, 'bookings', b.id), {
+              status: 'cancelled',
+              cancellationAdminStatus: 'approved',
+              completedAt: serverTimestamp()
+            });
+          }
+        }
+      };
+
+      if (bookings.length > 0) checkAutoApprovals();
+    }, [bookings]);
+
     const filteredBookings = bookings.filter(b => {
-      // Default 'all' view shows all active bookings + past classes? 
-      // User says "all here inside show all". I'll show everything here.
+      if (b.deletedByStudent && !justDeletedIds.includes(b.id)) return false;
+      
+      // Default 'all' view shows all
       if (tab === 'all') return true; 
       
       // 'confirmed' -> after booking slot of student then if tutor conform means show here
@@ -936,18 +1089,19 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
     });
 
     return (
+      <>
       <div className="space-y-12">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 md:gap-8">
           <motion.div 
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="flex bg-primary/5 p-1 rounded-xl md:p-1.5 md:rounded-2xl w-full sm:w-fit overflow-x-auto no-scrollbar"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            className="flex items-center gap-2 p-1 bg-primary/5 rounded-2xl w-full sm:w-auto overflow-x-auto scrollbar-hide"
           >
             {[
-              { id: 'all', label: 'All' },
-              { id: 'confirmed', label: 'Confirmed' },
+              { id: 'all', label: 'All Classes' },
+              { id: 'confirmed', label: 'Upcoming' },
               { id: 'completed', label: 'Completed' },
-              { id: 'not_conducted', label: 'Not Attend/Not Conduct' }
+              { id: 'not_conducted', label: 'Not Conducted' }
             ].map(t => (
               <button 
                 key={t.id}
@@ -958,36 +1112,325 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
               </button>
             ))}
           </motion.div>
+
+          {hasActiveEnrollments && (
+            <motion.button 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => {
+                setIsCancellationModalOpen(true);
+                setCancellationStep(1);
+                setCancellationSubmitted(false);
+                setSelectedBookingId('');
+              }}
+              className="px-8 py-4 bg-rose-50 text-rose-600 rounded-[1.5rem] text-[11px] font-black uppercase tracking-widest border border-rose-100 flex items-center justify-center gap-3 hover:bg-rose-600 hover:text-white transition-all shadow-xl shadow-rose-500/5 group"
+            >
+              <div className="p-1.5 rounded-lg bg-rose-100 text-rose-600 group-hover:bg-white/20 group-hover:text-white transition-colors">
+                <X size={14} />
+              </div>
+              Class Cancellation Request
+            </motion.button>
+          )}
+
         </div>
 
-        {tab === 'completed' && (
+
+
+        {isCancellationModalOpen ? (
           <motion.div 
-            initial={{ opacity: 0, y: 10 }}
+            initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="bg-primary/5 border border-primary/10 rounded-2xl p-6 md:p-8 flex items-center justify-between gap-6"
+            className="bg-white rounded-[2.5rem] p-8 md:p-12 border border-primary/5 shadow-2xl relative overflow-hidden"
           >
-            <div>
-              <h3 className="text-lg md:text-xl font-bold font-serif italic mb-1">Course Progress</h3>
-              <p className="text-[10px] md:text-xs text-primary/50 font-bold uppercase tracking-widest">Attendance Tracking</p>
+            {/* Background Decor */}
+            <div className="absolute top-0 right-0 w-64 h-64 bg-primary/5 rounded-full -mr-32 -mt-32 blur-3xl opacity-50"></div>
+            
+            <div className="flex items-center justify-between mb-10 relative z-10">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-rose-50 flex items-center justify-center text-rose-500 shadow-inner">
+                  <XCircle size={24} />
+                </div>
+                <div>
+                  <h3 className="text-2xl font-serif font-bold italic tracking-tight">Class Cancellation Request</h3>
+                  <p className="text-[10px] font-bold text-primary/30 uppercase tracking-widest mt-1">Please provide the details for your request</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => {
+                  setIsCancellationModalOpen(false);
+                  setCancellationStep(1);
+                  setCancellationForm({ reason: '', bookAnother: null, wantsRefund: null });
+                  setSelectedBookingId('');
+                }}
+                className="px-6 py-2.5 bg-slate-50 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-100 transition-all border border-slate-100"
+              >
+                Back to Sessions
+              </button>
             </div>
-            <div className="flex items-end gap-3 text-primary">
-              <span className="text-3xl md:text-5xl font-black">{bookings.filter(b => (b.attendance_status === 'attended' || b.status === 'completed') && b.tutorJoined && b.studentJoined && b.topic && (b.durationConducted === undefined || b.durationConducted >= 10)).length}</span>
-              <span className="text-lg md:text-xl font-bold mb-1 md:mb-2 opacity-50">/ {currentUser?.totalSessions || 30}</span>
-              <span className="text-[10px] md:text-xs font-bold mb-2 md:mb-3 opacity-50 uppercase tracking-widest ml-2">Sessions Ended</span>
+
+            <div className="space-y-8 relative z-10">
+              {cancellationSubmitted ? (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="flex flex-col items-center justify-center py-20 text-center"
+                >
+                  <div className="w-24 h-24 bg-emerald-50 rounded-[2.5rem] flex items-center justify-center text-emerald-500 mb-8 shadow-inner animate-bounce-slow">
+                    <CheckCircle size={48} />
+                  </div>
+                  <h4 className="text-3xl font-serif font-black italic text-slate-800 mb-4 tracking-tight">Request Received!</h4>
+                  <p className="max-w-md text-slate-500 font-bold leading-relaxed mb-10">
+                    Your cancellation request has been logged. Our administrative team will review it and process your refund/re-booking within the next 24 hours.
+                  </p>
+                  <button 
+                    onClick={() => {
+                      setCancellationSubmitted(false);
+                      setIsCancellationModalOpen(false);
+                      setSelectedBookingId('');
+                    }}
+                    className="px-10 py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-105 active:scale-95 transition-all shadow-2xl shadow-slate-900/20"
+                  >
+                    Return to Dashboard
+                  </button>
+                </motion.div>
+              ) : cancellationStep === 1 && (
+                <div className="space-y-12">
+                  <div className="space-y-4">
+                    <h3 className="text-3xl font-black text-slate-900 tracking-tight leading-tight">
+                      Why you want to cancel classes?
+                    </h3>
+                    <p className="text-slate-400 font-bold text-xs uppercase tracking-[0.2em] opacity-60">Step 1: Select Tutor & Provide Reason</p>
+                  </div>
+
+                  <div className="space-y-8">
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Select the tutor:</p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {activeTutors.map((tutor) => (
+                          <button
+                            key={tutor.id}
+                            onClick={() => setSelectedBookingId(tutor.id)}
+                            className={cn(
+                              "p-6 rounded-[2rem] border-2 transition-all flex items-center gap-4 text-left group relative overflow-hidden",
+                              selectedBookingId === tutor.id 
+                                ? "border-primary bg-primary/5 shadow-xl ring-1 ring-primary/20" 
+                                : "border-slate-100 bg-slate-50/50 hover:border-primary/20"
+                            )}
+                          >
+                            <Avatar initials={tutor.name.charAt(0)} size="md" />
+                            <div>
+                              <p className={cn("text-[9px] font-black uppercase tracking-widest", selectedBookingId === tutor.id ? "text-primary" : "text-slate-400")}>Active Tutor</p>
+                              <h4 className="font-bold text-base text-slate-800">{tutor.name}</h4>
+                            </div>
+                            {selectedBookingId === tutor.id && (
+                              <div className="absolute top-4 right-4 w-6 h-6 rounded-full bg-primary flex items-center justify-center text-white">
+                                <Check size={14} />
+                              </div>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Reason for cancellation:</p>
+                      <textarea 
+                        className="w-full bg-slate-50 border-2 border-slate-100 rounded-[2rem] px-8 py-6 focus:ring-4 ring-primary/10 focus:border-primary focus:bg-white outline-none text-base font-bold h-40 resize-none shadow-inner transition-all"
+                        placeholder="Please explain why you want to cancel these classes..."
+                        value={cancellationForm.reason}
+                        onChange={(e) => setCancellationForm({...cancellationForm, reason: e.target.value})}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col items-center gap-4">
+                    <button 
+                      onClick={() => {
+                        if (cancellationForm.reason.trim().length < 10) {
+                          setCancellationError("Please provide a more detailed reason (min 10 chars).");
+                          return;
+                        }
+                        setCancellationStep(2);
+                      }}
+                      disabled={!selectedBookingId || !cancellationForm.reason.trim()}
+                      className="w-full max-w-md h-16 bg-primary text-white font-black rounded-2xl text-[10px] uppercase tracking-widest shadow-2xl shadow-primary/30 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50"
+                    >
+                      Next Step <ArrowRight size={14} className="inline ml-2" />
+                    </button>
+                    {cancellationError && <p className="text-rose-500 text-[10px] font-black uppercase tracking-widest">{cancellationError}</p>}
+                  </div>
+                </div>
+              )}
+
+              {cancellationStep === 2 && (
+                <div className="space-y-10 py-4 max-w-2xl mx-auto">
+                  <div className="space-y-6">
+                    <div className="flex items-center gap-3 mb-2">
+                       <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
+                          <RefreshCw size={16} />
+                       </div>
+                       <label className="text-xs font-black uppercase tracking-widest text-slate-800">Choose Preference</label>
+                    </div>
+
+                    <div className="space-y-8">
+                      {(() => {
+                        const selectedTutorId = selectedBookingId;
+                        const tutorBookings = bookings.filter(b => b.tutorId === selectedTutorId && ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+                        if (tutorBookings.length === 0) return null;
+
+                        const firstBooking = tutorBookings[0];
+                        const bookingDate = new Date(firstBooking.createdAt?.toMillis ? firstBooking.createdAt.toMillis() : (firstBooking.createdAt || firstBooking.date));
+                        const now = new Date();
+                        const daysSinceEnrollment = (now.getTime() - bookingDate.getTime()) / (1000 * 60 * 60 * 24);
+                        
+                        const isFreePlan = currentUser.subscription?.tier === 'free';
+                        const isBefore3Days = daysSinceEnrollment < 3;
+                        const isPolicyEligible = !(isFreePlan && !isBefore3Days);
+
+                        return (
+                          <div className="space-y-8">
+                            {!isPolicyEligible && (
+                              <motion.div 
+                                initial={{ opacity: 0, y: -10 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                className="p-5 bg-amber-50 rounded-[2rem] border border-amber-100 flex items-start gap-4"
+                              >
+                                <AlertCircle size={20} className="text-amber-600 shrink-0 mt-1" />
+                                <div className="space-y-1">
+                                  <p className="text-[10px] font-black text-amber-600 uppercase tracking-widest">Policy Restriction</p>
+                                  <p className="text-[11px] font-bold text-amber-700/80 leading-relaxed">
+                                    Notice: Free plan users are not eligible for refunds or re-allocations after 3 days of enrollment.
+                                  </p>
+                                </div>
+                              </motion.div>
+                            )}
+
+                            <div className="space-y-4">
+                              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Would you like to book another tutor?</p>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                {[
+                                  { id: 'yes', label: 'Yes, Find New Tutor', icon: <Users size={16} />, disabled: !isPolicyEligible },
+                                  { id: 'no', label: 'No, Just Cancel', icon: <XCircle size={16} />, disabled: false }
+                                ].map((opt) => (
+                                  <button
+                                    key={opt.id}
+                                    disabled={opt.disabled}
+                                    onClick={() => setCancellationForm({ ...cancellationForm, bookAnother: opt.id as any })}
+                                    className={cn(
+                                      "h-16 px-6 rounded-2xl border-2 font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3",
+                                      cancellationForm.bookAnother === opt.id 
+                                        ? "bg-slate-900 border-slate-900 text-white shadow-xl shadow-slate-900/20" 
+                                        : "border-slate-100 text-slate-400 hover:border-slate-200",
+                                      opt.disabled && "opacity-30 cursor-not-allowed"
+                                    )}
+                                  >
+                                    {opt.icon} {opt.label}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <AnimatePresence>
+                              {cancellationForm.bookAnother === 'no' && (
+                                <motion.div 
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: 10 }}
+                                  className="space-y-4"
+                                >
+                                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Request refund to wallet?</p>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    {[
+                                      { id: 'yes', label: 'Request Refund', icon: <DollarSign size={16} />, disabled: !isPolicyEligible },
+                                      { id: 'no', label: 'No Refund', icon: <Minus size={16} />, disabled: false }
+                                    ].map((opt) => (
+                                      <button
+                                        key={opt.id}
+                                        disabled={opt.disabled}
+                                        onClick={() => setCancellationForm({ ...cancellationForm, wantsRefund: opt.id as any })}
+                                        className={cn(
+                                          "h-16 px-6 rounded-2xl border-2 transition-all font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-3",
+                                          cancellationForm.wantsRefund === opt.id 
+                                            ? "border-emerald-500 bg-emerald-500 text-white shadow-xl shadow-emerald-500/20" 
+                                            : "border-slate-100 text-slate-400 hover:border-emerald-300",
+                                          opt.disabled && "opacity-30 cursor-not-allowed"
+                                        )}
+                                      >
+                                        {opt.icon} {opt.label}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+
+                  <div className="flex gap-4 pt-8">
+                    <button 
+                      onClick={() => setCancellationStep(1)}
+                      className="flex-1 h-16 border-2 border-slate-100 text-slate-400 font-black rounded-2xl text-[10px] uppercase tracking-widest hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+                    >
+                      <ArrowLeft size={14} /> Back
+                    </button>
+                    <button 
+                      onClick={handleCancellationSubmit}
+                      disabled={isSubmittingCancellation || !cancellationForm.bookAnother || (cancellationForm.bookAnother === 'no' && !cancellationForm.wantsRefund)}
+                      className="flex-[2] h-16 bg-slate-900 text-white font-black rounded-2xl text-[10px] uppercase tracking-widest shadow-2xl shadow-slate-900/20 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-3"
+                    >
+                      {isSubmittingCancellation ? <RefreshCw className="animate-spin" size={14} /> : "Submit Final Request"}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </motion.div>
-        )}
-
-        <div className="space-y-4 md:space-y-6">
+        ) : (
+          <div className="space-y-4 md:space-y-6">
           {filteredBookings.length > 0 ? filteredBookings.map((booking, i) => (
             <motion.div 
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: i * 0.05 }}
               key={booking.id} 
-              className="course-card p-4 md:p-6 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-10"
+              className="course-card p-4 md:p-6 flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-10 relative overflow-hidden"
             >
-              <div className="flex items-center gap-4 md:gap-8 min-w-[240px]">
+              <AnimatePresence mode="wait">
+                {justDeletedIds.includes(booking.id) ? (
+                  <motion.div 
+                    key="deleted-message"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0 }}
+                    className="absolute inset-0 bg-emerald-50/90 backdrop-blur-sm flex items-center justify-center z-20"
+                  >
+                    <div className="flex items-center gap-3 text-emerald-600">
+                      <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center">
+                        <Check size={16} />
+                      </div>
+                      <span className="text-[11px] font-black uppercase tracking-[0.2em]">Session deleted successfully!</span>
+                    </div>
+                  </motion.div>
+                ) : (
+                  <React.Fragment>
+                    {/* Delete Icon */}
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteBooking(booking.id);
+                      }}
+                      className="absolute top-4 right-4 p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all z-10"
+                      title="Remove from history"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+
+                    <div className="flex items-center gap-4 md:gap-8 min-w-[240px]">
                 <Avatar 
                   src={((tutors || []).find(t => t.id === booking.tutorId) || MOCK_TUTORS.find(t => t.id === booking.tutorId))?.avatar || ''} 
                   size="md" 
@@ -1040,15 +1483,9 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
 
               <div className="flex flex-col items-end gap-3 md:min-w-[220px] border-t md:border-t-0 border-primary/5 pt-4 md:pt-0">
                 <div className="flex items-center gap-2">
-                  <span className={`px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest ${
-                    booking.status === 'confirmed' ? 'bg-emerald-50 text-emerald-600' :
-                    booking.status === 'pending' ? 'bg-amber-50 text-amber-600' :
-                    booking.status === 'completed' ? 'bg-primary/5 text-primary/40' :
-                    booking.isRescheduled || booking.status === 'rescheduled' ? 'bg-blue-50 text-blue-600' :
-                    'bg-rose-50 text-rose-600'
-                  }`}>
+                  <Badge variant={booking.status}>
                     {booking.isRescheduled || booking.status === 'rescheduled' ? 'Rescheduled' : booking.status}
-                  </span>
+                  </Badge>
                   
                     {booking.attendance_status === 'attended' ? (
                       <span className="px-4 py-1.5 rounded-full text-[8px] font-bold uppercase tracking-widest bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center gap-1.5">
@@ -1072,108 +1509,6 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                        <Clock size={10} /> {booking.durationConducted} mins conducted
                        {booking.talkingTime && <span>• {Math.round(booking.talkingTime / 60)} mins interaction</span>}
                     </div>
-                  )}
-
-                  {booking.isSubscription && (
-                    <div className="w-full flex flex-col gap-2">
-                      <div className="p-3 bg-primary/5 rounded-xl border border-primary/10 w-full">
-                        <div className="flex flex-col gap-2">
-                          <div className="flex items-center justify-between">
-                             <div className="flex items-center gap-2">
-                                <RefreshCw size={12} className={cn("text-primary", booking.subscriptionStatus === 'active' ? "animate-spin-slow" : "")} />
-                                <span className="text-[9px] font-black uppercase tracking-widest text-primary/60">Subscription Active</span>
-                             </div>
-                          </div>
-                          {booking.nextBillingDate && (
-                             <div className="flex items-center justify-between border-t border-primary/5 mt-2 pt-2">
-                               <span className="text-[8px] font-bold text-primary/30 uppercase">Next Bill</span>
-                               <span className="text-[9px] font-black text-accent uppercase">{
-                                 booking.nextBillingDate.seconds 
-                                   ? new Date(booking.nextBillingDate.seconds * 1000).toLocaleDateString()
-                                   : new Date(booking.nextBillingDate).toLocaleDateString()
-                               }</span>
-                             </div>
-                          )}
-                        </div>
-                      </div>
-                      {(() => {
-                        const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
-                        if (!paidAt) return null;
-
-                        const now = new Date();
-                        const startDay = paidAt.getDate();
-                        const currentDay = now.getDate();
-                        
-                        const daysUntilRenewal = (startDay - currentDay + 31) % 31;
-                        const isDue = daysUntilRenewal >= 1 && daysUntilRenewal <= 3;
-                        const isExpired = booking.subscriptionStatus === 'expired';
-
-                        if (booking.subscriptionStatus === 'active' && isDue) {
-                          return (
-                            <div className="flex flex-col gap-1 px-3 py-2 border-l-2 border-amber-500 bg-amber-50 rounded-r-lg">
-                              <div className="flex items-center gap-2">
-                                <Bell size={10} className="text-amber-600 animate-bounce" />
-                                <span className="text-[8px] font-black text-amber-700 uppercase leading-tight">Renewal Due: {new Date(now.getFullYear(), now.getMonth(), startDay).toLocaleDateString()}</span>
-                              </div>
-                            </div>
-                          );
-                        }
-                        
-                        if (isExpired) {
-                          return (
-                            <div className="flex items-center gap-2 px-3 py-2 border-l-2 border-rose-500 bg-rose-50 rounded-r-lg">
-                              <XCircle size={10} className="text-rose-600" />
-                              <span className="text-[8px] font-black text-rose-700 uppercase">Payment Pending</span>
-                            </div>
-                          );
-                        }
-
-                        return (
-                          <div className="flex items-center gap-2 px-3 py-1.5 border-l-2 border-emerald-500 bg-emerald-50 rounded-r-lg opacity-80">
-                            <CheckCircle size={10} className="text-emerald-500" />
-                            <span className="text-[8px] font-black text-emerald-700 uppercase">Verified</span>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  )}
-
-                <div className="flex items-center gap-2">
-                  {booking.status === 'pending' && (
-                    <button 
-                      onClick={async () => {
-                        try {
-                          await updateDoc(doc(db, 'bookings', booking.id), { status: 'cancelled' });
-                          alert('Session cancelled successfully');
-                        } catch (e) {
-                          console.error("Error cancelling booking:", e);
-                        }
-                      }}
-                      className="px-4 py-2 bg-rose-50 text-rose-500 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all"
-                    >
-                      Cancel
-                    </button>
-                  )}
-
-                  {booking.status === 'pending_cancellation' && (
-                    <span className="px-6 py-2 bg-amber-50 text-amber-600 rounded-xl text-[10px] font-black uppercase tracking-widest border border-amber-100 flex items-center gap-2">
-                       <RefreshCw size={14} className="animate-spin-slow" /> Cancellation Pending
-                    </span>
-                  )}
-
-                  {booking.type === 'paid' && 
-                   (booking.status === 'confirmed' || booking.status === 'rescheduled') && 
-                   (booking as any).paidAt && 
-                   (() => {
-                      const refund = calculateRefund(booking);
-                      return refund.eligible || booking.isSubscription;
-                   })() && (
-                    <button 
-                      onClick={() => { setCancelBooking(booking); setIsCancelModalOpen(true); }}
-                      className="px-6 py-2 bg-rose-50 text-rose-500 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-rose-600 hover:text-white transition-all border border-rose-100 shadow-sm"
-                    >
-                      Request Booking Cancellation
-                    </button>
                   )}
 
                   {(booking.status === 'confirmed' || booking.status === 'live') && (() => {
@@ -1207,22 +1542,9 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                     if ((isInJoinWindow || booking.status === 'live') && !isWayPastEnd) {
                       if (isSubscriptionExpired) {
                         return (
-                          <div className="flex flex-col gap-2 w-full sm:w-auto">
+                           <div className="flex flex-col gap-2 w-full sm:w-auto">
                             <button disabled className="px-6 py-2 bg-slate-100 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest cursor-not-allowed border border-slate-200 opacity-70">
                               <Lock size={14} className="mr-1.5 inline" /> Payment Pending
-                            </button>
-                            <button 
-                              onClick={async () => {
-                                if (confirm('Are you sure you want to permanently cancel this expired subscription?')) {
-                                  try {
-                                    await updateDoc(doc(db, 'bookings', booking.id), { status: 'cancelled' });
-                                    alert('Subscription permanently cancelled.');
-                                  } catch (e) { console.error(e); }
-                                }
-                              }}
-                              className="text-[9px] font-black text-rose-500 uppercase tracking-widest hover:text-rose-600 transition-colors flex items-center justify-center gap-1.5"
-                            >
-                              <XCircle size={12} /> Permanently Cancel
                             </button>
                           </div>
                         );
@@ -1251,41 +1573,36 @@ const MyBookingsView = ({ bookings, setBookings, openChat, onReschedule, setView
                     );
                   })()}
 
-                   {(booking.status === 'confirmed' || booking.status === 'pending') && (() => {
-                    const now = new Date();
-                    const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                    const isToday = booking.date === todayStr || booking.date === isoToday;
-                    const sessionMins = parseTime(booking.time);
-                    const nowMins = now.getHours() * 60 + now.getMinutes();
-
-                    const hasStarted = isToday && nowMins >= sessionMins;
-                    const isPast = !isToday && new Date(booking.date) < new Date(isoToday);
-
-                    if (hasStarted || isPast) return null;
-                    
-                    return (
-                      <button 
-                        onClick={() => onReschedule(booking)}
-                        className="w-10 h-10 rounded-full bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-background transition-all"
-                        title="Reschedule"
-                      >
-                        <Calendar size={16} />
-                      </button>
-                    );
-                  })()}
+                  <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto justify-center">
+                    <button 
+                      onClick={() => onReschedule(booking)}
+                      className="px-6 py-3 rounded-xl bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-white transition-all border border-primary/10 font-bold text-[10px] uppercase tracking-widest"
+                      title="Reschedule"
+                    >
+                      <Calendar size={14} className="mr-2" /> Reschedule
+                    </button>
+                    {(booking.status as any) === 'pending_cancellation' && (
+                      <div className="px-6 py-3 rounded-xl bg-amber-50 text-amber-600 border border-amber-100 font-bold text-[10px] uppercase tracking-widest flex items-center gap-2">
+                        <RefreshCw size={12} className="animate-spin-slow" /> Cancellation Pending
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            </motion.div>
-          )) : (
-            <div className="text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10">
+              </React.Fragment>
+            )}
+          </AnimatePresence>
+        </motion.div>
+      )) : (
+            <div className="text-center py-20 bg-white/20 rounded-[3rem] border border-dashed border-primary/10 w-full">
               <p className="text-primary/30 font-bold uppercase tracking-widest text-xs">No sessions found in {tab} view</p>
             </div>
           )}
         </div>
-      </div>
-    );
-  };
+      )}
+    </div>
+    </>
+  );
+};
 
 const LoginView = ({ setView, setCurrentUser }: { 
   setView: (view: View) => void, 
@@ -1337,10 +1654,23 @@ const LoginView = ({ setView, setCurrentUser }: {
       // View transition is handled by onAuthStateChanged listener at the top of the file
     } catch (err: any) {
       console.error("⛔ Student Auth Failure:", err.code || err.message);
-      if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
-        setError("Invalid email or password.");
-      } else {
-        setError(err.message || "An unexpected error occurred during login.");
+      switch (err.code) {
+        case 'auth/user-not-found':
+        case 'auth/wrong-password':
+        case 'auth/invalid-credential':
+          setError("❌ Invalid email or password. Please try again.");
+          break;
+        case 'auth/too-many-requests':
+          setError("⚠️ Too many failed attempts. Please try again later.");
+          break;
+        case 'auth/network-request-failed':
+          setError("🌐 Network error. Please check your internet connection.");
+          break;
+        case 'auth/user-disabled':
+          setError("🚫 Your account has been disabled.");
+          break;
+        default:
+          setError(err.message || "⚠️ An unexpected error occurred. Please try again.");
       }
     } finally {
       setIsLoggingIn(false);
@@ -1529,6 +1859,7 @@ const RegisterView = ({ setView, setCurrentUser }: {
         studentType: formData.studentType,
         status: 'EMAIL_NOT_VERIFIED',
         email_verified: false,
+        walletBalance: 0,
         createdAt: serverTimestamp(),
         notifications: { reminders: true, messages: true, updates: true }
       };
@@ -2206,6 +2537,225 @@ const RegisterView = ({ setView, setCurrentUser }: {
 
   return <ItemsContainer />;
 };
+
+const ProjectsView = ({ currentUser, bookings, currentTier, setView }: { currentUser: StudentProfile | null, bookings: Booking[], currentTier: string, setView: (view: View) => void }) => {
+  const [projects, setProjects] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
+  const [viewingDoc, setViewingDoc] = useState<any>(null);
+  const [zoomScale, setZoomScale] = useState(1);
+
+  // Enrolled subjects for filtering
+  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => b.subject.toLowerCase())));
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const q = query(collection(db, 'projects'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const allProjects = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const profileClass = normalize(currentUser.class);
+      const bookingClasses = Array.from(new Set(bookings.map(b => normalize(b.studentClass || b.class || ''))));
+      const studentClasses = Array.from(new Set([profileClass, ...bookingClasses].filter(Boolean)));
+      const normalizedEnrolled = enrolledSubjects.map(normalize);
+
+      const filtered = allProjects.filter((p: any) => {
+        const target = p.targetClass || p.class || '';
+        const normTarget = normalize(target);
+        const extractNumber = (s: string) => { const m = s.match(/\d+/); return m ? m[0] : null; };
+        const targetNum = extractNumber(normTarget);
+
+        const matchesClass = !target || normTarget === 'all' || normTarget === 'any' || 
+                           studentClasses.some(c => c === normTarget) ||
+                           (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
+                           (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget)) ||
+                           (targetNum && studentClasses.some(c => extractNumber(c) === targetNum));
+        
+        const matchesSubject = enrolledSubjects.length === 0 || 
+                             !p.subject || normalize(p.subject) === 'all' || normalize(p.subject) === 'any' ||
+                             normalizedEnrolled.includes(normalize(p.subject)) ||
+                             normalizedEnrolled.some(enrolled => normalize(p.subject).includes(enrolled) || enrolled.includes(normalize(p.subject)));
+        
+        return matchesClass && matchesSubject;
+      });
+      setProjects(filtered);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser?.id, currentUser?.class, enrolledSubjects.join(',')]);
+
+  if (loading) return <div className="p-20 text-center"><RefreshCw className="animate-spin inline text-primary" size={32} /></div>;
+
+  const uniqueDates = Array.from(new Set(projects.map(i => formatDateLabel(i.createdAt)).filter(Boolean)));
+  const uniqueTopics = Array.from(new Set(projects.map(i => i.topic).filter(Boolean)));
+
+  const filtered = projects.filter(n => {
+    const dMatch = !selectedDate || formatDateLabel(n.createdAt) === selectedDate;
+    const tMatch = !selectedTopic || n.topic === selectedTopic;
+    return dMatch && tMatch;
+  });
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 md:px-8 space-y-12 pb-20 overflow-x-hidden">
+      <div className="flex flex-col md:flex-row items-center justify-between gap-6 mb-4 mt-2">
+        <div>
+          <h2 className="text-xl md:text-3xl font-black tracking-tighter">Advanced Project Guidance</h2>
+          <p className="text-xs font-bold text-primary/40 mt-0.5">Hands-on industry project support for Elite Scholars.</p>
+        </div>
+        <div className="bg-secondary/5 px-5 py-3 rounded-xl flex items-center gap-3 border border-secondary/10 shadow-sm">
+          <Briefcase className="text-secondary w-4 h-4" />
+          <div>
+            <p className="text-[9px] font-bold text-secondary/40 uppercase tracking-widest">Portal Status</p>
+            <p className="font-bold text-xs tracking-tight text-secondary">Active Guidance</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="flex items-center gap-3 overflow-x-auto pb-6 scrollbar-hide">
+        <button 
+          onClick={() => setSelectedDate(null)}
+          className={cn(
+            "px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+            selectedDate === null ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40 hover:border-primary/20 shadow-sm"
+          )}
+        >
+          All Projects
+        </button>
+        {uniqueDates.map(date => (
+          <button 
+            key={date}
+            onClick={() => setSelectedDate(date)}
+            className={cn(
+              "px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+              selectedDate === date ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40 hover:border-primary/20 shadow-sm"
+            )}
+          >
+            {date}
+          </button>
+        ))}
+      </div>
+
+      {uniqueTopics.length > 0 && (
+         <div className="flex items-center gap-2 overflow-x-auto pb-4">
+            {uniqueTopics.map(topic => (
+              <button 
+                key={topic}
+                onClick={() => setSelectedTopic(selectedTopic === topic ? null : topic)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider transition-all whitespace-nowrap border",
+                  selectedTopic === topic ? "bg-secondary text-white border-secondary" : "bg-secondary/5 text-secondary border-secondary/10"
+                )}
+              >
+                {topic}
+              </button>
+            ))}
+         </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {filtered.length === 0 ? (
+          <div className="col-span-full py-20 text-center bg-white/40 rounded-[3rem] border border-dashed border-primary/10">
+            <Briefcase size={32} className="mx-auto text-primary/10 mb-4" />
+            <p className="text-[10px] font-bold uppercase tracking-widest text-primary/30">No project materials available yet</p>
+          </div>
+        ) : filtered.map(project => (
+          <motion.div 
+            key={project.id} 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="p-6 bg-white rounded-[2.5rem] border border-black/5 hover:shadow-2xl transition-all group flex flex-col h-full"
+          >
+            <div className="flex items-start justify-between">
+              <div className="w-14 h-14 bg-secondary/5 rounded-[1.5rem] flex items-center justify-center text-secondary group-hover:scale-110 transition-transform overflow-hidden border border-secondary/10">
+                 {project.fileType?.startsWith('image/') ? (
+                   <img src={project.fileData} className="w-full h-full object-cover" alt="" />
+                 ) : (
+                   <Briefcase size={28} />
+                 )}
+              </div>
+              <div className="px-3 py-1 bg-slate-50 rounded-full border border-black/5">
+                <span className="text-[8px] font-black uppercase text-secondary/40 tracking-tighter">
+                   {project.fileType?.split('/')[1]?.toUpperCase() || 'DOC'}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-8 flex-1">
+              <h4 className="font-bold text-lg leading-snug group-hover:text-secondary transition-colors line-clamp-2">{project.fileName}</h4>
+              <div className="flex items-center gap-2 mt-2">
+                 {project.topic && <span className="bg-secondary/5 text-secondary text-[8px] font-black px-1.5 py-0.5 rounded uppercase border border-secondary/10">{project.topic}</span>}
+                 <span className="text-[10px] font-black uppercase tracking-[0.15em] text-primary/30">{project.subject}</span>
+                 <span className="w-1 h-1 bg-primary/20 rounded-full" />
+                 <span className="text-[10px] font-bold text-primary/40">By {project.tutorName}</span>
+              </div>
+            </div>
+
+            <div className="mt-8 pt-6 border-t border-black/5 flex flex-col gap-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <button 
+                    onClick={() => setViewingDoc(project)}
+                    className="py-4 bg-secondary/5 hover:bg-secondary text-secondary hover:text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-secondary/10"
+                  >
+                     <Eye size={16} /> View
+                  </button>
+                  <a 
+                    href={project.fileData} 
+                    download={project.fileName}
+                    className="py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 shadow-xl shadow-slate-900/10 hover:scale-[1.02]"
+                  >
+                     <Download size={16} /> Save
+                  </a>
+                </div>
+             </div>
+          </motion.div>
+        ))}
+      </div>
+
+      {/* FULL SCREEN VIEWER */}
+      <AnimatePresence>
+        {viewingDoc && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black">
+             <motion.div 
+               initial={{ opacity: 0 }}
+               animate={{ opacity: 1 }}
+               exit={{ opacity: 0 }}
+               className="relative w-full h-full flex flex-col items-center justify-center"
+             >
+                <button onClick={() => setViewingDoc(null)} className="fixed top-4 right-4 z-[110] bg-white/5 hover:bg-white/10 backdrop-blur-md p-2.5 rounded-full text-white/70 hover:text-white transition-all border border-white/10">
+                   <X size={20} />
+                </button>
+
+                <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[110] flex items-center gap-2 bg-white/10 backdrop-blur-xl px-4 py-2 rounded-2xl border border-white/10 shadow-2xl">
+                   <button onClick={() => setZoomScale(prev => Math.max(0.1, prev - 0.1))} className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"><Minus size={20} /></button>
+                   <div className="w-12 text-center"><span className="text-white font-black text-[10px] uppercase tracking-widest">{Math.round(zoomScale * 100)}%</span></div>
+                   <button onClick={() => setZoomScale(prev => Math.min(3, prev + 0.1))} className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"><Plus size={20} /></button>
+                </div>
+
+                <div className="flex-1 w-full h-full bg-[#0a0a0b] overflow-auto custom-scrollbar flex items-center justify-center p-2">
+                   <motion.div animate={{ scale: zoomScale }} transition={{ type: "spring", stiffness: 300, damping: 30 }} className="origin-center flex items-center justify-center">
+                      {viewingDoc.fileType?.startsWith('image/') ? (
+                        <img src={viewingDoc.fileData} className="max-w-[96vw] max-h-[96vh] object-contain shadow-2xl rounded-md" alt={viewingDoc.fileName} />
+                      ) : (
+                        <div className="w-[96vw] h-[96vh] bg-white rounded-md shadow-2xl overflow-hidden">
+                           <iframe src={`${viewingDoc.fileData}#toolbar=0&view=FitH`} className="w-full h-full border-none" title="Project Viewer" />
+                        </div>
+                      )}
+                   </motion.div>
+                </div>
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
 
 function ForgotPasswordView({ setView }: { setView: (view: View) => void }) {
     const [email, setEmail] = useState('');
@@ -4619,6 +5169,21 @@ export default function App() {
   const [isUpdatingGateUpi, setIsUpdatingGateUpi] = useState(false);
 
   const openBookingModal = (type: 'demo' | 'paid') => {
+    // 🛡️ PLAN SUBJECT LIMIT CHECK
+    if (currentUser && type === 'paid') {
+      const activeBookings = bookings.filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+      const currentSubjects = new Set(activeBookings.map(b => b.subject));
+      const allowedSubjects = currentUser.subscription?.allowedSubjects || 1;
+      
+      // If student is trying to book a NEW subject and is at the limit
+      if (selectedTutor && !currentSubjects.has(selectedTutor.subjects[0]) && currentSubjects.size >= allowedSubjects) {
+        const tierName = currentUser.subscription?.tier === 'free' ? 'Explorer (Free)' : currentUser.subscription?.tier === 'standard' ? 'Scholar (Standard)' : 'Elite (Premium)';
+        showToast(`You have reached the ${allowedSubjects} subject limit for your ${tierName} plan. Please upgrade your plan to choose multiple subjects.`, "info");
+        setView('settings'); // Redirect to plans/settings
+        return;
+      }
+    }
+
     setBookingType(type);
     setBookingSelectedSubject('');
     setBookingSelectedDate('');
@@ -4854,9 +5419,9 @@ export default function App() {
   const [selectedTutor, setSelectedTutor] = useState<Tutor|null>(null);
   const [tutors, setTutors] = useState<Tutor[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
-  const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
+  const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
 
-  const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 4000);
   };
@@ -5017,6 +5582,7 @@ export default function App() {
   const [bookingPlan, setBookingPlan] = useState<string>('');
   const [bookingSelectedDate, setBookingSelectedDate] = useState<string>('');
   const [bookingSelectedSubject, setBookingSelectedSubject] = useState<string>('');
+  const [useWalletCredit, setUseWalletCredit] = useState(true);
   const [bookingSelectedTime, setBookingSelectedTime] = useState<string>('');
   const [bookingDuration, setBookingDuration] = useState('');
   const [bookingType, setBookingType] = useState<'demo' | 'paid'>('paid');
@@ -5247,12 +5813,13 @@ export default function App() {
 
           // 0. AUTO-MARK PAST DAYS: If the booking date is before today, mark as not attended
           if (!isToday) {
-            // Parse booking date to compare
             const bookingDate = new Date(b.date);
             const todayDate = new Date(isoToday);
             if (bookingDate < todayDate && !isNaN(bookingDate.getTime())) {
               const bRef = doc(db, 'bookings', b.id);
-              if (b.studentPresent && b.tutorPresent && b.topic && b.talkingTime >= 60) {
+              
+              // Only mark as attended if both were present for at least 15 mins
+              if (b.studentJoined && b.tutorPresent && b.topic && (b.talkingTime || 0) >= 900) {
                 await updateDoc(bRef, { 
                   status: 'completed', 
                   attendance_status: 'attended',
@@ -5260,12 +5827,14 @@ export default function App() {
                   completedAt: serverTimestamp() 
                 });
               } else {
+                // If not attended, check if it was tutor or student who missed
+                const status = b.tutorPresent ? 'not_attended' : 'not_conducted';
                 await updateDoc(bRef, { 
-                  status: 'cancelled', 
-                  attendance_status: 'not_attended' 
+                  status: 'completed', 
+                  attendance_status: status 
                 });
               }
-              return; // Skip further checks for past-day bookings
+              return; 
             }
           }
 
@@ -5300,13 +5869,21 @@ export default function App() {
           // 1b. Completion/Not-Attended Logic (after class end time)
           if (isToday && nowMins > (bMins + durationMins)) {
             const bRef = doc(db, 'bookings', b.id);
-            // Require 10 minutes (600s) of interaction and successful join
-            if (b.studentJoined && b.tutorPresent && b.topic && (b.talkingTime || 0) >= 600) {
+            // Require 15 minutes (900s) of interaction and successful join
+            if (b.studentJoined && b.tutorPresent && b.topic && (b.talkingTime || 0) >= 900) {
               await updateDoc(bRef, { 
                 status: 'completed', 
                 attendance_status: 'attended',
                 attendedCount: increment(1),
                 completedAt: serverTimestamp() 
+              });
+            } else {
+              // Mark as not attended or not conducted
+              const status = b.tutorPresent ? 'not_attended' : 'not_conducted';
+              await updateDoc(bRef, { 
+                status: 'completed', 
+                attendance_status: status,
+                completedAt: serverTimestamp()
               });
             }
           }
@@ -5667,7 +6244,7 @@ export default function App() {
           
           await updateDoc(bookingRef, {
             [`participantData.${emailKey}.leaveTime`]: serverTimestamp(),
-            [`participantData.${emailKey}.status`]: duration >= 12 ? 'attended' : 'not_attended',
+            [`participantData.${emailKey}.status`]: duration >= 15 ? 'attended' : 'not_attended',
             studentPresent: false
           });
         } else {
@@ -5677,7 +6254,7 @@ export default function App() {
           await updateDoc(bookingRef, {
             studentPresent: false,
             studentLeaveTime: serverTimestamp(),
-            attendance_status: (duration >= 10 && bookingData.tutorJoined) ? 'attended' : 'not_attended'
+            attendance_status: (duration >= 15 && bookingData.tutorJoined) ? 'attended' : 'not_attended'
           });
         }
       } catch (e) {
@@ -5733,7 +6310,9 @@ export default function App() {
       text,
       timestamp: serverTimestamp()
     });
-  };  const openChat = async (tutorId: string) => {
+  };
+
+  const openChat = async (tutorId: string) => {
     if (!currentUser?.email) return;
 
     const studentEmailKey = currentUser.email.replace(/\./g, '_');
@@ -5774,29 +6353,23 @@ export default function App() {
     setActiveChatId(chatId);
     setView('chat');
   };
+
   const processPayment = async (upiOption: string) => {
     if (!selectedTutor || !bookingFormData) return;
     
     setPaymentStatus('processing');
     
-    // 1. Calculate amount (using centralized getBookingAmount helper)
+    // 1. Calculate amount
     const grossAmount = getBookingAmount();
-    let amountStr = grossAmount.toString();
-
-    let finalAmount = parseFloat(amountStr);
     const walletFunds = currentUser?.walletBalance || 0;
-    const useWallet = walletFunds > 0;
+    const isWalletUsed = useWalletCredit && walletFunds > 0;
     
-    if (useWallet) {
-      if (walletFunds >= finalAmount) {
-        // Fully covered by wallet
-        finalAmount = 0;
-      } else {
-        finalAmount -= walletFunds;
-      }
+    let finalPayable = grossAmount;
+    if (isWalletUsed) {
+      finalPayable = Math.max(0, grossAmount - walletFunds);
     }
 
-    if (finalAmount === 0) {
+    if (finalPayable === 0) {
       setPaymentStatus('success');
       confirmBookingAfterPayment('wallet_pay_id', 'wallet_order_id', grossAmount);
       return;
@@ -5810,17 +6383,12 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          amount: finalAmount,
+          amount: finalPayable,
           receipt: `rcpt_${bookingFormData.id}`,
           notes: {
             bookingId: bookingFormData.id,
-            studentId: currentUser?.id,
-            studentEmail: currentUser?.email,
-            subject: bookingFormData.subject,
-            tutorId: selectedTutor.id,
-            tutorName: selectedTutor.name,
-            plan: bookingFormData.plan,
-            type: bookingFormData.type
+            walletUsed: isWalletUsed,
+            walletDeducted: Math.min(walletFunds, grossAmount)
           }
         })
       });
@@ -5833,23 +6401,16 @@ export default function App() {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID, 
         amount: orderData.amount,
         currency: orderData.currency,
-        name: "Eduqra",
-        description: `${getSubjectName(bookingFormData.subject)} with ${selectedTutor.name}`,
-        // image: "/logo.png", // Disabled to avoid CORS error on localhost
+        name: "Eduqra Scholar",
+        description: `Enrollment: ${getSubjectName(bookingFormData.subject)}`,
         order_id: orderData.orderId,
         handler: async function (response: any) {
-          console.log("✅ Payment Successful:", response.razorpay_payment_id);
-          setPaymentData({ 
-            paymentId: response.razorpay_payment_id, 
-            orderId: response.razorpay_order_id, 
-            status: 'success' 
-          });
           setPaymentStatus('success');
-      await confirmBookingAfterPayment(
-        response.razorpay_payment_id, 
-        response.razorpay_order_id, 
-        grossAmount
-      );
+          await confirmBookingAfterPayment(
+            response.razorpay_payment_id, 
+            response.razorpay_order_id, 
+            grossAmount
+          );
         },
         prefill: {
           name: currentUser?.name || "",
@@ -5868,7 +6429,7 @@ export default function App() {
     } catch (err: any) {
       console.error('❌ Payment Error:', err);
       setPaymentStatus('cancelled');
-      showToast("Payment initialization failed: " + err.message, "error");
+      showToast("Payment failed: " + err.message, "error");
     }
   };
 
@@ -5880,9 +6441,9 @@ export default function App() {
     nextBilling.setDate(nextBilling.getDate() + 30);
 
     try {
-      const isWalletUsed = paymentId === 'wallet_pay_id';
       const walletFunds = currentUser?.walletBalance || 0;
-      const appliedWalletAmount = isWalletUsed ? amount : Math.min(walletFunds, amount + walletFunds); // This is simplified
+      const isWalletUsed = useWalletCredit && walletFunds > 0;
+      const walletDeducted = isWalletUsed ? Math.min(walletFunds, amount) : 0;
 
       await updateDoc(doc(db, 'bookings', bookingFormData.id), {
         status: 'pending',
@@ -5893,17 +6454,16 @@ export default function App() {
         isSubscription: isSub,
         subscriptionStatus: isSub ? 'active' : null,
         nextBillingDate: isSub ? nextBilling : null,
-        walletUsed: appliedWalletAmount > 0,
-        walletAmount: appliedWalletAmount,
+        walletUsed: isWalletUsed,
+        walletAmount: walletDeducted,
         tierAtBooking: currentUser?.subscription?.tier || 'free'
       });
 
-      // Deduct from student wallet if used
-      if (currentUser?.id && walletFunds > 0) {
-        const deduction = isWalletUsed ? amount : walletFunds; 
+      if (isWalletUsed && currentUser?.id) {
         await updateDoc(doc(db, 'students', currentUser.id), {
-          walletBalance: increment(-Math.min(deduction, walletFunds))
+          walletBalance: increment(-walletDeducted)
         });
+        setCurrentUser(prev => prev ? { ...prev, walletBalance: prev.walletBalance! - walletDeducted } : null);
       }
 
       const hostname = window.location.hostname;
@@ -5940,8 +6500,13 @@ export default function App() {
         read: false,
         timestamp: serverTimestamp()
       });
+
+      showToast("Booking Successful!", "success");
+      setIsPaymentModalOpen(false);
+      setView('my-bookings');
     } catch (e) {
-      console.error("Firestore Update Error:", e);
+      console.error(e);
+      showToast("Error finalising booking: " + e, "error");
     }
   };
 
@@ -6086,6 +6651,12 @@ export default function App() {
     const timer = setInterval(() => setCurrentSystemTime(new Date()), 60000);
     return () => clearInterval(timer);
   }, []);
+
+
+
+
+
+
 
   // --- REAL-TIME TUTOR SYNC FOR BOOKING ---
   const [activeTutorDoc, setActiveTutorDoc] = useState<any>(null);
@@ -6733,144 +7304,14 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
 
 
 
-  const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
-  const [cancelBooking, setCancelBooking] = useState<Booking | null>(null);
-  const [isCancelling, setIsCancelling] = useState(false);
-  const [cancelReason, setCancelReason] = useState('');
-  const [wantsNewTutor, setWantsNewTutor] = useState(false);
 
-  const calculateRefund = (booking: Booking) => {
-    if (!booking.amount) return { eligible: false, refundAmount: 0, reason: "No payment found" };
 
-    const platformFeeRate = 0.17;
-    const totalAmount = booking.amount;
-    const platformFee = totalAmount * platformFeeRate;
-    const originalAmount = totalAmount - platformFee;
-    
-    // Calculate days since payment
-    const paidAt = (booking as any).paidAt?.toDate ? (booking as any).paidAt.toDate() : (booking.paidAt ? new Date(booking.paidAt) : null);
-    if (!paidAt) return { eligible: false, refundAmount: 0, reason: "Payment date unknown" };
 
-    const now = new Date();
-    const diffTime = Math.abs(now.getTime() - paidAt.getTime());
-    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
 
-    // Get Tier - prioritize tierAtBooking if saved, else fallback to current user's tier
-    const tier = (booking as any).tierAtBooking || currentUser?.subscription?.tier || 'free';
-    const attendedClasses = (booking as any).attendedCount || 0;
 
-    let eligible = false;
-    let refundAmount = 0;
-    let reason = "";
-    let deductionType = "";
 
-    if (tier === 'free') {
-      if (diffDays <= 3) {
-        eligible = true;
-        refundAmount = originalAmount; // Refund base amount if within 3 days
-        reason = "Within 3-day window (Free Tier)";
-      } else {
-        eligible = false;
-        refundAmount = 0;
-        reason = "Refund window (3 days) expired for Free Tier.";
-      }
-    } else if (tier === 'standard' || tier === 'premium') {
-      if (diffDays <= 3 && attendedClasses <= 3) {
-        // First 3 days (after attending ≤3 classes)
-        // Rule: total paid amount minus (completed days cost + 3% deduction)
-        // completed days cost = originalAmount * (attended / totalDays) - assuming duration is total days
-        const totalDays = parseFloat(booking.duration || '1') * 30; // Assuming duration is months
-        const completedDaysCost = originalAmount * (attendedClasses / totalDays);
-        const deduction = totalAmount * 0.03;
-        refundAmount = totalAmount - completedDaysCost - deduction;
-        eligible = refundAmount > 0;
-        reason = "Early Cancellation window (≤3 days/classes)";
-        deductionType = "Pro-rated + 3% Fee";
-      } else if (diffDays > 3) {
-        // Last 10 days of the plan check
-        const totalDurationDays = 90; // 3 month plan
-        const daysLeft = totalDurationDays - diffDays;
 
-        if (daysLeft > 10) {
-          const refundPercent = tier === 'premium' ? 0.40 : 0.20;
-          refundAmount = originalAmount * refundPercent;
-          eligible = true;
-          reason = `Flat ${refundPercent * 100}% Refund (${tier.toUpperCase()} Tier)`;
-          deductionType = `Standard Tier Deduction`;
-        } else {
-          eligible = false;
-          refundAmount = 0;
-          reason = "No refund in the last 10 days of the plan.";
-        }
-      } else {
-        // Case where diffDays <= 3 but attended > 3 classes
-        const refundPercent = tier === 'premium' ? 0.40 : 0.20;
-        refundAmount = originalAmount * refundPercent;
-        eligible = true;
-        reason = `Flat ${refundPercent * 100}% Refund (Classes > 3)`;
-      }
-    }
 
-    return { 
-      eligible: eligible && refundAmount > 0, 
-      refundAmount: Math.max(0, Math.floor(refundAmount)),
-      reason,
-      breakdown: { 
-        platformFee: Math.floor(platformFee), 
-        originalAmount: Math.floor(originalAmount),
-        tutorShare: Math.floor(originalAmount * 0.5), // Standard 50% split assumption for display
-        diffDays, 
-        attendedClasses,
-        tier,
-        deductionType
-      }
-    };
-  };
-
-  const handleRequestCancellation = async () => {
-    if (!cancelBooking || !cancelReason) {
-      alert("Please provide a reason for cancellation.");
-      return;
-    }
-    setIsCancelling(true);
-    try {
-      await updateDoc(doc(db, 'bookings', cancelBooking.id), { 
-        status: 'pending_cancellation',
-        cancellationReason: cancelReason,
-        wantsNewTutor: wantsNewTutor,
-        cancellationRequestedAt: serverTimestamp()
-      });
-      // 1. Notify Admin
-      await addDoc(collection(db, 'admin_notifications'), {
-        type: 'Cancellation Request',
-        title: 'Booking Cancellation Requested',
-        message: `${currentUser?.name} has requested to cancel their session for ${getSubjectName(cancelBooking.subject)} with ${cancelBooking.tutorName}.`,
-        bookingId: cancelBooking.id,
-        time: serverTimestamp(),
-        read: false
-      });
-
-      // 2. Notify Tutor
-      await addDoc(collection(db, 'tutor_notifications'), {
-        tutorId: cancelBooking.tutorId,
-        type: 'update',
-        title: 'Cancellation Requested',
-        description: `${currentUser?.name} requested to cancel the ${getSubjectName(cancelBooking.subject)} session on ${cancelBooking.date}.`,
-        time: 'Just now',
-        read: false,
-        createdAt: serverTimestamp()
-      });
-
-      alert('Your booking cancellation request has been submitted. We will review it and notify you soon.');
-      setIsCancelModalOpen(false);
-      setCancelBooking(null);
-    } catch (e) {
-      console.error("Error submitting cancellation:", e);
-      alert('Failed to submit cancellation request. Please try again.');
-    } finally {
-      setIsCancelling(false);
-    }
-  };
 
   // --- Core Lifecycle ---
   const renderView = () => {
@@ -7025,9 +7466,8 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
             startSession={startSession}
             parseTime={parseTime}
             currentUser={currentUser}
-            setCancelBooking={setCancelBooking}
-            setIsCancelModalOpen={setIsCancelModalOpen}
-            calculateRefund={calculateRefund}
+
+            showToast={showToast}
           />
         );
       case 'chat':
@@ -7124,13 +7564,8 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
             </div>
           );
         }
-        return (
-          <div className="p-10 text-center">
-            <Briefcase size={48} className="mx-auto mb-4 text-primary" />
-            <h2 className="text-2xl font-serif font-bold">Advanced Projects</h2>
-            <p className="text-sm text-primary/40 mt-2">Academic & Industry project guidance portal is active.</p>
-          </div>
-        );
+        return <ProjectsView currentUser={currentUser} bookings={bookings} currentTier={currentTier} setView={setView} />;
+
       case 'settings':
         return <SettingsView 
           setView={setView} 
@@ -7215,7 +7650,30 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
               />
             )}
             
-            {renderView()}
+            <div className="relative flex-1 flex flex-col min-h-0">
+              {renderView()}
+              
+              <AnimatePresence>
+                {toast && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -20, scale: 0.9 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.9, y: -20 }}
+                    className={cn(
+                      "absolute top-4 right-4 z-[100] px-6 py-3 rounded-full shadow-2xl font-black text-[10px] uppercase tracking-widest flex items-center gap-3 border transition-all whitespace-nowrap",
+                      toast.type === 'error' ? "bg-rose-500 text-white border-rose-400" : 
+                      toast.type === 'info' ? "bg-blue-500 text-white border-blue-400" :
+                      "bg-primary text-white border-primary/20"
+                    )}
+                  >
+                    {toast.type === 'error' ? <AlertTriangle size={16} /> : 
+                     toast.type === 'info' ? <Info size={16} /> :
+                     <CheckCircle size={16} />}
+                    {toast.message}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
           </main>
         </div>
       </div>
@@ -7596,12 +8054,34 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                 {(() => {
                   const amt = getBookingAmount();
                   const walletFunds = currentUser?.walletBalance || 0;
-                  return Math.max(0, amt - walletFunds).toFixed(2);
+                  return Math.max(0, amt - (useWalletCredit ? walletFunds : 0)).toFixed(2);
                 })()}
               </div>
               <p className="text-[10px] font-bold text-primary/40 mt-1">{currentUser?.email || 'student@scholar.com'}</p>
             </div>
           </div>
+
+          {currentUser?.walletBalance && currentUser.walletBalance > 0 && (
+            <div className="p-4 bg-emerald-50/50 rounded-2xl border border-emerald-100 flex items-center justify-between group transition-all hover:bg-emerald-50">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-emerald-100 rounded-xl flex items-center justify-center text-emerald-600">
+                  <Wallet size={20} />
+                </div>
+                <div>
+                  <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">Available Credit</p>
+                  <p className="text-sm font-black text-emerald-900">₹{currentUser.walletBalance}</p>
+                </div>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setUseWalletCredit(!useWalletCredit)}
+                disabled={paymentStatus === 'processing' || paymentStatus === 'success'}
+                className={`px-6 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${useWalletCredit ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20' : 'bg-white text-emerald-600 border border-emerald-200 hover:border-emerald-400'}`}
+              >
+                {useWalletCredit ? 'Applied' : 'Apply Credit'}
+              </button>
+            </div>
+          )}
 
           <div className="space-y-4">
             <p className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Pay Using UPI</p>
@@ -8137,130 +8617,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
         </div>
       </Modal>
       {/* Cancellation Modal */}
-      <AnimatePresence>
-        {isCancelModalOpen && cancelBooking && (
-          <div className="fixed inset-0 z-[500] bg-black/80 backdrop-blur-xl flex items-center justify-center p-4">
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.9, y: 30 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.9, y: 30 }}
-              className="bg-white rounded-[3rem] w-full max-w-lg p-8 md:p-12 shadow-2xl overflow-hidden relative"
-            >
-              <div className="absolute top-0 right-0 w-32 h-32 bg-rose-50 rounded-full -mr-16 -mt-16 opacity-50" />
-              
-              <div className="text-center relative z-10">
-                <div className="w-20 h-20 bg-rose-100 rounded-[2rem] flex items-center justify-center mx-auto mb-8">
-                  <AlertTriangle size={36} className="text-rose-600" />
-                </div>
-                <h3 className="text-3xl font-serif font-black italic text-slate-900 mb-4 tracking-tight">Cancel This Booking?</h3>
-                
-                <div className="space-y-6 mb-8 text-left">
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Reason for Cancellation</label>
-                    <select 
-                      className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-4 px-6 outline-none focus:ring-2 focus:ring-primary/20 transition-all font-bold text-sm"
-                      value={cancelReason}
-                      onChange={(e) => setCancelReason(e.target.value)}
-                    >
-                      <option value="">Select a reason...</option>
-                      <option value="Schedule Conflict">Schedule Conflict</option>
-                      <option value="Tutor Not Suitable">Tutor Not Suitable</option>
-                      <option value="Subject Changed">Subject Changed</option>
-                      <option value="Personal Reasons">Personal Reasons</option>
-                      <option value="Other">Other</option>
-                    </select>
-                  </div>
 
-                  <div className="flex items-center justify-between p-6 bg-primary/5 rounded-2xl border border-primary/10">
-                    <div>
-                      <h4 className="text-sm font-black text-primary tracking-tight">Book a different tutor?</h4>
-                      <p className="text-[10px] font-bold text-primary/40 uppercase tracking-widest mt-1">We'll add refund to your wallet</p>
-                    </div>
-                    <button 
-                      onClick={() => setWantsNewTutor(!wantsNewTutor)}
-                      className={cn(
-                        "w-12 h-6 rounded-full transition-all relative",
-                        wantsNewTutor ? "bg-primary" : "bg-slate-200"
-                      )}
-                    >
-                      <motion.div 
-                        animate={{ x: wantsNewTutor ? 24 : 4 }}
-                        className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
-                      />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Refund Information */}
-                <div className="bg-slate-50 rounded-[2rem] p-8 mb-10 border border-slate-100 text-left">
-                  <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-6 flex items-center gap-2">
-                    <DollarSign size={14} className="text-primary" /> Refund Eligibility Preview
-                  </h4>
-                  <p className="text-[9px] font-black text-rose-500 uppercase tracking-widest mb-4 italic opacity-60">
-                    * Cancellation requests are subject to admin approval
-                  </p>
-                  
-                  {(() => {
-                    const { eligible, refundAmount, reason, breakdown } = calculateRefund(cancelBooking);
-                    if (!eligible) return (
-                      <div className="space-y-3">
-                        <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-xl border border-rose-100 italic">
-                        {reason}
-                        </p>
-                        <p className="text-[9px] font-medium text-slate-400 leading-relaxed italic">
-                          * As per our policy, cancellations after 15 days or usage of more than 50% of the course duration are not eligible for a refund.
-                        </p>
-                      </div>
-                    );
-
-                    return (
-                      <div className="space-y-6">
-                        <div className="flex items-center justify-between text-slate-600">
-                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Course Amount</span>
-                          <span className="font-extrabold">₹{cancelBooking.amount}</span>
-                        </div>
-                        <div className="flex items-center justify-between text-slate-600">
-                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Platform Fee (17%)</span>
-                          <span className="font-extrabold text-rose-500">- ₹{breakdown?.platformFee}</span>
-                        </div>
-                        <div className="flex items-center justify-between text-slate-600">
-                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">Tutor Share (50%)</span>
-                          <span className="font-extrabold text-rose-500">- ₹{breakdown?.tutorShare}</span>
-                        </div>
-                        <div className="h-px bg-slate-200 border-dashed border-t" />
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-black text-slate-900">Estimated Refund</span>
-                          <span className="text-2xl font-serif font-black italic text-emerald-600">₹{refundAmount}</span>
-                        </div>
-                        <p className="text-[9px] font-medium text-slate-400 leading-relaxed flex items-start gap-2 pt-2 border-t border-slate-100 mt-4">
-                           <Check size={12} className="text-emerald-500 shrink-0" />
-                           Refunds are subject to final admin verification and approval.
-                        </p>
-                      </div>
-                    );
-                  })()}
-                </div>
-
-                <div className="space-y-4">
-                  <button 
-                    disabled={isCancelling}
-                    onClick={handleRequestCancellation}
-                    className="w-full bg-rose-600 text-white font-black py-5 rounded-[1.5rem] shadow-xl shadow-rose-600/20 hover:scale-[1.02] active:scale-95 transition-all uppercase text-xs tracking-widest flex items-center justify-center gap-3 disabled:opacity-50"
-                  >
-                    {isCancelling ? 'Submitting Request...' : 'Yes, Request Cancellation'}
-                  </button>
-                  <button 
-                    onClick={() => { setIsCancelModalOpen(false); setCancelBooking(null); }}
-                    className="w-full bg-slate-100 text-slate-600 font-black py-5 rounded-[1.5rem] hover:bg-slate-200 transition-all uppercase text-xs tracking-widest"
-                  >
-                    No, Keep Booking
-                  </button>
-                </div>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
 
       {/* 🔐 MANDATORY UPI ID GATE MODAL */}
       <AnimatePresence>
@@ -8336,22 +8693,6 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
         )}
       </AnimatePresence>
 
-      <AnimatePresence>
-        {toast && (
-          <motion.div
-            initial={{ opacity: 0, y: 50, scale: 0.9 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.9, y: 20 }}
-            className={cn(
-              "fixed bottom-10 left-1/2 -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl font-black text-[10px] uppercase tracking-widest flex items-center gap-3 border transition-all",
-              toast.type === 'error' ? "bg-rose-500 text-white border-rose-400" : "bg-primary text-white border-primary/20"
-            )}
-          >
-            {toast.type === 'error' ? <AlertTriangle size={16} /> : <CheckCircle size={16} />}
-            {toast.message}
-          </motion.div>
-        )}
-      </AnimatePresence>
     </>
   );
 }
@@ -8490,8 +8831,6 @@ function ChatView({
     { icon: FileText, label: 'Document', color: 'bg-indigo-500 text-white' },
     { icon: ImageIcon, label: 'Gallery', color: 'bg-emerald-500 text-white' },
     { icon: Camera, label: 'Camera', color: 'bg-rose-500 text-white' },
-    { icon: Mic, label: 'Voice Note', color: 'bg-blue-500 text-white' },
-    { icon: BarChart2, label: 'Poll', color: 'bg-amber-500 text-white' },
   ];
 
   const galleryInputRef = useRef<HTMLInputElement>(null);
@@ -8946,10 +9285,6 @@ function ChatView({
                                     galleryInputRef.current?.click();
                                   } else if (opt.label === 'Camera') {
                                     cameraInputRef.current?.click();
-                                  } else if (opt.label === 'Voice Note') {
-                                    alert('Voice Recording starting... (Simulated)');
-                                  } else if (opt.label === 'Poll') {
-                                    setIsPollModalOpen(true);
                                   }
                                 }}
                                 className={cn(
@@ -9039,7 +9374,7 @@ function ChatView({
                     <input 
                       type="file" 
                       accept="image/*" 
-                      capture="environment" 
+                      capture 
                       ref={cameraInputRef} 
                       className="hidden" 
                       onChange={async (e) => {
@@ -9089,7 +9424,7 @@ function ChatView({
                         (drafts[activeChatId || ''] || '').trim() ? 'text-primary hover:bg-primary/10' : 'text-primary/30'
                       )}
                     >
-                      {(drafts[activeChatId || ''] || '').trim() ? <Send size={22} /> : <Mic size={22} />}
+                      {(drafts[activeChatId || ''] || '').trim() ? <Send size={22} /> : <Send size={22} className="opacity-20" />}
                     </button>
                   </div>
                 </div>
@@ -9475,7 +9810,7 @@ const PaymentsView = ({ bookings, onPay, currentUser }: {
                           "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[9px] font-black uppercase tracking-widest border",
                           txn.status === 'completed' || txn.status === 'confirmed' || txn.status === 'live'
                             ? "bg-emerald-50 text-emerald-600 border-emerald-100" 
-                            : txn.status === 'pending' || txn.status === 'pending_cancellation'
+                            : txn.status === 'pending'
                             ? "bg-amber-50 text-amber-600 border-amber-100"
                             : txn.status === 'unpaid'
                             ? "bg-rose-50 text-rose-600 border-rose-100"
