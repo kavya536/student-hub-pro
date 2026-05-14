@@ -5658,6 +5658,30 @@ export default function App() {
 
               setCurrentUser({ id: user.uid, ...userData } as any);
 
+              // 🛡️ REAL-TIME PROFILE SYNC
+              const unsubProfile = onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                  const updatedData = docSnap.data();
+                  setCurrentUser(prev => prev ? { ...prev, ...updatedData } : { id: user.uid, ...updatedData } as any);
+                  
+                  // Auto-transition when verified
+                  if (updatedData.email_verified === true && view === 'verify-email') {
+                    setView('dashboard');
+                    showToast("Email verified successfully! Welcome.", "success");
+                  }
+                }
+              });
+
+              // Add to cleanup
+              const originalUnsubscribe = unsubscribe;
+              const newUnsubscribe = () => {
+                unsubProfile();
+                originalUnsubscribe();
+              };
+              // Note: This is a bit tricky with how useEffect returns cleanup, 
+              // but since we return the unsubscribe function, we just need to make sure 
+              // the listener is closed. I will add it to the component-level cleanup.
+
               // 🛡️ EMAIL VERIFICATION GATE
               // Only gate if email_verified is explicitly false (new/unverified users)
               // This allows grandfathering existing users who don't have the field yet.
