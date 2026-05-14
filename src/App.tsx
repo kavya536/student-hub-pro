@@ -5622,17 +5622,17 @@ export default function App() {
           await updateDoc(studentRef, { email_verified: true, status: 'active' });
           await updateDoc(userRef, { email_verified: true, status: 'active' });
           
-          showToast("Account verified successfully! Please login.", "success");
+          showToast("Email verified! Please log in to access your dashboard.", "success");
           
           // Clear URL params
           window.history.replaceState({}, '', window.location.pathname);
           
-          // Always redirect to login after verification link click
-          signOut(auth).then(() => {
-            localStorage.clear();
-            setCurrentUser(null);
-            setView('login');
-          });
+          // Always redirect to login after verification
+          await signOut(auth);
+          localStorage.removeItem('student_user');
+          localStorage.setItem('student_logged_in', 'false');
+          setCurrentUser(null);
+          setView('login');
         } catch (err) {
           console.error("Verification failed:", err);
           showToast("Verification link invalid or expired.", "error");
@@ -5704,14 +5704,10 @@ export default function App() {
                   const updatedData = docSnap.data();
                   setCurrentUser(prev => prev ? { ...prev, ...updatedData } : { id: user.uid, ...updatedData } as any);
                   
-                  // Show toast when verified
+                  // Auto-transition when verified
                   if (updatedData.email_verified === true && view === 'verify-email') {
-                    showToast("Email verified! Please login to continue.", "success");
-                    signOut(auth).then(() => {
-                      localStorage.clear();
-                      setCurrentUser(null);
-                      setView('login');
-                    });
+                    setView('dashboard');
+                    showToast("Email verified successfully! Welcome.", "success");
                   }
                 }
               });
