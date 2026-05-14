@@ -1983,13 +1983,21 @@ const RegisterView = ({ setView, setCurrentUser }: {
 
       setView('dashboard');
       
-      // Notify Backend to send Welcome Email
+      // 📧 Send Verification & Welcome Emails via GAS Bridge (Bypassing Backend)
       try {
-        sendPlatformEmail(
+        const verifyLink = `${window.location.origin}/?verify=true&uid=${uid}`;
+        
+        await sendPlatformEmail(
+          { name: formData.name, email: formData.email }, 
+          'student_verify',
+          { verifyLink }
+        );
+
+        await sendPlatformEmail(
           { name: formData.name, email: formData.email }, 
           'student_register'
         );
-      } catch(e) { console.warn("Welcome email error:", e) }
+      } catch(e) { console.warn("Email dispatch error:", e) }
     } catch (err: any) {
       console.error("Student Registration Error:", err);
       if (err.code === 'permission-denied') {
@@ -5600,7 +5608,36 @@ export default function App() {
         window.location.reload();
       });
     }
-  }, []);
+
+    // 🔐 DIRECT FRONTEND VERIFICATION (Bypasses Backend)
+    const verifyToken = urlParams.get('verify');
+    const verifyUid = urlParams.get('uid');
+    if (verifyToken && verifyUid) {
+      const performVerification = async () => {
+        try {
+          const studentRef = doc(db, 'students', verifyUid);
+          const userRef = doc(db, 'users', verifyUid);
+          
+          await updateDoc(studentRef, { email_verified: true, status: 'active' });
+          await updateDoc(userRef, { email_verified: true, status: 'active' });
+          
+          showToast("Account verified successfully! Welcome.", "success");
+          
+          // Clear URL params
+          window.history.replaceState({}, '', window.location.pathname);
+          
+          // If already logged in as this user, view will update via snapshot
+          if (currentUser?.id !== verifyUid) {
+            setView('login');
+          }
+        } catch (err) {
+          console.error("Verification failed:", err);
+          showToast("Verification link invalid or expired.", "error");
+        }
+      };
+      performVerification();
+    }
+  }, [currentUser?.id]);
 
   const markNotifRead = async (id: string) => {
     setNotifications(notifications.map(n => n.id === id ? { ...n, read: true } : n));
@@ -5824,27 +5861,18 @@ export default function App() {
   const handleResendVerification = async () => {
     if (!currentUser?.email) return;
     try {
-      const hostname = window.location.hostname;
-      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || `http://${hostname}:5001`;
-      const response = await fetch(`${backendBaseUrl}/api/auth/send-verification`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          email: currentUser.email,
-          name: currentUser.name,
-          role: 'student'
-        })
-      });
-      if (response.ok) {
-        showToast("Resend link sent to your mail");
-      } else {
-        const errorData = await response.json().catch(() => ({}));
-        showToast(`Failed to resend: ${errorData.message || 'Server error'}`, 'error');
-      }
+      const verifyLink = `${window.location.origin}/?verify=true&uid=${currentUser.id}`;
+      
+      await sendPlatformEmail(
+        { name: currentUser.name, email: currentUser.email }, 
+        'student_verify',
+        { verifyLink }
+      );
+      
+      showToast("Resend link sent to your mail");
     } catch (err) {
       console.error("Resend error:", err);
-      showToast("Connection error: Could not reach verification server.", "error");
+      showToast("Connection error: Could not reach email bridge.", "error");
     }
   };
 

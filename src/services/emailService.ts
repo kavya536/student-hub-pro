@@ -4,8 +4,8 @@
  */
 export const sendPlatformEmail = async (
   payload: { name: string; email: string }, 
-  type: 'approve' | 'reject' | 'tutor_register' | 'student_register' | 'booking_confirm', 
-  details?: { reason?: string; tutorName?: string; timing?: string; subject?: string }
+  type: 'approve' | 'reject' | 'tutor_register' | 'student_register' | 'booking_confirm' | 'student_verify', 
+  details?: { reason?: string; tutorName?: string; timing?: string; subject?: string; verifyLink?: string }
 ) => {
   if (!payload.email) return;
 
@@ -40,6 +40,33 @@ export const sendPlatformEmail = async (
             </div>
             
             <p style="font-size: 14px; color: #94a3b8; margin-top: 30px; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 25px;">Eduqra Learning Services • Your Future, Personalized</p>
+          </div>
+        </div>
+      </div>
+    `;
+  } else if (type === 'student_verify') {
+    subject = "🔐 Verify Your Eduqra Account – Final Step";
+    html = `
+      <div style="${containerStyle}">
+        <div style="${cardStyle}">
+          <div style="background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); padding: 35px; text-align: center;">
+            <h1 style="${h1Style}">Verify Your Email</h1>
+          </div>
+          <div style="${bodyStyle}">
+            <p style="font-size: 16px; color: #1e293b; margin-bottom: 20px;">Hello <strong>${payload.name}</strong>,</p>
+            <p style="font-size: 15px; color: #475569; line-height: 1.8;">
+              Welcome to Eduqra! To complete your registration and secure your account, please verify your email address by clicking the button below:
+            </p>
+            
+            <div style="margin: 35px 0; text-align: center;">
+              <a href="${details?.verifyLink}" style="display: inline-block; background: #4f46e5; color: #ffffff; padding: 18px 40px; border-radius: 12px; font-weight: 800; text-decoration: none; box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);">Verify Email Address</a>
+            </div>
+            
+            <div style="background-color: #f0f7ff; border-radius: 12px; padding: 20px; margin-top: 30px;">
+              <p style="margin: 0; color: #1e40af; font-size: 12px; font-weight: 600;">🔒 Security Note: This link is for your use only and ensures your account remains secure.</p>
+            </div>
+
+            <p style="font-size: 14px; color: #94a3b8; margin-top: 30px; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 25px;">Eduqra Security Layer • Your Safety, Our Priority</p>
           </div>
         </div>
       </div>
