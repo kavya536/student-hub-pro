@@ -5622,15 +5622,17 @@ export default function App() {
           await updateDoc(studentRef, { email_verified: true, status: 'active' });
           await updateDoc(userRef, { email_verified: true, status: 'active' });
           
-          showToast("Account verified successfully! Welcome.", "success");
+          showToast("Account verified successfully! Please login.", "success");
           
           // Clear URL params
           window.history.replaceState({}, '', window.location.pathname);
           
-          // If already logged in as this user, view will update via snapshot
-          if (currentUser?.id !== verifyUid) {
+          // Always redirect to login after verification link click
+          signOut(auth).then(() => {
+            localStorage.clear();
+            setCurrentUser(null);
             setView('login');
-          }
+          });
         } catch (err) {
           console.error("Verification failed:", err);
           showToast("Verification link invalid or expired.", "error");
@@ -5702,10 +5704,14 @@ export default function App() {
                   const updatedData = docSnap.data();
                   setCurrentUser(prev => prev ? { ...prev, ...updatedData } : { id: user.uid, ...updatedData } as any);
                   
-                  // Auto-transition when verified
+                  // Show toast when verified
                   if (updatedData.email_verified === true && view === 'verify-email') {
-                    setView('dashboard');
-                    showToast("Email verified successfully! Welcome.", "success");
+                    showToast("Email verified! Please login to continue.", "success");
+                    signOut(auth).then(() => {
+                      localStorage.clear();
+                      setCurrentUser(null);
+                      setView('login');
+                    });
                   }
                 }
               });
