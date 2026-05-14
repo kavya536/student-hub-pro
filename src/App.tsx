@@ -96,7 +96,8 @@ import {
   signInWithRedirect,
   getRedirectResult
 } from 'firebase/auth';
-import { onSnapshot, collection, query, where, doc, setDoc, addDoc, getDoc, updateDoc, serverTimestamp, getDocs, deleteDoc, orderBy, increment, arrayUnion, limit } from 'firebase/firestore';
+import { onSnapshot, collection, query, where, or, doc, setDoc, addDoc, getDoc, updateDoc, serverTimestamp, getDocs, deleteDoc, orderBy, increment, arrayUnion, limit, Timestamp } from 'firebase/firestore';
+import * as PricingEngine from './services/pricingService';
 
 // Helper to format Firestore timestamp safely
 const formatTime = (ts: any) => {
@@ -312,20 +313,32 @@ const formatDateLocal = (date: Date) => {
 const getEffectivePrice = (tutor: any) => {
   if (!tutor) return "0";
   
-  // 1. Priority: Base hourly rate (this is what students should see as 'starting at')
-  const baseRate = parseFloat(String(tutor.price || tutor.classPricing || '0')) || 0;
+  // 1. Priority: General Class Pricing (Starting Amount)
+  // The user requested this field to be the primary display price on the student side
+  const baseRate = parseFloat(String(tutor.classPricing || tutor.price || '0')) || 0;
   if (baseRate > 0) {
     return Math.ceil(baseRate * 1.17).toString();
   }
 
-  // 2. Fallback: First non-course subject pricing
+  // 2. Fallback: Check pricingEntries (the specific configuration)
+  if (Array.isArray(tutor.pricingEntries) && tutor.pricingEntries.length > 0) {
+    const hourlyPlan = tutor.pricingEntries.find((e: any) => e.type === 'hourly');
+    const firstEntry = hourlyPlan || tutor.pricingEntries[0];
+    const rate = firstEntry.hourlyRate || (firstEntry.baseAmount / 30) || 0;
+    if (rate > 0) {
+      return Math.ceil(rate * 1.17).toString();
+    }
+  }
+
+  // 3. Fallback: First non-course subject pricing in subjectsPricing
   if (Array.isArray(tutor.subjectsPricing) && tutor.subjectsPricing.length > 0) {
     const hourlyPlan = tutor.subjectsPricing.find((sp: any) => sp.type !== 'course');
     const firstPrice = parseFloat(String((hourlyPlan || tutor.subjectsPricing[0]).price || '0')) || 0;
-    return Math.ceil(firstPrice * 1.17).toString();
+    const rate = hourlyPlan ? (firstPrice / 30) : firstPrice; 
+    return Math.ceil(rate * 1.17).toString();
   }
 
-  return "188"; // Final safety fallback
+  return "188"; 
 };
 
 // Helper to notify tutors when a student changes plans
@@ -467,8 +480,9 @@ interface Booking {
   date: string;
   time: string;
   duration: string;
-  status: 'pending' | 'confirmed' | 'cancelled' | 'completed' | 'rescheduled' | 'unpaid' | 'live' | 'pending_cancellation';
+  status: 'pending' | 'confirmed' | 'cancelled' | 'completed' | 'rescheduled' | 'unpaid' | 'paid' | 'live' | 'pending_cancellation';
   studentReason?: string;
+  courseEndDate?: any;
   requestType?: string;
   isRescheduled?: boolean;
   attendance_status?: 'attended' | 'not_attended' | 'pending' | 'not_conducted';
@@ -504,6 +518,7 @@ interface Booking {
   type?: 'demo' | 'paid';
   createdAt?: any;
   isGroup?: boolean;
+  rescheduledDays?: Record<string, string>;
   maxParticipants?: number;
   participantCount?: number;
   participants?: string[];
@@ -988,37 +1003,67 @@ const MyBookingsView = ({
           const updateData = {
             status: 'pending_cancellation' as any,
             cancellationReason: cancellationForm.reason,
-            bookedAnotherTutor: isPolicyEligible ? (cancellationForm.bookAnother === 'yes') : false,
-            wantsRefund: isPolicyEligible ? (cancellationForm.wantsRefund === 'yes') : false,
+            bookedAnotherTutor: cancellationForm.bookAnother === 'yes',
+            wantsRefund: cancellationForm.wantsRefund === 'yes',
             cancellationRequestedAt: serverTimestamp(),
             cancellationAdminStatus: 'pending' as 'pending',
             isPolicyEligible,
-            cancelledTutorId: selectedTutorId
+            daysSinceEnrollment: Math.round(daysSinceEnrollment),
+            cancelledTutorId: selectedTutorId,
+            financialRule: daysSinceEnrollment < 3 ? '4_percent_wallet' : (daysSinceEnrollment < 10 ? '17_percent_upi' : 'standard')
           };
           return updateDoc(bookingRef, updateData);
         });
         
         await Promise.all(batchUpdates);
 
-        // Notify Admin
+        // 1. Notify Student (Passbook/Inbox)
+        await addDoc(collection(db, 'notifications'), {
+          studentId: currentUser.id,
+          title: 'Cancellation Request Logged',
+          message: `Your request to cancel classes with ${tutorBookings[0].tutorName} has been received. Our admin team will process this within 24 hours.`,
+          time: 'Just now',
+          type: 'update',
+          read: false,
+          createdAt: serverTimestamp()
+        });
+
+        // 2. Notify Tutor
+        await addDoc(collection(db, 'notifications'), {
+          tutorId: selectedTutorId,
+          title: 'Class Cancellation Notice',
+          message: `Student ${currentUser.name} has requested to cancel their classes. Reason: ${cancellationForm.reason}. Admin is reviewing the eligibility.`,
+          time: 'Just now',
+          type: 'booking',
+          read: false,
+          createdAt: serverTimestamp(),
+          isTutorNotif: true // Flag for tutor dashboard filtering
+        });
+
+        // 3. Notify Admin with Financial Instructions
+        const refundType = daysSinceEnrollment < 3 ? '3-Day Policy (4% Fee)' : (daysSinceEnrollment < 10 ? '10-Day Window (17% Fee)' : 'Standard Review');
+        const payoutRule = daysSinceEnrollment < 10 
+          ? `Tutor gets paid for completed days. Admin to deduct ${daysSinceEnrollment < 3 ? '4%' : '17%'} platform fee and send remainder to ${cancellationForm.bookAnother === 'yes' ? 'Student Wallet' : 'Student UPI'}.`
+          : 'Standard cancellation rules apply.';
+
         await addDoc(collection(db, 'admin_notifications'), {
           type: 'cancellation_request',
-          title: 'Class Cancellation Request',
-          message: `${currentUser.name} requested cancellation for tutor ${tutorBookings[0].tutorName}.`,
+          title: 'New Cancellation Request',
+          message: `${currentUser.name} (${currentUser.subscription?.tier}) wants to cancel ${tutorBookings[0].tutorName}.`,
           studentId: currentUser.id,
           tutorId: selectedTutorId,
           details: {
             ...cancellationForm,
-            isFreePlan,
-            isBefore3Days,
-            isPolicyEligible,
+            daysSinceEnrollment: Math.round(daysSinceEnrollment),
+            refundType,
+            payoutRule,
             requestTime: now.toISOString()
           },
           read: false,
           createdAt: serverTimestamp()
         });
 
-        showToast("Cancellation request submitted! You will get an update within 24 hours.", "success");
+        showToast("Request submitted! Checking eligibility & processing within 24 hours.", "success");
         setCancellationSubmitted(true);
         // Reset remaining state but keep selected ID for success message context if needed
         setCancellationForm({ reason: '', bookAnother: null, wantsRefund: null });
@@ -1031,12 +1076,28 @@ const MyBookingsView = ({
       }
     };
     
-    const hasActiveEnrollments = bookings.some(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+    const isEnrollmentActive = (booking: any) => {
+      // Must be a paid enrollment (not demo) and must NOT be in 'unpaid' status
+      if (booking.type !== 'paid' || booking.status === 'unpaid') return false;
+      
+      const bookingDate = new Date(booking.createdAt?.toMillis ? booking.createdAt.toMillis() : (booking.createdAt || booking.date));
+      const now = new Date();
+      
+      // Determine duration in days based on plan
+      let durationDays = 30; // Default 1 month
+      const planStr = (booking.plan || '').toLowerCase();
+      if (planStr.includes('3 month')) durationDays = 90;
+      else if (planStr.includes('6 month')) durationDays = 180;
+      else if (planStr.includes('1 month')) durationDays = 30;
+      
+      const expiryDate = new Date(bookingDate.getTime() + (durationDays * 24 * 60 * 60 * 1000));
+      return now <= expiryDate;
+    };
 
     const getActiveTutors = () => {
       const uniqueTutors = new Map();
       bookings
-        .filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status))
+        .filter(b => b.type !== 'demo' && isEnrollmentActive(b))
         .forEach(b => {
           if (!uniqueTutors.has(b.tutorId)) {
             uniqueTutors.set(b.tutorId, { id: b.tutorId, name: b.tutorName });
@@ -1044,6 +1105,8 @@ const MyBookingsView = ({
         });
       return Array.from(uniqueTutors.values());
     };
+
+    const hasActiveEnrollments = bookings.some(b => b.type !== 'demo' && isEnrollmentActive(b));
 
     const activeTutors = getActiveTutors();
 
@@ -1196,33 +1259,41 @@ const MyBookingsView = ({
                   </button>
                 </motion.div>
               ) : cancellationStep === 1 && (
-                <div className="space-y-12">
-                  <div className="space-y-4">
-                    <h3 className="text-3xl font-black text-slate-900 tracking-tight leading-tight">
+                <div className="space-y-10 max-w-4xl mx-auto">
+                  <div className="text-center space-y-4 mb-12">
+                    <h3 className="text-4xl font-black text-slate-900 tracking-tight leading-tight">
                       Why you want to cancel classes?
                     </h3>
                     <p className="text-slate-400 font-bold text-xs uppercase tracking-[0.2em] opacity-60">Step 1: Select Tutor & Provide Reason</p>
                   </div>
 
-                  <div className="space-y-8">
-                    <div className="space-y-4">
-                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Select the tutor:</p>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {activeTutors.map((tutor) => (
+                  <div className="space-y-10">
+                    <div className="space-y-5">
+                      <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest ml-1 flex items-center gap-2">
+                        <Users size={16} className="text-primary" /> Select Enrolled Tutor:
+                      </p>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {activeTutors.length === 0 ? (
+                          <div className="col-span-full p-10 bg-slate-50 rounded-[2rem] border-2 border-dashed border-slate-200 text-center">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">No active enrollments found for cancellation</p>
+                          </div>
+                        ) : activeTutors.map((tutor) => (
                           <button
                             key={tutor.id}
                             onClick={() => setSelectedBookingId(tutor.id)}
                             className={cn(
-                              "p-6 rounded-[2rem] border-2 transition-all flex items-center gap-4 text-left group relative overflow-hidden",
+                              "p-6 rounded-[2rem] border-2 transition-all flex items-center gap-4 text-left relative overflow-hidden group",
                               selectedBookingId === tutor.id 
                                 ? "border-primary bg-primary/5 shadow-xl ring-1 ring-primary/20" 
-                                : "border-slate-100 bg-slate-50/50 hover:border-primary/20"
+                                : "border-slate-100 bg-white hover:border-primary/20"
                             )}
                           >
                             <Avatar initials={tutor.name.charAt(0)} size="md" />
                             <div>
-                              <p className={cn("text-[9px] font-black uppercase tracking-widest", selectedBookingId === tutor.id ? "text-primary" : "text-slate-400")}>Active Tutor</p>
-                              <h4 className="font-bold text-base text-slate-800">{tutor.name}</h4>
+                              <p className={cn("text-[9px] font-black uppercase tracking-widest", selectedBookingId === tutor.id ? "text-primary" : "text-slate-400")}>
+                                Active Enrollment
+                              </p>
+                              <h4 className="font-bold text-lg text-slate-800">{tutor.name}</h4>
                             </div>
                             {selectedBookingId === tutor.id && (
                               <div className="absolute top-4 right-4 w-6 h-6 rounded-full bg-primary flex items-center justify-center text-white">
@@ -1234,10 +1305,12 @@ const MyBookingsView = ({
                       </div>
                     </div>
 
-                    <div className="space-y-4">
-                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Reason for cancellation:</p>
+                    <div className="space-y-5">
+                      <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest ml-1 flex items-center gap-2">
+                        <MessageSquare size={16} className="text-primary" /> Reason for cancellation:
+                      </p>
                       <textarea 
-                        className="w-full bg-slate-50 border-2 border-slate-100 rounded-[2rem] px-8 py-6 focus:ring-4 ring-primary/10 focus:border-primary focus:bg-white outline-none text-base font-bold h-40 resize-none shadow-inner transition-all"
+                        className="w-full bg-slate-50 border-2 border-slate-100 rounded-[2rem] px-8 py-6 focus:ring-4 ring-primary/10 focus:border-primary focus:bg-white outline-none text-base font-bold h-44 resize-none shadow-inner transition-all placeholder:text-slate-300"
                         placeholder="Please explain why you want to cancel these classes..."
                         value={cancellationForm.reason}
                         onChange={(e) => setCancellationForm({...cancellationForm, reason: e.target.value})}
@@ -1245,7 +1318,7 @@ const MyBookingsView = ({
                     </div>
                   </div>
 
-                  <div className="flex flex-col items-center gap-4">
+                  <div className="flex flex-col items-center gap-6 pt-6">
                     <button 
                       onClick={() => {
                         if (cancellationForm.reason.trim().length < 10) {
@@ -1255,14 +1328,23 @@ const MyBookingsView = ({
                         setCancellationStep(2);
                       }}
                       disabled={!selectedBookingId || !cancellationForm.reason.trim()}
-                      className="w-full max-w-md h-16 bg-primary text-white font-black rounded-2xl text-[10px] uppercase tracking-widest shadow-2xl shadow-primary/30 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50"
+                      className="w-full max-w-md h-16 bg-primary text-white font-black rounded-2xl text-[11px] uppercase tracking-widest shadow-2xl shadow-primary/30 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-3"
                     >
-                      Next Step <ArrowRight size={14} className="inline ml-2" />
+                      Next Step <ArrowRight size={16} />
                     </button>
-                    {cancellationError && <p className="text-rose-500 text-[10px] font-black uppercase tracking-widest">{cancellationError}</p>}
+                    {cancellationError && (
+                      <motion.p 
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="text-rose-500 text-[10px] font-black uppercase tracking-widest bg-rose-50 px-6 py-2 rounded-full border border-rose-100"
+                      >
+                        {cancellationError}
+                      </motion.p>
+                    )}
                   </div>
                 </div>
               )}
+
 
               {cancellationStep === 2 && (
                 <div className="space-y-10 py-4 max-w-2xl mx-auto">
@@ -1277,7 +1359,7 @@ const MyBookingsView = ({
                     <div className="space-y-8">
                       {(() => {
                         const selectedTutorId = selectedBookingId;
-                        const tutorBookings = bookings.filter(b => b.tutorId === selectedTutorId && ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+                        const tutorBookings = bookings.filter(b => b.tutorId === selectedTutorId && ['confirmed', 'pending', 'live', 'rescheduled', 'completed'].includes(b.status));
                         if (tutorBookings.length === 0) return null;
 
                         const firstBooking = tutorBookings[0];
@@ -1292,19 +1374,9 @@ const MyBookingsView = ({
                         return (
                           <div className="space-y-8">
                             {!isPolicyEligible && (
-                              <motion.div 
-                                initial={{ opacity: 0, y: -10 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                className="p-5 bg-amber-50 rounded-[2rem] border border-amber-100 flex items-start gap-4"
-                              >
-                                <AlertCircle size={20} className="text-amber-600 shrink-0 mt-1" />
-                                <div className="space-y-1">
-                                  <p className="text-[10px] font-black text-amber-600 uppercase tracking-widest">Policy Restriction</p>
-                                  <p className="text-[11px] font-bold text-amber-700/80 leading-relaxed">
-                                    Notice: Free plan users are not eligible for refunds or re-allocations after 3 days of enrollment.
-                                  </p>
-                                </div>
-                              </motion.div>
+                              <p className="text-[10px] font-bold text-rose-500 mb-2 italic">
+                                * Free plan: No refunds/re-allocations after 3 days.
+                              </p>
                             )}
 
                             <div className="space-y-4">
@@ -1319,7 +1391,7 @@ const MyBookingsView = ({
                                     disabled={opt.disabled}
                                     onClick={() => setCancellationForm({ ...cancellationForm, bookAnother: opt.id as any })}
                                     className={cn(
-                                      "h-16 px-6 rounded-2xl border-2 font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3",
+                                      "h-14 px-6 rounded-2xl border-2 font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3",
                                       cancellationForm.bookAnother === opt.id 
                                         ? "bg-slate-900 border-slate-900 text-white shadow-xl shadow-slate-900/20" 
                                         : "border-slate-100 text-slate-400 hover:border-slate-200",
@@ -1351,7 +1423,7 @@ const MyBookingsView = ({
                                         disabled={opt.disabled}
                                         onClick={() => setCancellationForm({ ...cancellationForm, wantsRefund: opt.id as any })}
                                         className={cn(
-                                          "h-16 px-6 rounded-2xl border-2 transition-all font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-3",
+                                          "h-14 px-6 rounded-2xl border-2 transition-all font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-3",
                                           cancellationForm.wantsRefund === opt.id 
                                             ? "border-emerald-500 bg-emerald-500 text-white shadow-xl shadow-emerald-500/20" 
                                             : "border-slate-100 text-slate-400 hover:border-emerald-300",
@@ -1379,7 +1451,13 @@ const MyBookingsView = ({
                       <ArrowLeft size={14} /> Back
                     </button>
                     <button 
-                      onClick={handleCancellationSubmit}
+                      onClick={() => {
+                        if (cancellationForm.bookAnother === 'no' && cancellationForm.wantsRefund === 'no') {
+                          showToast("Please select at least one option (Re-book or Refund) to proceed.", "info");
+                          return;
+                        }
+                        handleCancellationSubmit();
+                      }}
                       disabled={isSubmittingCancellation || !cancellationForm.bookAnother || (cancellationForm.bookAnother === 'no' && !cancellationForm.wantsRefund)}
                       className="flex-[2] h-16 bg-slate-900 text-white font-black rounded-2xl text-[10px] uppercase tracking-widest shadow-2xl shadow-slate-900/20 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-3"
                     >
@@ -1439,7 +1517,20 @@ const MyBookingsView = ({
                 />
                 <div>
                   <h4 className="font-bold text-lg md:text-xl truncate max-w-[160px]">{booking.tutorName}</h4>
-                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest">{getSubjectName(booking.subject)}</p>
+                  <p className="text-[9px] md:text-[10px] font-bold text-primary/40 uppercase tracking-widest mb-2">{getSubjectName(booking.subject)}</p>
+                  <div className="flex flex-wrap gap-2">
+                    <span className={cn(
+                      "text-[7px] md:text-[8px] font-black px-2 py-0.5 rounded-md uppercase tracking-widest border",
+                      booking.type === 'demo' ? "bg-accent/10 text-accent border-accent/20" : "bg-blue-50 text-blue-600 border-blue-100"
+                    )}>
+                      {booking.type === 'demo' ? 'Demo' : 'Regular'}
+                    </span>
+                    {booking.duration && (
+                      <span className="text-[7px] md:text-[8px] font-black bg-amber-50 text-amber-600 px-2 py-0.5 rounded-md uppercase tracking-widest border border-amber-100">
+                        {booking.duration}
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -1515,7 +1606,12 @@ const MyBookingsView = ({
                     const now = new Date();
                     const todayStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
                     const isoToday = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-                    const isToday = booking.date === todayStr || booking.date === isoToday;
+                    
+                    const courseEndDate = booking.courseEndDate ? (booking.courseEndDate.toMillis ? booking.courseEndDate.toMillis() : new Date(booking.courseEndDate).getTime()) : null;
+                    const sessionStartDate = new Date(booking.date);
+                    const isWithinCourseRange = booking.plan === 'course' && now >= sessionStartDate && (!courseEndDate || now.getTime() <= courseEndDate);
+
+                    const isToday = booking.date === todayStr || booking.date === isoToday || isWithinCourseRange;
                     
                     // If not today, don't show Join button at all — past/future dates
                     if (!isToday) {
@@ -1538,8 +1634,10 @@ const MyBookingsView = ({
                     const gracePeriodMins = 0; // Strictly active per end time for rejoin only
                     const isWayPastEnd = nowMins > (sessionMins + durationMins + gracePeriodMins);
                     const isSubscriptionExpired = booking.isSubscription && booking.subscriptionStatus === 'expired';
+
+                    const isCourseEnded = courseEndDate && now.getTime() > courseEndDate;
                     
-                    if ((isInJoinWindow || booking.status === 'live') && !isWayPastEnd) {
+                    if ((isInJoinWindow || booking.status === 'live') && !isWayPastEnd && !isCourseEnded) {
                       if (isSubscriptionExpired) {
                         return (
                            <div className="flex flex-col gap-2 w-full sm:w-auto">
@@ -1574,13 +1672,21 @@ const MyBookingsView = ({
                   })()}
 
                   <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto justify-center">
-                    <button 
-                      onClick={() => onReschedule(booking)}
-                      className="px-6 py-3 rounded-xl bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-white transition-all border border-primary/10 font-bold text-[10px] uppercase tracking-widest"
-                      title="Reschedule"
-                    >
-                      <Calendar size={14} className="mr-2" /> Reschedule
-                    </button>
+                    {(() => {
+                      const now = new Date();
+                      const sessionStart = new Date(`${booking.date} ${booking.time}`);
+                      const canReschedule = now.getTime() <= (sessionStart.getTime() + 10 * 60 * 1000);
+                      
+                      return canReschedule && (
+                        <button 
+                          onClick={() => onReschedule(booking)}
+                          className="px-6 py-3 rounded-xl bg-primary/5 text-primary/60 flex items-center justify-center hover:bg-primary hover:text-white transition-all border border-primary/10 font-bold text-[10px] uppercase tracking-widest"
+                          title="Reschedule"
+                        >
+                          <Calendar size={14} className="mr-2" /> Reschedule
+                        </button>
+                      );
+                    })()}
                     {(booking.status as any) === 'pending_cancellation' && (
                       <div className="px-6 py-3 rounded-xl bg-amber-50 text-amber-600 border border-amber-100 font-bold text-[10px] uppercase tracking-widest flex items-center gap-2">
                         <RefreshCw size={12} className="animate-spin-slow" /> Cancellation Pending
@@ -1653,24 +1759,27 @@ const LoginView = ({ setView, setCurrentUser }: {
       
       // View transition is handled by onAuthStateChanged listener at the top of the file
     } catch (err: any) {
-      console.error("⛔ Student Auth Failure:", err.code || err.message);
+      console.error("⛔ Student Auth Failure:", err.code);
       switch (err.code) {
         case 'auth/user-not-found':
         case 'auth/wrong-password':
         case 'auth/invalid-credential':
-          setError("❌ Invalid email or password. Please try again.");
+          setError("❌ Incorrect email or password. Please double-check your credentials.");
           break;
         case 'auth/too-many-requests':
-          setError("⚠️ Too many failed attempts. Please try again later.");
+          setError("⚠️ Too many failed attempts. Please wait a few minutes or try resetting your password.");
           break;
         case 'auth/network-request-failed':
           setError("🌐 Network error. Please check your internet connection.");
           break;
         case 'auth/user-disabled':
-          setError("🚫 Your account has been disabled.");
+          setError("🚫 Your account has been disabled. Please contact support.");
+          break;
+        case 'auth/invalid-email':
+          setError("⚠️ The email address entered is not valid.");
           break;
         default:
-          setError(err.message || "⚠️ An unexpected error occurred. Please try again.");
+          setError("⚠️ Login failed. Please check your details and try again.");
       }
     } finally {
       setIsLoggingIn(false);
@@ -2007,7 +2116,7 @@ const RegisterView = ({ setView, setCurrentUser }: {
 
 
   // Enrolled subjects for filtering (confirmed, completed, or pending)
-  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => b.subject.toLowerCase())));
+  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending', 'live', 'rescheduled'].includes(b.status)).map(b => b.subject.toLowerCase())));
   const studentEmailKey = currentUser?.email?.replace(/\./g, '_') || '';
 
   useEffect(() => {
@@ -2286,20 +2395,13 @@ const RegisterView = ({ setView, setCurrentUser }: {
               </div>
 
               <div className="mt-8 pt-6 border-t border-black/5 flex flex-col gap-3">
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3">
                     <button 
                       onClick={() => setViewingDoc(note)}
                       className="py-4 bg-primary/5 hover:bg-primary text-primary hover:text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-primary/10"
                     >
                        <Eye size={16} /> View
                     </button>
-                    <a 
-                      href={note.fileData} 
-                      download={note.fileName}
-                      className="py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 shadow-xl shadow-slate-900/10 hover:scale-[1.02]"
-                    >
-                       <Download size={16} /> Save
-                    </a>
                   </div>
                   
                   <div className="flex items-center justify-between px-2 pt-2">
@@ -2547,7 +2649,7 @@ const ProjectsView = ({ currentUser, bookings, currentTier, setView }: { current
   const [zoomScale, setZoomScale] = useState(1);
 
   // Enrolled subjects for filtering
-  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => b.subject.toLowerCase())));
+  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending', 'live', 'rescheduled'].includes(b.status)).map(b => b.subject.toLowerCase())));
 
   useEffect(() => {
     if (!currentUser) return;
@@ -2697,20 +2799,13 @@ const ProjectsView = ({ currentUser, bookings, currentTier, setView }: { current
             </div>
 
             <div className="mt-8 pt-6 border-t border-black/5 flex flex-col gap-3">
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3">
                   <button 
                     onClick={() => setViewingDoc(project)}
                     className="py-4 bg-secondary/5 hover:bg-secondary text-secondary hover:text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-secondary/10"
                   >
                      <Eye size={16} /> View
                   </button>
-                  <a 
-                    href={project.fileData} 
-                    download={project.fileName}
-                    className="py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 shadow-xl shadow-slate-900/10 hover:scale-[1.02]"
-                  >
-                     <Download size={16} /> Save
-                  </a>
                 </div>
              </div>
           </motion.div>
@@ -2753,6 +2848,220 @@ const ProjectsView = ({ currentUser, bookings, currentTier, setView }: { current
         )}
       </AnimatePresence>
     </div>
+  );
+};
+
+const AssignmentsView = ({ currentUser, bookings, currentTier, setView }: { currentUser: StudentProfile | null, bookings: Booking[], currentTier: string, setView: (view: View) => void }) => {
+  const [assignments, setAssignments] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
+  const [viewingDoc, setViewingDoc] = useState<any>(null);
+  const [zoomScale, setZoomScale] = useState(1);
+
+  // Enrolled subjects for filtering
+  const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending', 'live', 'rescheduled'].includes(b.status)).map(b => b.subject.toLowerCase())));
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const q = query(collection(db, 'assignments'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const allAssignments = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const profileClass = normalize(currentUser.class);
+      const bookingClasses = Array.from(new Set(bookings.map(b => normalize(b.studentClass || b.class || ''))));
+      const studentClasses = Array.from(new Set([profileClass, ...bookingClasses].filter(Boolean)));
+      const normalizedEnrolled = enrolledSubjects.map(normalize);
+
+      const filtered = allAssignments.filter((a: any) => {
+        const target = a.targetClass || a.class || '';
+        const normTarget = normalize(target);
+        const extractNumber = (s: string) => { const m = s.match(/\d+/); return m ? m[0] : null; };
+        const targetNum = extractNumber(normTarget);
+
+        const matchesClass = !target || normTarget === 'all' || normTarget === 'any' || 
+                           studentClasses.some(c => c === normTarget) ||
+                           (studentClasses.some(c => c.includes('btech')) && normTarget.includes('graduate')) ||
+                           (studentClasses.some(c => c.includes('graduate')) && normTarget.includes('btech')) ||
+                           studentClasses.some(c => normTarget.includes(c) || c.includes(normTarget)) ||
+                           (targetNum && studentClasses.some(c => extractNumber(c) === targetNum));
+        
+        const matchesSubject = enrolledSubjects.length === 0 || 
+                             !a.subject || normalize(a.subject) === 'all' || normalize(a.subject) === 'any' ||
+                             normalizedEnrolled.includes(normalize(a.subject)) ||
+                             normalizedEnrolled.some(enrolled => normalize(a.subject).includes(enrolled) || enrolled.includes(normalize(a.subject)));
+        
+        return matchesClass && matchesSubject;
+      });
+      setAssignments(filtered);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser?.id, currentUser?.class, enrolledSubjects.join(',')]);
+
+  const formatDateLabel = (ts: any) => {
+    if (!ts) return '';
+    const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+    return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  };
+
+  const filtered = assignments.filter(a => {
+    const dMatch = !selectedDate || formatDateLabel(a.createdAt) === selectedDate;
+    const tMatch = !selectedTopic || a.topic === selectedTopic;
+    return dMatch && tMatch;
+  });
+
+  const uniqueDates = Array.from(new Set(assignments.map(a => formatDateLabel(a.createdAt)).filter(Boolean)));
+  const uniqueTopics = Array.from(new Set(assignments.map(a => a.topic).filter(Boolean)));
+
+  if (loading) return <div className="p-20 text-center"><RefreshCw className="animate-spin inline text-primary" size={32} /></div>;
+
+  const isGated = currentTier === 'free';
+  
+  if (isGated) {
+    return (
+      <div className="min-h-[70vh] flex flex-col items-center justify-center p-10 text-center animate-in fade-in slide-in-from-bottom-10 duration-700">
+        <div className="w-24 h-24 bg-primary/5 rounded-[2.5rem] flex items-center justify-center mb-8 relative">
+           <FileCheck size={40} className="text-primary/20" />
+           <Lock size={20} className="absolute -top-1 -right-1 text-rose-500" />
+        </div>
+        <h2 className="text-3xl font-serif font-black italic text-slate-800 mb-4 tracking-tight">Assessments Locked</h2>
+        <p className="max-w-md text-slate-500 font-medium leading-relaxed mb-10">
+          Unlock assignments, mock tests, and performance analysis by upgrading to Scholar Standard or Elite.
+        </p>
+        <button 
+          onClick={() => setView('settings')}
+          className="px-10 py-5 bg-primary text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-2xl shadow-primary/20 hover:scale-105 active:scale-95 transition-all"
+        >
+          Upgrade for Assessments
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <section className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-700">
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+        <div>
+          <h2 className="text-4xl font-serif font-black italic text-on-surface tracking-tighter">Assignments & Tests</h2>
+          <p className="text-[10px] font-black text-primary/40 uppercase tracking-[0.2em] mt-2">Personalized tasks based on your curriculum</p>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 overflow-x-auto pb-2 no-scrollbar">
+        <button 
+          onClick={() => setSelectedDate(null)}
+          className={cn(
+            "px-5 py-2.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+            selectedDate === null ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40"
+          )}
+        >
+          All Uploads
+        </button>
+        {uniqueDates.map(date => (
+          <button 
+            key={date}
+            onClick={() => setSelectedDate(date)}
+            className={cn(
+              "px-5 py-2.5 rounded-full text-[9px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+              selectedDate === date ? "bg-primary text-white" : "bg-white border border-black/5 text-primary/40"
+            )}
+          >
+            {date}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {filtered.length === 0 ? (
+          <div className="col-span-full py-20 text-center bg-white/40 rounded-[3rem] border border-dashed border-primary/10">
+            <FileCheck size={32} className="mx-auto text-primary/10 mb-4" />
+            <p className="text-[10px] font-bold uppercase tracking-widest text-primary/30">No assignments available yet</p>
+          </div>
+        ) : filtered.map(item => (
+          <motion.div 
+            key={item.id} 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="p-6 bg-white rounded-[2.5rem] border border-black/5 hover:shadow-2xl transition-all group flex flex-col h-full"
+          >
+            <div className="flex items-start justify-between">
+              <div className="w-14 h-14 bg-primary/5 rounded-[1.5rem] flex items-center justify-center text-primary group-hover:scale-110 transition-transform overflow-hidden border border-primary/10">
+                 {item.fileType?.startsWith('image/') ? (
+                   <img src={item.fileData} className="w-full h-full object-cover" alt="" />
+                 ) : (
+                   <FileCheck size={28} />
+                 )}
+              </div>
+              <div className="px-3 py-1 bg-slate-50 rounded-full border border-black/5">
+                <span className="text-[8px] font-black uppercase text-primary/40 tracking-tighter">
+                   {item.fileType?.split('/')[1]?.toUpperCase() || 'PDF'}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-8 flex-1">
+              <h4 className="font-bold text-lg leading-snug group-hover:text-primary transition-colors line-clamp-2">{item.fileName}</h4>
+              <div className="flex items-center gap-2 mt-2">
+                 {item.topic && <span className="bg-primary/5 text-primary text-[8px] font-black px-1.5 py-0.5 rounded uppercase border border-primary/10">{item.topic}</span>}
+                 <span className="text-[10px] font-black uppercase tracking-[0.15em] text-primary/30">{item.subject}</span>
+                 <span className="w-1 h-1 bg-primary/20 rounded-full" />
+                 <span className="text-[10px] font-bold text-primary/40">By {item.tutorName}</span>
+              </div>
+            </div>
+
+            <div className="mt-8 pt-6 border-t border-black/5 flex flex-col gap-3">
+                <div className="grid grid-cols-1 gap-3">
+                  <button 
+                    onClick={() => setViewingDoc(item)}
+                    className="py-4 bg-primary/5 hover:bg-primary text-primary hover:text-white rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-primary/10"
+                  >
+                     <Eye size={16} /> View
+                  </button>
+                </div>
+             </div>
+          </motion.div>
+        ))}
+      </div>
+
+      <AnimatePresence>
+        {viewingDoc && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black">
+             <motion.div 
+               initial={{ opacity: 0 }}
+               animate={{ opacity: 1 }}
+               exit={{ opacity: 0 }}
+               className="relative w-full h-full flex flex-col items-center justify-center"
+             >
+                <button onClick={() => setViewingDoc(null)} className="fixed top-4 right-4 z-[110] bg-white/5 hover:bg-white/10 backdrop-blur-md p-2.5 rounded-full text-white/70 hover:text-white transition-all border border-white/10">
+                   <X size={20} />
+                </button>
+
+                <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[110] flex items-center gap-2 bg-white/10 backdrop-blur-xl px-4 py-2 rounded-2xl border border-white/10 shadow-2xl">
+                   <button onClick={() => setZoomScale(prev => Math.max(0.1, prev - 0.1))} className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"><Minus size={20} /></button>
+                   <div className="w-12 text-center"><span className="text-white font-black text-[10px] uppercase tracking-widest">{Math.round(zoomScale * 100)}%</span></div>
+                   <button onClick={() => setZoomScale(prev => Math.min(3, prev + 0.1))} className="p-2 text-white hover:bg-white/20 rounded-xl transition-all"><Plus size={20} /></button>
+                </div>
+
+                <div className="flex-1 w-full h-full bg-[#0a0a0b] overflow-auto custom-scrollbar flex p-4">
+                   <motion.div animate={{ scale: zoomScale }} transition={{ type: "spring", stiffness: 300, damping: 30 }} className="origin-center m-auto flex items-center justify-center min-w-max">
+                      {viewingDoc.fileType?.startsWith('image/') ? (
+                        <img src={viewingDoc.fileData} className="max-w-[96vw] max-h-[96vh] object-contain shadow-2xl rounded-md" alt={viewingDoc.fileName} />
+                      ) : (
+                        <div className="w-[96vw] h-[96vh] bg-white rounded-md shadow-2xl overflow-hidden">
+                           <iframe src={`${viewingDoc.fileData}#toolbar=0&view=FitH`} className="w-full h-full border-none" title="Assignment Viewer" />
+                        </div>
+                      )}
+                   </motion.div>
+                </div>
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </section>
   );
 };
 
@@ -2915,7 +3224,7 @@ const Sidebar = ({ view, setView, isMobileSidebarOpen, setIsMobileSidebarOpen, h
       view === 'chat' ? 'md:hidden' : ''
     )}>
       <div className="flex items-center justify-between mb-6">
-        <a href="http://localhost:5173" className="flex items-center gap-3 group">
+        <a href="https://localhost:3000" className="flex items-center gap-3 group">
           <div className="w-10 h-10 bg-background rounded-full flex items-center justify-center group-hover:scale-105 transition-transform">
             <GraduationCap className="text-primary" size={24} />
           </div>
@@ -3021,7 +3330,27 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   
   return (
-    <header className="flex items-center justify-between mb-4 md:mb-6">
+    <header className="flex flex-col mb-4 md:mb-6">
+    {!currentUser?.upiId && !['login', 'register', 'forgot-password', 'blocked', 'verify-email'].includes(view) && (
+      <motion.div 
+        initial={{ height: 0, opacity: 0 }}
+        animate={{ height: 'auto', opacity: 1 }}
+        onClick={() => setView('settings')}
+        className="mb-4 bg-rose-50 border border-rose-100 p-3 rounded-2xl flex items-center justify-between cursor-pointer group hover:bg-rose-100 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-rose-500/10 rounded-xl flex items-center justify-center">
+            <AlertCircle className="text-rose-500" size={16} />
+          </div>
+          <div>
+            <p className="text-[10px] font-black uppercase tracking-widest text-rose-600">Payment Setup Required</p>
+            <p className="text-[9px] font-bold text-rose-500/70">Your UPI ID is missing. Click here to add it in your profile.</p>
+          </div>
+        </div>
+        <ChevronRight size={16} className="text-rose-400 group-hover:translate-x-1 transition-transform" />
+      </motion.div>
+    )}
+    <div className="flex items-center justify-between">
     <div className="flex items-center gap-4">
       <button 
         onClick={() => setIsMobileSidebarOpen(true)}
@@ -3126,7 +3455,8 @@ const Topbar = ({ view, setIsMobileSidebarOpen, isNotifOpen, setIsNotifOpen, not
         </AnimatePresence>
       </div>
     </div>
-  </header>
+  </div>
+</header>
 );
 };
 
@@ -3406,7 +3736,13 @@ function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 px-4">
           {interactionTutorIds.map(tId => {
-            const tutor = tutors.find(t => t.id === tId) || { id: tId, name: 'Tutor', avatar: '', subjects: [] } as any;
+            const tutorBooking = allBookings.find(b => String(b.tutorId) === String(tId));
+            const tutor = tutors.find(t => String(t.id) === String(tId)) || { 
+              id: tId, 
+              name: tutorBooking?.tutorName || 'Tutor', 
+              avatar: (tutorBooking as any)?.tutorAvatar || '', 
+              subjects: tutorBooking?.subject ? [tutorBooking.subject] : [] 
+            } as any;
             const tutorPending = pendingReviews.filter(b => b.tutorId === tId);
             const tutorPast = pastReviews.filter(b => b.tutorId === tId);
             const rep = getReputation(tId, tutor.reviews || []);
@@ -3583,16 +3919,27 @@ function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation
                           Cancel
                        </button>
                        <button 
-                         disabled={isSubmitting || reviewForm.rating === 0}
+                         disabled={isSubmitting || reviewForm.rating === 0 || (reviewForm.rating <= 3 ? reviewForm.comment.trim().length < 10 : (reviewForm.comment.trim().length > 0 && reviewForm.comment.trim().length < 10))}
                          onClick={async () => {
                             setIsSubmitting(true);
                             try {
                               const bId = reviewForm.bookingId!;
-                              if (bId.startsWith('b')) {
-                                setBookings(prev => prev.map(b => b.id === bId ? { ...b, reviewSubmitted: true, reviewRating: reviewForm.rating, reviewComment: reviewForm.comment } : b));
-                                setReviewedIds(prev => [...prev, bId]);
-                                localStorage.setItem('scholar_reviewed_ids', JSON.stringify([...reviewedIds, bId]));
+                              if (!bId) return;
+                              
+                              // Persist to backend
+                              try {
+                                await updateDoc(doc(db, 'bookings', bId), {
+                                  reviewSubmitted: true,
+                                  reviewRating: reviewForm.rating,
+                                  reviewComment: reviewForm.comment
+                                });
+                              } catch (dbErr) {
+                                console.error("Failed to save review to backend", dbErr);
                               }
+
+                              setBookings((prev: Booking[]) => prev.map(b => b.id === bId ? { ...b, reviewSubmitted: true, reviewRating: reviewForm.rating, reviewComment: reviewForm.comment } : b));
+                              setReviewedIds(prev => [...prev, bId]);
+                              localStorage.setItem('scholar_reviewed_ids', JSON.stringify([...reviewedIds, bId]));
 
                               // Notify Admin and Tutor about the new review
                               const booking = bookings.find(b => b.id === bId);
@@ -3702,7 +4049,7 @@ function ReviewsView({ bookings, tutors, currentUser, setBookings, getReputation
                                <div className="flex gap-0.5 text-amber-400 mb-2">
                                   {[1, 2, 3, 4, 5].map(st => <Star key={st} size={12} fill={st <= (rev.rating || 0) ? "currentColor" : "none"} />) }
                                </div>
-                               <p className="text-xs font-medium italic text-on-surface leading-relaxed pl-3 border-l-2 border-primary/10">"{rev.comment || 'Excellent session!'}"</p>
+                               {rev.comment && <p className="text-xs font-medium italic text-on-surface leading-relaxed pl-3 border-l-2 border-primary/10">"{rev.comment}"</p>}
                             </motion.div>
                           ))
                         ) : (
@@ -3821,9 +4168,16 @@ function SettingsView({ setView, currentUser, setCurrentUser, currentTier, booki
       return;
     }
 
-    if (!formData.name.trim() || !formData.mobile.trim()) {
+    if (!formData.name.trim() || !formData.mobile.trim() || !formData.upiId.trim()) {
       setStatus('error');
-      alert("please fill in your name and mobile number");
+      alert("Please fill in your name, mobile number, and UPI ID.");
+      setTimeout(() => setStatus('idle'), 3000);
+      return;
+    }
+
+    if (!/^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$/.test(formData.upiId.trim())) {
+      setStatus('error');
+      alert("Please enter a valid UPI ID (e.g. name@bank)");
       setTimeout(() => setStatus('idle'), 3000);
       return;
     }
@@ -4482,7 +4836,8 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {filtered.map(b => {
                   const isToday = b.date === todayStr || b.date === isoToday;
-                  const sessionMins = parseTime(b.time);
+                  const actualTime = (b.rescheduledDays?.[isoToday]) || (isToday ? (b.rescheduledDays?.[b.date] || b.time) : b.time);
+                  const sessionMins = parseTime(actualTime);
                   const diffMins = sessionMins - nowMins;
                   const durationMins = parseFloat(b.duration || '1') * 60;
                   const isInJoinWindow = isToday && diffMins <= 10 && nowMins <= (sessionMins + durationMins);
@@ -4506,7 +4861,7 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
                          )}>{isToday ? 'Today' : (b.date === yesterdayStr || b.date === isoYesterday) ? 'Yesterday' : 'Tomorrow'} · {b.date}</span>
                          {isLive && <span className="text-[8px] font-black uppercase tracking-widest bg-blue-500 text-white px-2 py-0.5 rounded-full animate-pulse">LIVE</span>}
                        </div>
-                       <span className="text-[10px] font-bold text-on-surface/40 uppercase">{b.time} · {b.duration}</span>
+                       <span className="text-[10px] font-bold text-on-surface/40 uppercase">{actualTime} · {b.duration}</span>
                     </div>
                     
                     <h4 className="text-lg font-bold text-on-surface mb-1">{b.subject}</h4>
@@ -4533,19 +4888,25 @@ const DashboardView = ({ setView, bookings, setSelectedTutor, openChat, onResche
                       )}
                       
                       {/* Reschedule button — only before class starts */}
-                      {!isLive && !(isToday && nowMins >= sessionMins) && (
-                        <button 
-                          onClick={() => onReschedule(b)}
-                          className="px-4 py-2.5 bg-primary/5 text-primary rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-primary hover:text-white transition-all flex items-center gap-2 border border-primary/10"
-                        >
-                          <Calendar size={14} /> Reschedule
-                        </button>
-                      )}
+                      {(() => {
+                        const now = new Date();
+                        const sessionStart = new Date(`${b.date} ${b.time}`);
+                        const canReschedule = !isLive && now.getTime() <= (sessionStart.getTime() + 10 * 60 * 1000);
+                        
+                        return canReschedule && (
+                          <button 
+                            onClick={() => onReschedule(b)}
+                            className="px-4 py-2.5 bg-primary/5 text-primary rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-primary hover:text-white transition-all flex items-center gap-2 border border-primary/10"
+                          >
+                            <Calendar size={14} /> Reschedule
+                          </button>
+                        );
+                      })()}
                       
                       {/* Time indicator for sessions not in join window */}
                       {!isInJoinWindow && !isLive && isToday && (
                         <span className="flex-1 py-2.5 text-center text-[10px] font-bold text-primary/30 uppercase tracking-widest">
-                          Starts at {b.time} {diffMins > 0 && `(in ${diffMins}m)`}
+                          Starts at {actualTime} {diffMins > 0 && `(in ${diffMins}m)`}
                         </span>
                       )}
                     </div>
@@ -4814,10 +5175,25 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
                   {tutor.experience === 'Fresher' ? 'Fresher' : `${tutor.experience || 'Expert'} Experience`}
                 </p>
                 <div className="flex flex-wrap gap-1.5 md:gap-2 mb-3 md:mb-4">
-                  {(tutor as any).subjects?.slice(0, 1).map((s: string) => (
-                    <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{getSubjectName(s)}</span>
-                  ))}
-                  {tutor.subjects.length > 1 && <span className="text-[8px] font-bold text-primary/20">+{tutor.subjects.length - 1} more</span>}
+                  {(() => {
+                    const pricingEntries = (tutor as any).pricingEntries || [];
+                    const subjectsPricing = (tutor as any).subjectsPricing || [];
+                    const tutorSubjects = Array.from(new Set([
+                      ...pricingEntries.map((e: any) => e.subject),
+                      ...subjectsPricing.map((p: any) => p.subject)
+                    ].filter(Boolean)));
+
+                    if (tutorSubjects.length === 0) {
+                      const fallback = Array.isArray(tutor.subjects) ? tutor.subjects : [];
+                      return fallback.map(s => (
+                        <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{getSubjectName(s)}</span>
+                      ));
+                    }
+
+                    return tutorSubjects.map(s => (
+                      <span key={s} className="pill-tag bg-primary/5 text-primary/70 !text-[8px]">{s}</span>
+                    ));
+                  })()}
                 </div>
                 <p className="text-primary/60 text-[10px] md:text-xs leading-relaxed mb-4 line-clamp-2">{(tutor as any).bio}</p>
               </div>
@@ -4825,25 +5201,36 @@ const FindTutorsView = ({ setView, setSelectedTutor, tutors, currentUser, bookin
               <div className="flex flex-col gap-2">
                 <div className="flex gap-2">
                   {(() => {
-                    const hasAttendedDemo = bookings.some(b => b.tutorId === tutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                    const hasBookedDemo = hasAttendedDemo;
+                    const tutorBookings = bookings.filter(b => b.tutorId === tutor.id);
+                    const hasPaidEnrollment = tutorBookings.some(b => b.type === 'paid' && b.status !== 'cancelled');
+                    const hasConductedDemo = tutorBookings.some(b => b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
+                    const hasActiveRequest = tutorBookings.some(b => ['pending', 'confirmed', 'live', 'rescheduled'].includes(b.status));
 
-                    if (!hasBookedDemo) {
-                      return (
-                        <button 
-                          onClick={() => { setSelectedTutor(tutor); openBookingModal('demo'); }}
-                          className="flex-1 bg-accent/10 text-accent py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-accent hover:text-white transition-all text-center"
-                        >
-                          Book Free Demo
-                        </button>
-                      );
-                    } else {
+                    if (hasPaidEnrollment || hasConductedDemo) {
                       return (
                         <button 
                           onClick={() => { setSelectedTutor(tutor); openBookingModal('paid'); }}
                           className="flex-1 bg-primary text-background py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:scale-[1.02] active:scale-[0.98] transition-all"
                         >
                           Enroll Now
+                        </button>
+                      );
+                    } else if (hasActiveRequest) {
+                      return (
+                        <button 
+                          disabled
+                          className="flex-1 bg-slate-100 text-slate-400 py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs cursor-not-allowed"
+                        >
+                          Booking Active
+                        </button>
+                      );
+                    } else {
+                      return (
+                        <button 
+                          onClick={() => { setSelectedTutor(tutor); openBookingModal('demo'); }}
+                          className="flex-1 bg-accent/10 text-accent py-2.5 md:py-3 rounded-xl font-black text-[10px] md:text-xs hover:bg-accent hover:text-white transition-all text-center"
+                        >
+                          Book Free Demo
                         </button>
                       );
                     }
@@ -4911,10 +5298,10 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-6 md:gap-8 py-4 md:py-6 border-y border-primary/5">
                   <div>
-                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Primary Subject</p>
+                    <p className="text-[9px] md:text-[10px] font-bold text-primary/30 uppercase tracking-widest mb-1">Subjects</p>
                     <div className="flex flex-wrap justify-center sm:justify-start gap-2">
-                      {selectedTutor.subjects.slice(0, 1).map(s => (
-                        <span key={s} className="pill-tag text-[8px] md:text-[9px]">{s}</span>
+                      {selectedTutor.subjects.map(s => (
+                        <span key={s} className="pill-tag text-[8px] md:text-[9px]">{getSubjectName(normalizeSubject(s))}</span>
                       ))}
                     </div>
                   </div>
@@ -5021,54 +5408,36 @@ const TutorProfileView = ({ selectedTutor, setView, openBookingModal, openChat, 
               </div>
               <div className="flex flex-col gap-4 mt-6 md:mt-8">
                 {(() => {
-                  const hasAttendedDemo = bookings.some(b => b.tutorId === selectedTutor.id && b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
-                  const hasBookedDemo = hasAttendedDemo;
+                  const tutorBookings = bookings.filter(b => b.tutorId === selectedTutor.id);
+                  const hasPaidEnrollment = tutorBookings.some(b => b.type === 'paid' && b.status !== 'cancelled');
+                  const hasConductedDemo = tutorBookings.some(b => b.type === 'demo' && (b.status === 'completed' || b.attendance_status === 'attended'));
+                  const hasActiveRequest = tutorBookings.some(b => ['pending', 'confirmed', 'live', 'rescheduled'].includes(b.status));
 
-                  if (selectedTutor.subjectsPricing && selectedTutor.subjectsPricing.length > 0) {
-                    return (
-                      <div className="space-y-4 mb-4">
-                        <p className="text-background/40 text-[9px] font-black uppercase tracking-widest">Available Subjects</p>
-                        <div className="flex flex-wrap gap-2">
-                           {selectedTutor.subjects.map(s => (
-                             <span key={s} className="px-3 py-1.5 bg-white/5 rounded-lg text-[9px] font-bold border border-white/5">{s}</span>
-                           ))}
-                        </div>
-                        
-                        {!hasBookedDemo ? (
-                          <button 
-                            onClick={() => openBookingModal('demo')}
-                            className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
-                          >
-                            Book Free Demo
-                          </button>
-                        ) : (
-                          <button 
-                            onClick={() => openBookingModal('paid')}
-                            className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
-                          >
-                            Enroll Now
-                          </button>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  if (!hasBookedDemo) {
+                  if (hasPaidEnrollment || hasConductedDemo) {
                     return (
                       <button 
-                        onClick={() => openBookingModal('demo')}
-                        className="w-full bg-accent/10 text-accent py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:bg-accent hover:text-white transition-all text-sm md:text-base"
+                        onClick={() => openBookingModal('paid')}
+                        className="w-full bg-primary text-background py-5 rounded-2xl font-black text-xs hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl shadow-primary/20"
                       >
-                        Book Free Demo
+                        Enroll Now
+                      </button>
+                    );
+                  } else if (hasActiveRequest) {
+                    return (
+                      <button 
+                        disabled
+                        className="w-full bg-slate-100 text-slate-400 py-5 rounded-2xl font-black text-xs cursor-not-allowed"
+                      >
+                        Current Booking Active
                       </button>
                     );
                   } else {
                     return (
                       <button 
-                        onClick={() => openBookingModal('paid')}
-                        className="w-full bg-primary text-background py-4 md:py-5 rounded-xl md:rounded-2xl font-bold hover:scale-105 transition-transform shadow-xl text-sm md:text-base"
+                        onClick={() => openBookingModal('demo')}
+                        className="w-full bg-accent text-white py-5 rounded-2xl font-black text-xs hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl shadow-accent/20"
                       >
-                        Enroll Now
+                        Book Free Demo
                       </button>
                     );
                   }
@@ -5173,11 +5542,13 @@ export default function App() {
     if (currentUser && type === 'paid') {
       const activeBookings = bookings.filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
       const currentSubjects = new Set(activeBookings.map(b => b.subject));
-      const allowedSubjects = currentUser.subscription?.allowedSubjects || 1;
+      
+      const tier = currentUser.subscription?.tier || 'free';
+      const allowedSubjects = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
       
       // If student is trying to book a NEW subject and is at the limit
       if (selectedTutor && !currentSubjects.has(selectedTutor.subjects[0]) && currentSubjects.size >= allowedSubjects) {
-        const tierName = currentUser.subscription?.tier === 'free' ? 'Explorer (Free)' : currentUser.subscription?.tier === 'standard' ? 'Scholar (Standard)' : 'Elite (Premium)';
+        const tierName = tier === 'free' ? 'Explorer (Free)' : tier === 'standard' ? 'Scholar (Standard)' : 'Elite (Premium)';
         showToast(`You have reached the ${allowedSubjects} subject limit for your ${tierName} plan. Please upgrade your plan to choose multiple subjects.`, "info");
         setView('settings'); // Redirect to plans/settings
         return;
@@ -5470,13 +5841,10 @@ export default function App() {
 
   const currentTier = effectiveSubscription.tier;
 
-  // 🛡️ MANDATORY UPI ID GATE
+  // 🛡️ MANDATORY UPI ID GATE - DISABLED PER USER REQUEST
   useEffect(() => {
-    if (currentUser && !currentUser.upiId && !['login', 'register', 'forgot-password', 'blocked'].includes(view)) {
-      setShowUpiGate(true);
-    } else {
-      setShowUpiGate(false);
-    }
+    // Logic removed to prevent blocking card. Banner in Topbar used instead.
+    setShowUpiGate(false);
   }, [currentUser?.upiId, view]);
 
   const handleGateUpiSubmit = async (e: React.FormEvent) => {
@@ -5502,7 +5870,8 @@ export default function App() {
     const tutorsQuery = query(
       collection(db, 'users'), 
       where('role', '==', 'tutor'),
-      where('status', '==', 'approved')
+      where('status', '==', 'approved'),
+      where('isPublic', '==', true)
     );
     const unsubTutors = onSnapshot(tutorsQuery, (snap) => {
       const tutorList = snap.docs.map(doc => {
@@ -5521,7 +5890,8 @@ export default function App() {
           experience: data.experience || 'Fresher',
           qualification: data.qualification || '',
           reviews: data.reviews || [],
-          subjectsPricing: data.subjectsPricing || []
+          subjectsPricing: data.subjectsPricing || [],
+          pricingEntries: data.pricingEntries || []
         };
       });
       setTutors(tutorList);
@@ -5538,6 +5908,23 @@ export default function App() {
     const bQuery = query(collection(db, 'bookings'), where('studentEmail', '==', currentUser.email));
     const unsubBookings = onSnapshot(bQuery, (snap) => {
       const bookingList = snap.docs.map(d => ({ id: d.id, ...d.data() } as Booking));
+      
+      const getSortMs = (item: any) => {
+         if (item.date) {
+            const timeStr = item.time || '00:00';
+            const d = new Date(`${item.date} ${timeStr}`);
+            if (!isNaN(d.getTime())) return d.getTime();
+            const d2 = new Date(item.date);
+            if (!isNaN(d2.getTime())) return d2.getTime();
+         }
+         if (item.createdAt?.toMillis) return item.createdAt.toMillis();
+         if (item.createdAt?.seconds) return item.createdAt.seconds * 1000;
+         if (item.timestamp?.toMillis) return item.timestamp.toMillis();
+         if (item.timestamp?.seconds) return item.timestamp.seconds * 1000;
+         return 0;
+      };
+      
+      bookingList.sort((a, b) => getSortMs(b) - getSortMs(a));
       setBookings(bookingList);
     }, (err) => {
       console.error("Error fetching bookings:", err);
@@ -5549,12 +5936,17 @@ export default function App() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
 
   useEffect(() => {
-    if (!currentUser?.id) return;
+    if (!currentUser?.id || !currentUser?.email) return;
     const uid = currentUser.id;
+    const email = currentUser.email.toLowerCase().trim();
 
     const nQuery = query(
       collection(db, 'notifications'), 
-      where('userId', '==', uid)
+      or(
+        where('userId', '==', uid),
+        where('studentEmail', '==', email),
+        where('studentId', '==', uid) // Support legacy studentId field
+      )
     );
     
     const unsubNotifs = onSnapshot(nQuery, (snap) => {
@@ -5563,17 +5955,34 @@ export default function App() {
         ...doc.data() 
       } as any));
       
-      notifList.sort((a, b) => {
-         const timeA = a.time?.seconds ? a.time.seconds * 1000 : new Date(a.time).getTime();
-         const timeB = b.time?.seconds ? b.time.seconds * 1000 : new Date(b.time).getTime();
-         return timeB - timeA;
+      // Filter based on Student Preferences
+      const prefs = currentUser?.notifications || { reminders: true, messages: true, updates: true };
+      const filtered = notifList.filter(n => {
+        if (n.type === 'booking') return prefs.reminders !== false;
+        if (n.type === 'message') return prefs.messages !== false;
+        if (n.type === 'update' || n.type === 'platform') return prefs.updates !== false;
+        return true;
       });
+
+      const getMs = (item: any) => {
+         if (item.createdAt?.toMillis) return item.createdAt.toMillis();
+         if (item.createdAt?.seconds) return item.createdAt.seconds * 1000;
+         if (item.timestamp?.toMillis) return item.timestamp.toMillis();
+         if (item.timestamp?.seconds) return item.timestamp.seconds * 1000;
+         if (item.time) {
+           const d = new Date(item.time);
+           if (!isNaN(d.getTime())) return d.getTime();
+         }
+         return Date.now(); // Fallback for "Just now" or invalid strings to put them at top
+      };
       
-      setNotifications(notifList);
+      filtered.sort((a, b) => getMs(b) - getMs(a));
+      
+      setNotifications(filtered);
     });
 
     return () => unsubNotifs();
-  }, [currentUser?.id, currentUser?.email]);
+  }, [currentUser?.id, currentUser?.email, currentUser?.notifications]);
   const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
   const [paymentStatus, setPaymentStatus] = useState<'idle' | 'processing' | 'success' | 'failed' | 'cancelled'>('idle');
@@ -5585,61 +5994,31 @@ export default function App() {
   const [useWalletCredit, setUseWalletCredit] = useState(true);
   const [bookingSelectedTime, setBookingSelectedTime] = useState<string>('');
   const [bookingDuration, setBookingDuration] = useState('');
+
+  // 🎓 Auto-set duration for Full Course Enrollment
+  useEffect(() => {
+    if (bookingPlan === 'course') {
+      setBookingDuration('2');
+    }
+  }, [bookingPlan]);
   const [bookingType, setBookingType] = useState<'demo' | 'paid'>('paid');
   
-  useEffect(() => {
-    if (selectedTutor && bookingSelectedDate) {
-      const tutorBookings = bookings.filter(b => b.tutorId === selectedTutor.id);
-      const tutorAvailability = selectedTutor.availability || [];
-      
-      // Get the selected weekday name (same as render logic)
-      const dateObj = new Date(bookingSelectedDate);
-      const selectedDay = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
-
-      // Filter by matching day OR specific date — same logic as the render
-      const rawSlots = tutorAvailability.filter((s: any) => {
-        if (typeof s === 'string') return true;
-        if (s.status === 'busy') return false;
-        if (s.date) return s.date === bookingSelectedDate;
-        if (s.day) return s.day.toLowerCase() === selectedDay.toLowerCase();
-        return false;
-      });
-
-      // Expand time ranges into individual hourly slots
-      const expandedSlots: string[] = [];
-      rawSlots.forEach((s: any) => {
-        const startTime = typeof s === 'string' ? s : (s.start || '');
-        const endTime = typeof s === 'string' ? '' : (s.end || '');
-        if (!startTime) return;
-        const startMins = parseTime(startTime);
-        const endMins = endTime ? parseTime(endTime) : startMins + 60;
-        for (let m = startMins; m < endMins; m += 60) {
-          expandedSlots.push(formatMins(m));
-        }
-      });
-
-      // Remove already-booked slots
-      const finalSlots = expandedSlots.filter(slotTime => {
-        return !tutorBookings.some(b =>
-          b.date === bookingSelectedDate &&
-          b.time === slotTime &&
-          ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status)
-        );
-      });
-
-      // If tutor has real slots for this day, clear any stale time selection
-      if (finalSlots.length > 0 && bookingSelectedTime === '10:00 AM') {
-        setBookingSelectedTime('');
-      }
-    }
-  }, [bookingSelectedDate, selectedTutor]);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
-  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [activeChatId, setActiveChatId] = useState<string | null>(localStorage.getItem('active_chat_id'));
+
+  useEffect(() => {
+    if (activeChatId) {
+      localStorage.setItem('active_chat_id', activeChatId);
+    } else {
+      localStorage.removeItem('active_chat_id');
+    }
+  }, [activeChatId]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [reschedulingBooking, setReschedulingBooking] = useState<Booking | null>(null);
   const [rescheduleDate, setRescheduleDate] = useState<string>('');
   const [rescheduleSlots, setRescheduleSlots] = useState<string[]>([]);
+  const [rescheduleSelectedTime, setRescheduleSelectedTime] = useState<string>('');
   const [rescheduleSuccess, setRescheduleSuccess] = useState(false);
   const [rescheduleReason, setRescheduleReason] = useState('');
 
@@ -5650,39 +6029,43 @@ export default function App() {
     const currentDur = parseFloat(bookingFormData?.duration || bookingDuration || '0');
     const subject = bookingSelectedSubject || bookingFormData?.subject;
 
-    if (!currentDur) return 0;
-    if (bookingType === 'paid' && !planToUse) return 0;
+    if (bookingType === 'demo') return 0;
     if (!subject) return 0;
 
-    // Use latest data from tutors list if available to ensure sync
     const latestTutor = tutors.find(t => t.id === selectedTutor.id) || selectedTutor;
 
-    // Check for subject-specific pricing first
-    const sp = latestTutor?.subjectsPricing?.find((p: any) => p.subject === subject);
-    const entry = (latestTutor as any)?.pricingEntries?.find((e: any) => e.subject === subject);
-    
-    let baseRate = parseFloat(String(latestTutor?.price || '0')) || 0;
-    
-    if (entry && entry.hourlyRate) {
-      baseRate = entry.hourlyRate;
-    } else if (sp) {
-      if (sp.type === 'course') {
-        return Math.ceil(sp.price * 1.17);
-      }
-      // If it's stored as monthly price, get hourly rate
-      baseRate = sp.price / 30;
+    // Helper for precise pricing lookup (simple normalized string comparison)
+    const pNorm = (s: string) => s?.toLowerCase().trim().replace(/[^a-z0-9]/g, '') || '';
+    const targetSubject = pNorm(subject);
+
+    const allEntries = (latestTutor as any)?.pricingEntries?.filter((e: any) => pNorm(e.subject) === targetSubject) || [];
+    const allSP = latestTutor?.subjectsPricing?.filter((p: any) => pNorm(p.subject) === targetSubject) || [];
+
+    // ISOLATED LOOKUP
+    const courseEntry = allEntries.find((e: any) => e.type === 'course') || 
+                        allSP.find((p: any) => p.type === 'course' || p.type === 'both');
+    const hourlyEntry = allEntries.find((e: any) => e.hourlyRate > 0) || 
+                        allEntries.find((e: any) => e.type === 'hourly') || 
+                        allSP.find((p: any) => p.hourlyRate > 0) || 
+                        allSP.find((p: any) => p.type === 'hourly' || p.type === 'both');
+
+    // ISOLATED CALCULATION
+    if (planToUse === 'course') {
+      const coursePrice = Number(courseEntry?.baseAmount || courseEntry?.price || 0);
+      return PricingEngine.calculateCourseBookingTotal(coursePrice);
     }
 
-    // --- Standard formula: Base = rate × hours × days, Final = Base × 1.17 ---
-    let days = 1; 
-    if (planToUse === '6months') days = 180;
-    else if (planToUse === '3months') days = 90;
-    else if (planToUse === '1month' || planToUse === 'monthly') days = 30;
-    else if (planToUse === 'subscription') days = 365; // Keep for legacy compatibility
+    // For Monthly Plans: Use ONLY hourlyRate. NEVER fallback to tutor.price (could be course lump sum).
+    const hourlyRate = Number(hourlyEntry?.hourlyRate || (hourlyEntry?.type === 'hourly' ? (hourlyEntry.baseAmount || hourlyEntry.price) : 0) || 0);
+    const days = PricingEngine.getPlanMultiplier(planToUse);
 
-    const base   = baseRate * currentDur * days;
-    const fee    = base * 0.17;
-    return Math.ceil(base + fee);
+    // If we have no hourly rate for this specific subject, return 0 to indicate invalid config for monthly plans
+    if (hourlyRate === 0) {
+      console.warn('No hourly rate found for subject:', subject);
+      return 0;
+    }
+
+    return PricingEngine.calculateHourlyBookingTotal(hourlyRate, currentDur, days);
   };
 
   const getPlanFeatures = (plan: string) => {
@@ -5707,55 +6090,53 @@ export default function App() {
     if (bookingType === 'demo') return 'Free First Demo Session';
     
     const planToUse = bookingFormData?.plan || bookingPlan;
-    const dur = parseFloat(bookingFormData?.duration || bookingDuration || '0');
     const subject = bookingSelectedSubject || bookingFormData?.subject;
     const date = bookingSelectedDate || bookingFormData?.date;
     const time = bookingSelectedTime || bookingFormData?.time;
+    const dur = bookingDuration || bookingFormData?.duration;
 
-    // Requirement: Show total only after ALL fields are selected
-    if (!subject || !planToUse || !dur || !date || !time) {
-      return 'Please Select All Fields To See Total';
-    }
+    if (!subject) return 'Subject is Required';
+    if (!planToUse) return 'Enrollment Type is Required';
+    if (!dur) return 'Daily Duration is Required';
+    if (!date) return 'Date is Required';
+    if (!time) return 'Time is Required';
 
     const amt = getBookingAmount();
-    if (amt === 0) return 'Invalid configuration';
+    if (amt === 0) return 'Complete Your Booking Details to View Total';
 
     const walletFunds = currentUser?.walletBalance || 0;
-    const isWalletUsed = walletFunds > 0;
-    const finalPayable = Math.max(0, amt - walletFunds);
+    const finalPayable = Math.max(0, amt - (useWalletCredit ? walletFunds : 0));
     
     let planLabel = 'Enrollment Total';
-    if (planToUse === 'course' || selectedTutor?.subjectsPricing?.find((sp: any) => sp.subject === bookingSelectedSubject)?.type === 'course') {
-      planLabel = 'Course Fee';
-    } else if (planToUse === 'subscription') {
-      planLabel = 'Year Plan';
-    } else if (planToUse === '6months') {
-      planLabel = '6 Months Plan';
-    } else if (planToUse === 'monthly' || planToUse === '1month' || planToUse === '3months') {
-      planLabel = planToUse === '1month' ? 'One Month Plan' : planToUse === '3months' ? 'Three Months Plan' : 'Plan Total';
-    }
+    if (planToUse === 'course') planLabel = 'Course Fee';
+    else if (planToUse === '6months') planLabel = 'Six Months Plan';
+    else if (planToUse === '3months') planLabel = 'Three Months Plan';
+    else if (planToUse === 'monthly' || planToUse === '1month') planLabel = 'One Month Plan';
 
-    if (isWalletUsed) {
-      return (
-        <div className="flex flex-col gap-1 items-end">
-          <span className="text-[10px] text-slate-400 font-bold uppercase line-through">₹{amt.toLocaleString('en-IN')}</span>
-          <span className="text-emerald-500 text-[10px] font-black uppercase tracking-widest flex items-center gap-1">
-             <Wallet size={10} /> - ₹{Math.min(amt, walletFunds).toLocaleString('en-IN')} Wallet Applied
-          </span>
-          <span className="text-primary font-black">Net Total: ₹{finalPayable.toLocaleString('en-IN')}</span>
-        </div>
-      );
-    }
-    
-    return `${planLabel}: ₹${amt.toLocaleString('en-IN')}`;
+    return (
+      <div className="flex flex-col">
+        <span className="text-[10px] opacity-40 font-black uppercase tracking-tight">{planLabel}:</span>
+        <span className="text-xl md:text-2xl font-black text-primary">₹{finalPayable.toLocaleString()}</span>
+        <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full w-fit mt-1">Including Platform Fee</span>
+      </div>
+    );
   };
+
+  // Reset booking state when critical fields change to avoid stale data mixing
+  useEffect(() => {
+    if (!bookingFormData) {
+      setBookingPlan('');
+      setBookingDuration('');
+      setBookingSelectedTime('');
+    }
+  }, [bookingSelectedSubject, bookingType]);
 
   // --- Real-time Notes Notification for Student ---
   useEffect(() => {
     if (!currentUser || !['standard', 'premium'].includes(currentTier)) return;
 
     const normalize = (s: string = '') => s.toString().toLowerCase().trim().replace(/[^a-z0-9]/g, '');
-    const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending'].includes(b.status)).map(b => normalize(b.subject))));
+    const enrolledSubjects = Array.from(new Set(bookings.filter(b => ['confirmed', 'completed', 'pending', 'live', 'rescheduled'].includes(b.status)).map(b => normalize(b.subject))));
     const studentClass = normalize(currentUser.class);
 
     const q = query(collection(db, 'notes'), orderBy('createdAt', 'desc'), limit(5));
@@ -6332,22 +6713,13 @@ export default function App() {
         tutorAvatar: tutor?.avatar || '',
         studentEmail: currentUser.email,
         studentName: currentUser.name || 'Student',
-        lastMessage: initialMsg,
+        lastMessage: 'Chat initialized',
         lastMessageTime: new Date().toISOString(),
         timestamp: serverTimestamp(),
         studentUnreadCount: 0,
-        tutorUnreadCount: 1
+        tutorUnreadCount: 0
       });
 
-      // Add actual message record so it's not empty
-      await addDoc(collection(chatRef, 'messages'), {
-        senderId: currentUser.email,
-        text: initialMsg,
-        timestamp: serverTimestamp(),
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        date: 'TODAY',
-        deletedBy: []
-      });
     }
 
     setActiveChatId(chatId);
@@ -6445,15 +6817,25 @@ export default function App() {
       const isWalletUsed = useWalletCredit && walletFunds > 0;
       const walletDeducted = isWalletUsed ? Math.min(walletFunds, amount) : 0;
 
+      // Calculate course end date if applicable
+      let courseEndDate = null;
+      if (bookingFormData.plan === 'course' && bookingFormData.durationDays) {
+        const start = new Date(bookingFormData.date);
+        const end = isNaN(start.getTime()) ? new Date() : start;
+        end.setDate(end.getDate() + parseInt(bookingFormData.durationDays));
+        courseEndDate = end;
+      }
+
       await updateDoc(doc(db, 'bookings', bookingFormData.id), {
-        status: 'pending',
+        status: 'paid',
         paymentId: paymentId,
         orderId: orderId,
         amount: amount,
         paidAt: serverTimestamp(),
         isSubscription: isSub,
-        subscriptionStatus: isSub ? 'active' : null,
+        subscriptionStatus: isSub ? 'active' : (bookingFormData.plan === 'course' ? 'active' : null),
         nextBillingDate: isSub ? nextBilling : null,
+        courseEndDate: courseEndDate ? Timestamp.fromDate(courseEndDate) : null,
         walletUsed: isWalletUsed,
         walletAmount: walletDeducted,
         tierAtBooking: currentUser?.subscription?.tier || 'free'
@@ -6652,28 +7034,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-
-
-
-
-
-
-  // --- REAL-TIME TUTOR SYNC FOR BOOKING ---
-  const [activeTutorDoc, setActiveTutorDoc] = useState<any>(null);
-  useEffect(() => {
-    if (!isBookingModalOpen || !selectedTutor?.id) {
-      setActiveTutorDoc(null);
-      return;
-    }
-    const unsub = onSnapshot(doc(db, 'users', selectedTutor.id), (snap) => {
-      if (snap.exists()) {
-        setActiveTutorDoc({ id: snap.id, ...snap.data() });
-      }
-    });
-    return () => unsub();
-  }, [isBookingModalOpen, selectedTutor?.id]);
-
-
   // --- REAL-TIME CHAT SYNC (Rename to whatsapp) ---
   useEffect(() => {
     if (!currentUser?.email) return;
@@ -6701,13 +7061,20 @@ export default function App() {
             yesterday.setDate(yesterday.getDate() - 1);
 
             const msgDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+            const diffDays = Math.floor((today.getTime() - msgDate.getTime()) / (1000 * 60 * 60 * 24));
 
             if (msgDate.getTime() === today.getTime()) {
-              return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+              return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
             }
-            if (msgDate.getTime() === yesterday.getTime()) return 'YESTERDAY';
+            if (msgDate.getTime() === yesterday.getTime()) return 'Yesterday';
             
-            return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+            if (diffDays > 0 && diffDays < 7) {
+              const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+              return weekdays[d.getDay()];
+            }
+            
+            // 4. Older: Show Full Date & Time
+            return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) + ', ' + d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
           };
 
           return {
@@ -6745,35 +7112,60 @@ export default function App() {
   useEffect(() => {
     if (!activeChatId || !currentUser?.email) return;
 
-    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
-    
-    const q = query(
-      collection(db, `whatsapp/${chatId}/messages`), 
-      orderBy('timestamp', 'asc')
-    );
-
-    const unsubMsgs = onSnapshot(q, (snap) => {
-      const msgs = snap.docs.map(d => {
-        const data = d.data();
-        return {
-          id: d.id,
-          ...data,
-          // 'me' if student sent it, otherwise 'tutor'
-          sender: data.senderId === currentUser.email ? 'me' : 'tutor'
-        };
-      }).filter((m: any) => !m.deletedBy?.includes(currentUser.email));
-
-      setChats(prev => prev.map(c => {
-        const cId = c.id || `${(c as any).tutorId}_${currentUser.email.replace(/\./g, '_')}`;
-        return cId === chatId ? { ...c, messages: msgs as Message[] } : c;
-      }));
+    const syncMessages = async () => {
+      const tutorId = activeChatId.includes('_') ? activeChatId.split('_')[0] : activeChatId;
+      const studentEmailKey = currentUser.email.replace(/\./g, '_');
       
-      // Mark as read
-      const chatDocRef = doc(db, 'whatsapp', chatId);
-      setDoc(chatDocRef, { studentUnreadCount: 0 }, { merge: true });
-    });
+      const id1 = `${tutorId}_${studentEmailKey}`;
+      const id2 = `${studentEmailKey}_${tutorId}`;
+      
+      // Determine which ID has the messages
+      const q1 = query(collection(db, `whatsapp/${id1}/messages`));
+      const snap1 = await getDocs(q1);
+      
+      let foundId = id1;
+      if (snap1.empty) {
+        const q2 = query(collection(db, `whatsapp/${id2}/messages`));
+        const snap2 = await getDocs(q2);
+        if (!snap2.empty) foundId = id2;
+      }
 
-    return () => unsubMsgs();
+      // Mark as read in the parent document
+      await updateDoc(doc(db, 'whatsapp', activeChatId), { studentUnreadCount: 0 }).catch(() => {});
+
+      // Setup real-time listener for the correct ID
+      const unsub = onSnapshot(query(collection(db, `whatsapp/${foundId}/messages`)), (snap) => {
+        const msgs = snap.docs.map(d => {
+          const data = d.data();
+            return {
+              ...data,
+              id: d.id,
+              senderId: data.senderId,
+              senderName: data.senderName,
+              text: data.text,
+              timestamp: data.timestamp,
+              status: data.status,
+              type: data.type,
+              sender: data.senderId === currentUser.email ? 'me' : 'tutor'
+            } as any;
+        }).sort((a: any, b: any) => {
+          const timeA = a.timestamp?.toMillis?.() || a.timestamp?.seconds * 1000 || 0;
+          const timeB = b.timestamp?.toMillis?.() || b.timestamp?.seconds * 1000 || 0;
+          return timeA - timeB;
+        });
+        
+        setChats(prev => prev.map(c => 
+          (c.id === id1 || c.id === id2 || c.id === activeChatId) ? { ...c, messages: msgs } : c
+        ));
+      });
+      
+      return unsub;
+    };
+
+    let unsubPromise = syncMessages();
+    return () => {
+      unsubPromise.then(unsub => unsub?.());
+    };
   }, [activeChatId, currentUser?.email]);
 
   const baseSendMessage = async (payload: any) => {
@@ -6858,54 +7250,62 @@ export default function App() {
     const msgRef = doc(db, `whatsapp/${chatId}/messages`, msgId);
 
     if (everyone) {
-      // Delete for Everyone
+      const deletedLabel = '🚫 This message was deleted';
       await updateDoc(msgRef, {
-        text: '🚫 This message was deleted',
+        text: deletedLabel,
         deletedForEveryone: true
       });
+      // Sync parent preview and timestamp
+      await updateDoc(doc(db, 'whatsapp', chatId), {
+        lastMessage: deletedLabel,
+        timestamp: serverTimestamp()
+      });
     } else {
-      // Delete for Me
       await updateDoc(msgRef, {
         deletedBy: arrayUnion(currentUser.email)
       });
     }
   };
 
+  const clearChatHistory = async () => {
+    if (!activeChatId || !currentUser?.email) return;
+    if (!window.confirm("Are you sure you want to clear your chat history? This cannot be undone.")) return;
+
+    const chatId = activeChatId.includes('_') ? activeChatId : `${activeChatId}_${currentUser.email.replace(/\./g, '_')}`;
+    const msgsRef = collection(db, `whatsapp/${chatId}/messages`);
+    const snap = await getDocs(msgsRef);
+    
+    const batchPromises = snap.docs.map(d => 
+      updateDoc(doc(db, `whatsapp/${chatId}/messages`, d.id), {
+        deletedBy: arrayUnion(currentUser.email)
+      })
+    );
+    await Promise.all(batchPromises);
+    
+    // Clear parent preview
+    await updateDoc(doc(db, 'whatsapp', chatId), {
+      lastMessage: 'No messages yet',
+      lastMessageTime: null,
+      timestamp: serverTimestamp(),
+      studentUnreadCount: 0
+    });
+    
+    setIsChatMenuOpen(false);
+  };
+
   // --- Dynamic Availability ---
   const [tutorBookings, setTutorBookings] = useState<any[]>([]);
   const [availableSlots, setAvailableSlots] = useState<any[]>([]);
 
+  // Sync bookings for the selected tutor (Conflict Check)
   useEffect(() => {
-    if (!selectedTutor) return;
+    if (!selectedTutor?.id) return;
     
     const unsub = onSnapshot(query(collection(db, 'bookings'), where('tutorId', '==', selectedTutor.id)), (snap) => {
       setTutorBookings(snap.docs.map(d => d.data()));
     });
     return () => unsub();
-  }, [selectedTutor]);
-
-  useEffect(() => {
-    if (!currentUser?.email) return;
-    const q = query(
-      collection(db, 'notifications'), 
-      where('studentEmail', '==', currentUser.email)
-    );
-    const unsub = onSnapshot(q, (snap) => {
-      const data = snap.docs.map(d => ({ id: d.id, ...d.data() })) as Notification[];
-      
-      // Filter based on Student Preferences
-      const prefs = currentUser?.notifications || { reminders: true, messages: true, updates: true };
-      const filtered = data.filter(n => {
-        if (n.type === 'booking') return prefs.reminders !== false;
-        if (n.type === 'message') return prefs.messages !== false;
-        if (n.type === 'update' || n.type === 'platform') return prefs.updates !== false;
-        return true;
-      });
-
-      setNotifications(filtered.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()));
-    });
-    return () => unsub();
-  }, [currentUser]);
+  }, [selectedTutor?.id]);
 
 
   // --- Reschedule Availability ---
@@ -6966,9 +7366,9 @@ export default function App() {
             if (!slot || typeof slot !== 'object') return false;
             // Filter out busy slots
             if (slot.status === 'busy') return false;
-            if (slot.date) return slot.date === initialDate;
-            if (slot.day) return slot.day.toLowerCase() === selectedDay.toLowerCase();
-            return false;
+            const matchesDate = slot.date && slot.date === initialDate;
+            const matchesDay = slot.day && slot.day.toLowerCase() === selectedDay.toLowerCase();
+            return matchesDate || matchesDay;
           })
       : [];
 
@@ -6979,20 +7379,24 @@ export default function App() {
       const startTime = typeof s === 'string' ? s : (s.start || '');
       const endTime = typeof s === 'string' ? '' : (s.end || '');
       
-      if (!startTime) return;
+      if (!startTime || !endTime) return;
 
       const startMins = parseTime(startTime);
-      const endMins = endTime ? parseTime(endTime) : startMins + 60;
+      const endMins = parseTime(endTime);
+      
+      const durStr = reschedulingBooking.duration ? reschedulingBooking.duration.toString().replace(/ Hours?/, '') : '1';
+      const durationVal = parseFloat(durStr);
+      const requiredDurationMins = durationVal * 60;
 
-      // Expand range in 1-hour intervals
-      for (let slotStartMins = startMins; slotStartMins < endMins; slotStartMins += 60) {
-        const slotEndMins = slotStartMins + 60;
+      // Generate sub-slots every 10 minutes within the window
+      for (let slotStartMins = startMins; slotStartMins <= endMins - requiredDurationMins; slotStartMins += 10) {
+        const slotEndMins = slotStartMins + requiredDurationMins;
         const slotTimeStr = formatMins(slotStartMins);
         const slotDateTime = new Date(`${initialDate} ${slotTimeStr}`).getTime();
 
         // Rule 1: Must be in the future (if today)
         if (isToday) {
-          const minTime = now.getTime() + (60 * 60 * 1000); // At least 1 hour from now
+          const minTime = now.getTime() + (30 * 60 * 1000); // At least 30 mins from now
           if (slotDateTime < minTime) continue;
         }
 
@@ -7006,7 +7410,6 @@ export default function App() {
       }
     });
 
-    // Fallback if no manual slots found
     const finalSlots = Array.from(new Set(slots)).sort((a, b) => parseTime(a) - parseTime(b));
     setRescheduleSlots(finalSlots);
   }, [reschedulingBooking, rescheduleDate, bookings, tutors]);
@@ -7050,35 +7453,37 @@ export default function App() {
     }
 
     // 🛡️ TIER-BASED BOOKING GUARDS (Updated Logic)
-    const tier = currentTier;
-    const activeBookings = bookings.filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
-    const activeSubjects = new Set(activeBookings.map(b => b.subject.toLowerCase()));
-    const activeTutors = new Set(activeBookings.map(b => b.tutorId));
+    if (type !== 'demo') {
+      const tier = currentTier;
+      const activeBookings = bookings.filter(b => ['confirmed', 'pending', 'live', 'rescheduled'].includes(b.status));
+      const activeSubjects = new Set(activeBookings.map(b => b.subject.toLowerCase()));
+      const activeTutors = new Set(activeBookings.map(b => b.tutorId));
 
-    const isNewSubject = !activeSubjects.has(subject.toLowerCase());
-    const isNewTutor = !activeTutors.has(selectedTutor.id);
+      const isNewSubject = !activeSubjects.has(subject.toLowerCase());
+      const isNewTutor = !activeTutors.has(selectedTutor.id);
 
-    // Subject Limits based on Plan (User Request: Free:1, Standard:3, Premium:8)
-    const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
+      // Subject Limits based on Plan (User Request: Free:1, Standard:3, Premium:8)
+      const subjectLimit = tier === 'free' ? 1 : tier === 'standard' ? 3 : 8;
 
-    // Rule: Allow multiple tutors as long as within subject count. 
-    // Example: 1 tutor 3 subjects OR 3 tutors 1 subject each.
-    if (isNewSubject && activeSubjects.size >= subjectLimit) {
-       alert(`🚀 Upgrade for More Subjects! 
-       
-You are currently on the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan which allows up to ${subjectLimit} unique subject${subjectLimit > 1 ? 's' : ''}. 
+      // Rule: Allow multiple tutors as long as within subject count. 
+      // Example: 1 tutor 3 subjects OR 3 tutors 1 subject each.
+      if (isNewSubject && activeSubjects.size >= subjectLimit) {
+         alert(`🚀 Upgrade for More Subjects! 
+         
+  You are currently on the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan which allows up to ${subjectLimit} unique subject${subjectLimit > 1 ? 's' : ''}. 
 
-To book "${subject}" or add more subjects, please upgrade your plan in Settings for a professional academic experience!`);
-       return;
-    }
+  To book "${subject}" or add more subjects, please upgrade your plan in Settings for a professional academic experience!`);
+         return;
+      }
 
-    if (isNewTutor && activeTutors.size >= subjectLimit) {
-       alert(`🚀 Unlock More Tutors!
-       
-On the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan, you can book with up to ${subjectLimit} different tutor${subjectLimit > 1 ? 's' : ''}. 
+      if (isNewTutor && activeTutors.size >= subjectLimit) {
+         alert(`🚀 Unlock More Tutors!
+         
+  On the ${(tier || 'free').charAt(0).toUpperCase() + (tier || 'free').slice(1)} Plan, you can book with up to ${subjectLimit} different tutor${subjectLimit > 1 ? 's' : ''}. 
 
-To explore more expert tutors, kindly upgrade your plan in the Settings section.`);
-       return;
+  To explore more expert tutors, kindly upgrade your plan in the Settings section.`);
+         return;
+      }
     }
 
     const isGroup = (form.elements.namedItem('isGroup') as HTMLInputElement)?.value === 'true';
@@ -7141,6 +7546,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
             studentId: currentUser.email,
             studentName: currentUser.name,
             studentEmail: currentUser.email,
+            upiId: currentUser.upiId || '',
             studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
             subject,
             date,
@@ -7207,6 +7613,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
           studentId: currentUser.email,
           studentName: currentUser.name,
           studentEmail: currentUser.email,
+          upiId: currentUser.upiId || '',
           subject,
           date,
           time,
@@ -7225,6 +7632,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
           studentId: currentUser.email,
           studentName: currentUser.name,
           studentEmail: currentUser.email,
+          upiId: currentUser.upiId || '',
           studentType: currentUser.studentType || (currentUser.class === 'B.Tech' ? 'btech' : 'school'),
           subject,
           date,
@@ -7238,10 +7646,57 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
           isGroup,
           maxParticipants: isGroup ? 5 : 1,
           participantCount: 1,
-          participants: [currentUser.email]
+          participants: [currentUser.email],
+          durationDays: (selectedTutor as any)?.pricingEntries?.find((e: any) => normalizeSubject(e.subject) === normalizeSubject(subject))?.durationDays || 
+                        selectedTutor?.subjectsPricing?.find((p: any) => normalizeSubject(p.subject) === normalizeSubject(subject))?.durationDays || null
         };
         const docRef = await addDoc(collection(db, 'bookings'), bookingData);
         setBookingFormData({ ...bookingData, id: docRef.id });
+
+        // 🚀 Notification & WhatsApp for Full Course Enrollment
+        if (plan === 'course') {
+          const tutorId = selectedTutor.id;
+          const studentName = currentUser.name || 'Student';
+          const courseName = subject;
+          
+          // 1. In-App Notification
+          await addDoc(collection(db, 'tutor_notifications'), {
+            tutorId,
+            type: 'booking',
+            title: 'New Full Course Enrollment',
+            description: `${studentName} has enrolled for the Full Course: ${courseName}.`,
+            time: 'Just now',
+            createdAt: serverTimestamp(),
+            read: false
+          });
+
+          // 2. WhatsApp Message Identity Sync
+          const chatId = `${tutorId}_${currentUser.email.replace(/\./g, '_')}`;
+          const chatRef = doc(db, 'whatsapp', chatId);
+          const msgCol = collection(chatRef, 'messages');
+          const nowMsg = new Date();
+          const whatsappText = `🎓 *FULL COURSE ENROLLMENT:* ${studentName} has enrolled for your Full Course in *${courseName}*.\n\n*Important:* Please ensure each class session is at least 1:30h or 2:00h based on the daily schedule to ensure you receive the full course amount payout.`;
+
+          await addDoc(msgCol, {
+            senderId: currentUser.email,
+            text: whatsappText,
+            timestamp: serverTimestamp(),
+            time: nowMsg.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            date: nowMsg.toDateString(),
+            type: 'text'
+          });
+
+          await setDoc(chatRef, {
+            tutorId,
+            tutorName: selectedTutor.name,
+            studentEmail: currentUser.email,
+            studentName,
+            lastMessage: whatsappText,
+            lastMessageTime: nowMsg.toISOString(),
+            timestamp: serverTimestamp(),
+            tutorUnreadCount: increment(1)
+          }, { merge: true });
+        }
       }
       
         setIsBookingModalOpen(false);
@@ -7520,31 +7975,25 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
         }
         return <NotesView currentUser={currentUser} bookings={bookings} currentTier={currentTier} setView={setView} />;
       case 'assignments':
-        if (currentTier !== 'premium') {
+        if (currentTier === 'free') {
           return (
             <div className="p-10 text-center flex flex-col items-center justify-center min-h-[60vh]">
               <FileCheck size={48} className="text-primary/20 mb-6" />
               <h2 className="text-3xl font-serif font-black italic text-slate-800">Assessments & Mock Tests</h2>
               <p className="text-sm text-slate-500 mt-4 max-w-md mx-auto">
-                Regular mock tests and assignments are exclusive to our **Elite Premium** scholars.
+                Unlock assignments, mock tests, and performance analysis by upgrading to a **Standard** or **Premium** plan.
                 Get real-time feedback and detailed performance analysis.
               </p>
               <button 
                 onClick={() => setView('settings')}
                 className="mt-8 px-8 py-3.5 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-105 transition-all shadow-xl shadow-primary/20"
               >
-                Upgrade to Premium
+                Upgrade Plan
               </button>
             </div>
           );
         }
-        return (
-          <div className="p-10 text-center">
-            <FileCheck size={48} className="mx-auto mb-4 text-primary" />
-            <h2 className="text-2xl font-serif font-bold">Assignments & Mock Tests</h2>
-            <p className="text-sm text-primary/40 mt-2">Welcome to your assessment portal. New tests will appear here based on your curriculum.</p>
-          </div>
-        );
+        return <AssignmentsView currentUser={currentUser} bookings={bookings} currentTier={currentTier} setView={setView} />;
       case 'projects':
         if (currentTier !== 'premium') {
           return (
@@ -7695,33 +8144,25 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
             >
               <option value="" disabled>Select Subject</option>
               {(() => {
-                const subjects = (selectedTutor?.subjects && Array.isArray(selectedTutor.subjects)) ? selectedTutor.subjects : [];
+                const latestTutor = tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
+                const entries = (latestTutor as any)?.pricingEntries || [];
+                const subjectsPricing = latestTutor?.subjectsPricing || [];
                 
-                return subjects.map(s => {
-                  const standardizedId = normalizeSubject(s);
-                  const displayName = getSubjectName(standardizedId);
-                  const sp = selectedTutor?.subjectsPricing?.find((p: any) => normalizeSubject(p.subject) === standardizedId);
-                  const entry = (selectedTutor as any)?.pricingEntries?.find((e: any) => normalizeSubject(e.subject) === standardizedId);
-                  
-                  let displayPrice = 0;
-                  let priceSuffix = '/hr';
+                // Get unique raw subject names as defined by the tutor
+                const rawSubjects = Array.from(new Set([
+                  ...entries.map((e: any) => e.subject),
+                  ...subjectsPricing.map((p: any) => p.subject)
+                ].filter(Boolean)));
 
-                  if (entry && entry.hourlyRate) {
-                    displayPrice = Math.ceil(entry.hourlyRate * 1.17);
-                  } else if (sp) {
-                    if (sp.type === 'course') {
-                      displayPrice = Math.ceil(sp.price * 1.17);
-                      priceSuffix = ' Full Course';
-                    } else {
-                      // If it's a monthly total, divide by 30 to get hourly
-                      displayPrice = Math.ceil((sp.price / 30) * 1.17);
-                    }
-                  } else {
-                    displayPrice = Math.ceil(parseFloat(String(selectedTutor?.price || '0')) * 1.17);
-                  }
+                if (rawSubjects.length === 0) {
+                  // Fallback to legacy subjects if no pricing entries found
+                  const fallback = Array.isArray(selectedTutor?.subjects) ? selectedTutor.subjects : [];
+                  return fallback.map(s => <option key={s} value={s}>{getSubjectName(s)}</option>);
+                }
 
-                  return <option key={s} value={standardizedId}>{displayName} (₹{displayPrice}{priceSuffix})</option>;
-                });
+                return rawSubjects.map(s => (
+                  <option key={s} value={s}>{getSubjectName(s)}</option>
+                ));
               })()}
             </select>
           </div>
@@ -7735,52 +8176,83 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
               onChange={(e: any) => setBookingPlan(e.target.value)}
             >
               {(() => {
-                const targetClasses = (selectedTutor?.targetClasses || '').toLowerCase();
-                const isHigherEd = targetClasses.includes('graduate') || 
-                                   targetClasses.includes('intermediate') || 
-                                   targetClasses.includes('b.tech') || 
-                                   targetClasses.includes('degree') ||
-                                   targetClasses.includes('btech') ||
-                                   targetClasses.includes('college');
+                if (!bookingSelectedSubject) return <option value="" disabled>Select Subject First</option>;
 
-                const cls = currentUser?.class || '';
-                const gradeNum = parseInt(cls.replace(/\D/g, ''));
-                const isSchoolUnder10 = !isNaN(gradeNum) && gradeNum <= 10;
+                const latestTutor = tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
+                const pNorm = (s: string) => s?.toLowerCase().trim().replace(/[^a-z0-9]/g, '') || '';
+                const targetSubject = pNorm(bookingSelectedSubject);
 
-                if (isHigherEd) {
+                const allEntries = (latestTutor as any)?.pricingEntries?.filter((e: any) => pNorm(e.subject) === targetSubject) || [];
+                const allSP = latestTutor?.subjectsPricing?.filter((p: any) => pNorm(p.subject) === targetSubject) || [];
+
+                const hasCourse = allEntries.some((e: any) => e.type === 'course') || allSP.some((p: any) => p.type === 'course' || p.type === 'both');
+                const hasHourlyRate = allEntries.some((e: any) => (e.hourlyRate > 0 || e.type === 'hourly')) ||
+                                      allSP.some((p: any) => (p.hourlyRate > 0 || p.type === 'hourly' || p.type === 'both'));
+
+                if (hasCourse) {
+                  // If it has a course option, set it as default if no hourly exists
+                  if (bookingPlan !== 'course' && !bookingFormData && !hasHourlyRate) {
+                    setTimeout(() => setBookingPlan('course'), 0);
+                  }
+
                   return (
                     <>
                       <option value="" disabled>Choose Plan Type</option>
-                      <option value="1month">One Month Plan</option>
-                      <option value="3months">Three Months Plan</option>
-                      <option value="6months">Six Months Plan</option>
                       <option value="course">Full Course Enrollment</option>
+                      {hasHourlyRate && (
+                        <>
+                          <option value="1month">One Month Plan</option>
+                          <option value="3months">Three Months Plan</option>
+                          <option value="6months">Six Months Plan</option>
+                        </>
+                      )}
                     </>
                   );
                 }
 
-                if (isSchoolUnder10) {
-                  return (
-                    <>
-                      <option value="" disabled>Choose Plan Type</option>
-                      <option value="1month">One Month Plan</option>
-                      <option value="3months">Three Months Plan</option>
-                      <option value="6months">Six Months Plan</option>
-                    </>
-                  );
-                }
-
+                // Default for hourly-only subjects
                 return (
                   <>
                     <option value="" disabled>Choose Plan Type</option>
-                    <option value="1month">1-Month Plan</option>
-                    <option value="3months">3-Months Plan</option>
-                    <option value="6months">6-Months Plan</option>
+                    <option value="1month">One Month Plan</option>
+                    <option value="3months">Three Months Plan</option>
+                    <option value="6months">Six Months Plan</option>
                   </>
                 );
               })()}
             </select>
           </div>
+
+          {(() => {
+            const pNorm = (s: string) => s?.toLowerCase().trim().replace(/[^a-z0-9]/g, '') || '';
+            const targetSubject = pNorm(bookingSelectedSubject);
+
+            const allEntries = (selectedTutor as any)?.pricingEntries?.filter((e: any) => pNorm(e.subject) === targetSubject) || [];
+            const allSP = selectedTutor?.subjectsPricing?.filter((p: any) => pNorm(p.subject) === targetSubject) || [];
+            
+            const courseEntry = allEntries.find((e: any) => e.type === 'course') || allSP.find((p: any) => p.type === 'course' || p.type === 'both');
+            const durationDays = courseEntry?.durationDays;
+
+            if (courseEntry && durationDays && bookingPlan === 'course') {
+              return (
+                <div className="space-y-3 animate-in fade-in slide-in-from-top-2">
+                  <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Course Duration</label>
+                  <div className="bg-primary/5 p-4 rounded-2xl border border-primary/10 flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-black text-primary">
+                        {durationDays} Days to Complete
+                      </p>
+                      <p className="text-[9px] font-bold text-primary/40 uppercase tracking-tight">Standard completion timeline</p>
+                    </div>
+                    <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
+                      <Calendar className="w-5 h-5 text-primary" />
+                    </div>
+                  </div>
+                </div>
+              );
+            }
+            return null;
+          })()}
 
           
 
@@ -7904,22 +8376,23 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                 }}
               />
             </div>
-            <div className="space-y-3">
-              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Daily Duration</label>
-              <select 
-                name="duration" 
-                className="input-field" 
-                required 
-                value={bookingDuration}
-                onChange={(e) => setBookingDuration(e.target.value)}
-              >
-                <option value="" disabled>Choose Hours</option>
-                <option value="1">1 Hour</option>
-                <option value="1.5">1.5 Hours</option>
-                <option value="2">2 Hours</option>
-                <option value="3">3 Hours</option>
-              </select>
-            </div>
+            {bookingPlan !== 'course' && (
+              <div className="space-y-3">
+                <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Daily Duration</label>
+                <select 
+                  name="duration" 
+                  className="input-field" 
+                  required 
+                  value={bookingDuration}
+                  onChange={(e) => setBookingDuration(e.target.value)}
+                >
+                  <option value="" disabled>Choose Hours</option>
+                  {PricingEngine.getAvailableSessionDurations(bookingPlan).map(val => (
+                    <option key={val} value={val}>{val} {parseFloat(val) === 1 ? 'Hour' : 'Hours'}</option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             <div className="space-y-3">
               <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Select Time</label>
@@ -7932,11 +8405,11 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                 disabled={!bookingSelectedDate || !bookingDuration}
               >
                 {(() => {
-                  // INTERLINK: Use activeTutorDoc for real-time availability updates from tutor side
-                  const latestTutor = activeTutorDoc || tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
+                  // INTERLINK: Use real-time tutors list for latest availability
+                  const latestTutor = tutors.find(t => t.id === selectedTutor?.id) || selectedTutor;
                   
                   if (!bookingSelectedDate || !bookingDuration) {
-                    return <option value="" disabled>{!bookingSelectedDate ? 'Select Date First' : 'Choose Hours First'}</option>;
+                    return <option value="" disabled>{!bookingSelectedDate ? 'Please Choose a Date' : 'Choose Hours First'}</option>;
                   }
 
                   const [y, m, d_val] = bookingSelectedDate.split('-').map(Number);
@@ -7952,58 +8425,66 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
                   const isToday = bookingSelectedDate === isoToday;
                   const nowMins = now.getHours() * 60 + now.getMinutes();
 
-                  // Helper to apply real-time and booking filters
-                  const getFinalSlots = (sourceSlots: string[]) => {
-                    const uniqueSorted = Array.from(new Set(sourceSlots)).sort((a, b) => parseTime(a) - parseTime(b));
-                    let filtered = isToday ? uniqueSorted.filter(s => parseTime(s) >= nowMins) : uniqueSorted;
-                    return filtered.filter(slotTime => {
-                      const slotStart = parseTime(slotTime);
-                      const durationVal = parseFloat(bookingDuration || '1');
-                      const slotEnd = slotStart + (durationVal * 60);
-                      return !tutorBookings.some(b => {
-                        if (b.status === 'cancelled' || b.date !== bookingSelectedDate) return false;
+                  // DYNAMIC AVAILABILITY ENGINE
+                  const availability = (latestTutor?.availability || []) as any[];
+                  
+                  // Separate date-specific and weekly slots for the selected day
+                  const dateSpecificSlots = availability.filter((s: any) => 
+                    s.date && s.date === bookingSelectedDate && s.status !== 'busy' && typeof s !== 'string'
+                  );
+                  const weeklySlots = availability.filter((s: any) => 
+                    !s.date && s.day && s.day.toLowerCase() === selectedDay.toLowerCase() && s.status !== 'busy' && typeof s !== 'string'
+                  );
+
+                  // 🛡️ OVERRIDE LOGIC: If tutor has specific date availability, ignore general weekly schedule
+                  const rawMatching = dateSpecificSlots.length > 0 ? dateSpecificSlots : weeklySlots;
+
+                  const matchingAvailability = rawMatching;
+
+                  const durationVal = parseFloat(bookingDuration || '1');
+                  const requiredDurationMins = durationVal * 60;
+                  const currentMins = now.getHours() * 60 + now.getMinutes();
+
+                  const slotsToShow: string[] = [];
+                  
+                  matchingAvailability.forEach(availSlot => {
+                    const windowStart = parseTime(availSlot.start);
+                    const windowEnd = parseTime(availSlot.end);
+                    if (!windowStart || !windowEnd || windowEnd <= windowStart) return;
+
+                    // Generate all possible 10-minute intervals that can fit the required duration
+                    const maxStartTime = windowEnd - requiredDurationMins;
+                    
+                    for (let time = windowStart; time <= maxStartTime; time += 10) {
+                      if (isToday && time < currentMins + 30) continue;
+
+                      const slotEnd = time + requiredDurationMins;
+
+                      // Check for conflicts with existing tutor bookings
+                      const hasConflict = tutorBookings.some(b => {
+                        if (b.status === 'cancelled' || b.status === 'unpaid' || b.date !== bookingSelectedDate) return false;
                         const bStart = parseTime(b.time);
                         const bDurStr = b.duration?.toString().replace(/ Hours?/, '') || '1';
                         const bEnd = bStart + (parseFloat(bDurStr) * 60);
-                        return slotStart < bEnd && slotEnd > bStart;
+                        return time < bEnd && slotEnd > bStart;
                       });
-                    });
-                  };
 
-                  // 1. SLOT SOURCE (RULE 1)
-                  const availability = latestTutor?.availability || [];
-                  const daySlotsRaw = availability.filter((s: any) => {
-                    const dayMatch = s.day && s.day.toLowerCase() === selectedDay.toLowerCase();
-                    const dateMatch = s.date && s.date === bookingSelectedDate;
-                    return dateMatch || dayMatch;
+                      if (!hasConflict) {
+                        slotsToShow.push(formatMins(time));
+                      }
+                    }
                   });
 
-                  let baseSlots: string[] = [];
-                  if (daySlotsRaw.length > 0) {
-                    daySlotsRaw.forEach((s: any) => {
-                      const startTime = typeof s === 'string' ? s : (s.start || '');
-                      const endTime = typeof s === 'string' ? '' : (s.end || '');
-                      if (!startTime) return;
-                      const startMins = parseTime(startTime);
-                      const endMins = endTime ? parseTime(endTime) : startMins + 60;
-                      for (let m = startMins; m < endMins; m += 60) {
-                        baseSlots.push(formatMins(m));
-                      }
-                    });
-                  } else {
-                    baseSlots = [];
-                  }
-
-                  const slotsToShow = getFinalSlots(baseSlots);
-
-                  if (slotsToShow.length === 0) {
+                  const uniqueSortedSlots = Array.from(new Set(slotsToShow)).sort((a, b) => parseTime(a) - parseTime(b));
+                  
+                  if (uniqueSortedSlots.length === 0) {
                     return <option value="" disabled>No slots available for this duration</option>;
                   }
 
                   return (
                     <>
                       <option value="" disabled>Select Time</option>
-                      {slotsToShow.map((t, idx) => (
+                      {uniqueSortedSlots.map((t, idx) => (
                         <option key={idx} value={t}>{t}</option>
                       ))}
                     </>
@@ -8174,122 +8655,154 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
         }}
         title={`Reschedule Session with ${reschedulingBooking?.tutorName}`}
       >
-        <form 
-          onSubmit={async (e) => {
-            e.preventDefault();
-            const form = e.target as HTMLFormElement;
-            const date = (form.elements.namedItem('date') as HTMLInputElement).value;
-            const time = (form.elements.namedItem('time') as HTMLSelectElement).value;
-            const reason = rescheduleReason || 'No reason provided';
-            
-            if (reschedulingBooking?.id) {
-              try {
-                // 1. Update existing booking IN-PLACE with new time and status
-                const bookingRef = doc(db, 'bookings', reschedulingBooking.id);
-                await updateDoc(bookingRef, { 
-                  date,
-                  time,
-                  status: 'confirmed', 
-                  isRescheduled: true,
-                  rescheduleReason: reason,
-                  updatedAt: serverTimestamp()
-                });
+        <div className="space-y-8">
+          <div className="bg-primary/5 rounded-3xl p-6 border border-primary/10 flex items-center gap-5">
+            <div className="w-14 h-14 rounded-2xl bg-white flex items-center justify-center shadow-lg text-primary shrink-0">
+               <Calendar size={24} />
+            </div>
+            <div>
+              <p className="text-[10px] font-black text-primary/40 uppercase tracking-widest mb-1">Current Session</p>
+              <h4 className="text-lg font-bold text-slate-800">{reschedulingBooking?.date} at {reschedulingBooking?.time}</h4>
+              <p className="text-[10px] font-bold text-primary mt-1 opacity-60">Subject: {reschedulingBooking ? getSubjectName(reschedulingBooking.subject) : ''}</p>
+            </div>
+          </div>
 
-                // 2. Notify the Tutor automatically (FIXED: match Tutor Dashboard listener)
-                await addDoc(collection(db, 'tutor_notifications'), {
-                  tutorId: reschedulingBooking.tutorId,
-                  userId: currentUser.id || currentUser.email, // Standardize on userId
-                  studentId: currentUser.email, 
-                  studentName: currentUser.displayName || currentUser.name || 'Student',
-                  studentAvatar: currentUser.photoURL || '',
-                  type: 'booking',
-                  title: 'Session Rescheduled',
-                  description: `${currentUser.displayName || currentUser.name || 'Student'} has rescheduled their ${getSubjectName(reschedulingBooking.subject)} session to ${date} at ${time}. Reason: ${reason}`,
-                  bookingId: reschedulingBooking.id,
-                  time: 'Just now',
-                  read: false,
-                  createdAt: serverTimestamp() // Required for Tutor Dashboard sorting
-                });
+          <div className="space-y-6">
+            <div>
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block ml-1">1. Choose New Date</label>
+              <div className="flex gap-3 overflow-x-auto pb-4 no-scrollbar -mx-2 px-2">
+                {Array.from({ length: 14 }).map((_, i) => {
+                  const d = new Date();
+                  d.setDate(d.getDate() + i);
+                  const dateStr = formatDateLocal(d);
+                  const isSelected = rescheduleDate === dateStr;
+                  
+                  return (
+                    <button
+                      key={dateStr}
+                      onClick={() => {
+                        setRescheduleDate(dateStr);
+                        setRescheduleSelectedTime('');
+                      }}
+                      className={cn(
+                        "flex flex-col items-center justify-center min-w-[75px] py-5 rounded-[2rem] border-2 transition-all shrink-0",
+                        isSelected 
+                          ? "bg-primary border-primary text-white shadow-2xl shadow-primary/20 scale-105" 
+                          : "bg-white border-primary/5 text-slate-600 hover:border-primary/30"
+                      )}
+                    >
+                      <span className="text-[8px] font-black uppercase tracking-widest opacity-60 mb-1.5">
+                        {i === 0 ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short' })}
+                      </span>
+                      <span className="text-lg font-black">{d.getDate()}</span>
+                      <span className="text-[9px] font-bold uppercase">{d.toLocaleDateString('en-US', { month: 'short' })}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
 
-                setRescheduleSuccess(true);
-                setTimeout(() => {
-                  setReschedulingBooking(null);
-                  setRescheduleDate('');
-                  setRescheduleReason('');
-                  setRescheduleSuccess(false);
-                }, 3000);
-              } catch (err) {
-                console.error("Error in rescheduling process:", err);
-              }
-            }
-          }} 
-          className="space-y-8"
-        >
-          <div className="grid grid-cols-2 gap-6">
+            <div>
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block ml-1">2. Select Available Slot</label>
+              {rescheduleSlots.length > 0 ? (
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {rescheduleSlots.map(time => (
+                    <button
+                      key={time}
+                      onClick={() => setRescheduleSelectedTime(time)}
+                      className={cn(
+                        "py-4 px-4 rounded-2xl border-2 text-[10px] font-black transition-all flex items-center justify-center gap-2",
+                        rescheduleSelectedTime === time 
+                          ? "bg-primary border-primary text-white shadow-xl shadow-primary/20" 
+                          : "bg-white border-primary/5 text-slate-600 hover:border-primary/10"
+                      )}
+                    >
+                      <Clock size={12} className={rescheduleSelectedTime === time ? "text-white" : "text-primary/30"} />
+                      {time}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-12 border-2 border-dashed border-primary/10 rounded-[2.5rem] text-center bg-primary/5">
+                  <AlertCircle size={32} className="text-primary/20 mx-auto mb-3" />
+                  <p className="text-[10px] font-black text-primary/30 uppercase tracking-widest italic">No Free Slots for this Date</p>
+                </div>
+              )}
+            </div>
+
             <div className="space-y-3">
-              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">New Date</label>
-              <input 
-                name="date" 
-                type="date" 
-                className="input-field" 
-                required 
-                min={formatDateLocal(new Date())} 
-                max="2099-12-31"
-                value={rescheduleDate} 
-                onInput={(e) => {
-                  const val = e.currentTarget.value;
-                  if (val) {
-                    const parts = val.split('-');
-                    if (parts[0] && parts[0].length > 4) {
-                      parts[0] = parts[0].slice(0, 4);
-                      e.currentTarget.value = parts.join('-');
-                      setRescheduleDate(e.currentTarget.value);
-                    }
-                  }
-                }}
-                onChange={(e) => setRescheduleDate(e.target.value)}
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block ml-1">3. Reason (Optional)</label>
+              <textarea 
+                className="w-full bg-primary/5 border-2 border-transparent rounded-[2rem] px-8 py-6 focus:border-primary focus:bg-white outline-none text-sm font-bold h-32 resize-none transition-all shadow-inner"
+                placeholder="Why do you need to reschedule this session?"
+                value={rescheduleReason}
+                onChange={(e) => setRescheduleReason(e.target.value)}
               />
             </div>
-            <div className="space-y-3">
-              <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">New Time</label>
-              <select name="time" className="input-field" required defaultValue={reschedulingBooking?.time}>
-                {rescheduleSlots.length > 0 ? (
-                  rescheduleSlots.map(t => <option key={t} value={t}>{t}</option>)
-                ) : (
-                  <option value="" disabled selected>⚠️ No Slots Available for this Date</option>
-                )}
-              </select>
-              <p className="text-[8px] font-bold text-primary/30 uppercase tracking-tight ml-4">
-                * Slots are based on tutor's free time
-              </p>
-            </div>
           </div>
 
-          <div className="space-y-3">
-            <label className="text-[10px] font-bold text-primary/30 uppercase tracking-widest ml-1">Reason for Rescheduling</label>
-            <textarea 
-              className="input-field min-h-[100px] py-4"
-              placeholder="Please provide a valid reason for rescheduling this session..."
-              value={rescheduleReason}
-              onChange={(e) => setRescheduleReason(e.target.value)}
-              required
-            />
-          </div>
-          <div className="pt-8 flex justify-end">
+          <div className="pt-4 flex gap-4">
             <button 
-              type="submit" 
-              disabled={rescheduleSlots.length === 0 || rescheduleSuccess}
-              className={`bg-primary text-background px-10 py-4 rounded-2xl font-bold transition-all shadow-xl ${rescheduleSuccess ? 'bg-emerald-500 scale-95' : 'hover:scale-105'}`}
+              onClick={() => setReschedulingBooking(null)}
+              className="flex-1 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400 hover:bg-slate-50 rounded-2xl transition-all"
             >
-              {rescheduleSuccess ? '✓ Rescheduled Successfully' : 'Confirm Reschedule'}
+              Cancel
+            </button>
+            <button 
+              onClick={async () => {
+                if (!reschedulingBooking || !rescheduleSelectedTime) return;
+                setRescheduleSuccess(true);
+                
+                try {
+                  const bookingRef = doc(db, 'bookings', reschedulingBooking.id);
+                  const currentRescheduledDays = { ...(reschedulingBooking.rescheduledDays || {}) };
+                  currentRescheduledDays[rescheduleDate] = rescheduleSelectedTime;
+                  
+                  await updateDoc(bookingRef, { 
+                    rescheduledDays: currentRescheduledDays,
+                    status: 'confirmed', 
+                    isRescheduled: true,
+                    rescheduleReason: rescheduleReason || 'No reason provided',
+                    updatedAt: serverTimestamp()
+                  });
+
+                  await addDoc(collection(db, 'tutor_notifications'), {
+                    tutorId: reschedulingBooking.tutorId,
+                    studentId: currentUser?.email, 
+                    studentName: currentUser?.name || 'Student',
+                    type: 'booking',
+                    title: 'Session Rescheduled',
+                    description: `${currentUser?.name || 'Student'} rescheduled their ${getSubjectName(reschedulingBooking.subject)} session to ${rescheduleDate} at ${rescheduleSelectedTime}.`,
+                    bookingId: reschedulingBooking.id,
+                    time: 'Just now',
+                    read: false,
+                    createdAt: serverTimestamp()
+                  });
+
+                  setTimeout(() => {
+                    setReschedulingBooking(null);
+                    setRescheduleSuccess(false);
+                    setRescheduleReason('');
+                    setRescheduleDate('');
+                    setRescheduleSelectedTime('');
+                  }, 2000);
+                } catch (err) {
+                  console.error(err);
+                  setRescheduleSuccess(false);
+                }
+              }}
+              disabled={!rescheduleSelectedTime || rescheduleSuccess}
+              className={cn(
+                "flex-[2] py-4 rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3",
+                rescheduleSelectedTime && !rescheduleSuccess
+                  ? "bg-primary text-white shadow-2xl shadow-primary/30 hover:scale-[1.02] active:scale-95" 
+                  : rescheduleSuccess ? "bg-emerald-500 text-white" : "bg-slate-100 text-slate-300 cursor-not-allowed"
+              )}
+            >
+              {rescheduleSuccess ? '✓ Success' : 'Confirm Reschedule'}
             </button>
           </div>
-          {rescheduleSuccess && (
-            <p className="text-center text-emerald-600 font-bold text-[10px] uppercase tracking-widest mt-4">
-              The tutor has been notified automatically.
-            </p>
-          )}
-        </form>
+        </div>
       </Modal>
 
       {/* Live Class Overlay */}
@@ -8616,82 +9129,7 @@ To explore more expert tutors, kindly upgrade your plan in the Settings section.
           </div>
         </div>
       </Modal>
-      {/* Cancellation Modal */}
-
-
-      {/* 🔐 MANDATORY UPI ID GATE MODAL */}
-      <AnimatePresence>
-        {showUpiGate && (
-          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-6">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 bg-slate-900/80 backdrop-blur-md"
-            />
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.9, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="relative w-full max-w-lg bg-white rounded-[2.5rem] shadow-2xl overflow-hidden"
-            >
-              <div className="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-primary via-accent to-primary"></div>
-              
-              <div className="p-8 md:p-12">
-                <div className="w-20 h-20 bg-primary/5 rounded-3xl flex items-center justify-center mb-8 mx-auto">
-                   <Wallet size={40} className="text-primary animate-pulse" />
-                </div>
-                
-                <div className="text-center mb-10">
-                  <h2 className="text-3xl font-serif font-black italic text-slate-800 mb-4">Add Your UPI ID</h2>
-                  <p className="text-slate-500 font-medium leading-relaxed">
-                    To access your dashboard and schedule classes, please provide your primary UPI ID. This is required for secure academic transaction verifications.
-                  </p>
-                </div>
-
-                <form onSubmit={handleGateUpiSubmit} className="space-y-6">
-                  <div className="space-y-3">
-                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-primary/30 ml-1">Your UPI ID (e.g. name@bank)</label>
-                    <div className="relative">
-                      <CreditCard className="absolute left-4 top-1/2 -translate-y-1/2 text-primary/20" size={20} />
-                      <input 
-                        type="text" 
-                        required
-                        placeholder="username@okaxis"
-                        value={gateUpiInput}
-                        onChange={(e) => setGateUpiInput(e.target.value)}
-                        className="w-full h-16 pl-12 pr-6 bg-slate-50 border-2 border-slate-100 rounded-2xl font-bold text-lg focus:border-primary focus:bg-white transition-all outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <button 
-                    type="submit"
-                    disabled={isUpdatingGateUpi || !gateUpiInput.trim()}
-                    className="w-full h-16 bg-primary text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-2xl shadow-primary/20 hover:scale-[1.02] active:scale-98 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:grayscale"
-                  >
-                    {isUpdatingGateUpi ? (
-                      <>
-                        <RefreshCw size={18} className="animate-spin" />
-                        Processing...
-                      </>
-                    ) : (
-                      <>
-                        Continue to Dashboard
-                        <ArrowRight size={18} />
-                      </>
-                    )}
-                  </button>
-                </form>
-
-                <div className="mt-8 pt-8 border-t border-slate-50 text-center">
-                   <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Eduqra Scholar • Secure Verification</p>
-                </div>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
+      {/* 🔐 MANDATORY UPI ID GATE MODAL - REMOVED PER USER REQUEST */}
 
     </>
   );
@@ -9008,35 +9446,27 @@ function ChatView({
                     <AnimatePresence>
                       {isChatMenuOpen && (
                         <motion.div 
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: 10 }}
-                          className="absolute right-0 top-full mt-2 w-48 bg-white rounded-2xl shadow-xl border border-surface-variant overflow-hidden z-50"
+                          initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                          className="absolute right-0 top-full mt-2 w-56 bg-white rounded-2xl shadow-xl border border-surface-variant p-1 z-[100] overflow-hidden"
                         >
-                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3">
-                            <UserCircle size={16} /> View Profile
+                          <button className="w-full px-4 py-3 text-left text-xs font-black uppercase tracking-widest hover:bg-primary/5 flex items-center gap-3 transition-colors">
+                            <UserCircle size={16} className="text-primary/60" /> View Profile
                           </button>
-                          <button className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3">
-                            <FileText size={16} /> Shared Files
+                          <button className="w-full px-4 py-3 text-left text-xs font-black uppercase tracking-widest hover:bg-primary/5 flex items-center gap-3 transition-colors">
+                            <FileText size={16} className="text-primary/60" /> Shared Files
                           </button>
+                          <div className="h-[1px] bg-slate-100 my-1" />
                           <button 
-                            onClick={async () => {
-                              if (confirm('Are you sure you want to clear this chat for yourself?')) {
-                                try {
-                                  const msgs = await getDocs(collection(db, `whatsapp/${activeChatId}/messages`));
-                                  for (const m of msgs.docs) {
-                                    await updateDoc(doc(db, `whatsapp/${activeChatId}/messages`, m.id), {
-                                      deletedBy: arrayUnion(currentUser?.email)
-                                    });
-                                  }
-                                  setIsChatMenuOpen(false);
-                                  alert('Chat cleared.');
-                                } catch (e) { console.error(e); }
+                            onClick={() => {
+                              if (activeChatId) {
+                                setChats(prev => prev.map(c => c.id === activeChatId ? { ...c, messages: [] } : c));
                               }
                             }}
-                            className="w-full px-5 py-3 text-left text-sm font-bold hover:bg-primary/5 flex items-center gap-3 text-rose-500 border-t border-surface-variant"
+                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-rose-50 text-rose-600 rounded-xl transition-all font-black text-xs uppercase tracking-widest"
                           >
-                            <LogOut size={16} /> Clear Chat
+                            <Trash2 size={16} /> Clear Chat
                           </button>
                         </motion.div>
                       )}
@@ -9801,7 +10231,10 @@ const PaymentsView = ({ bookings, onPay, currentUser }: {
                            )}>
                              {txn.type || 'Session'}
                            </span>
-                           <p className="text-[9px] font-bold text-primary/40 uppercase tracking-widest">{getSubjectName(txn.subject)}</p>
+                           <p className="text-[9px] font-bold text-primary/40 uppercase tracking-widest">
+                             {getSubjectName(txn.subject)}
+                             {txn.plan && <span className="ml-2 text-primary/30 border-l border-primary/10 pl-2">{txn.plan} Plan</span>}
+                           </p>
                         </div>
                       </td>
                       <td className="px-8 py-5 text-xs font-black text-primary">₹{(txn.amount || 0).toLocaleString('en-IN')}</td>
