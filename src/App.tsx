@@ -5622,17 +5622,16 @@ export default function App() {
           await updateDoc(studentRef, { email_verified: true, status: 'active' });
           await updateDoc(userRef, { email_verified: true, status: 'active' });
           
-          showToast("Email verified! Please log in to access your dashboard.", "success");
+          // 🚪 FORCE LOGOUT & REDIRECT TO LOGIN (Per User Request)
+          await signOut(auth);
+          localStorage.clear();
+          setCurrentUser(null);
+          setView('login');
+          
+          showToast("Account verified successfully! Please login to continue.", "success");
           
           // Clear URL params
           window.history.replaceState({}, '', window.location.pathname);
-          
-          // Always redirect to login after verification
-          await signOut(auth);
-          localStorage.removeItem('student_user');
-          localStorage.setItem('student_logged_in', 'false');
-          setCurrentUser(null);
-          setView('login');
         } catch (err) {
           console.error("Verification failed:", err);
           showToast("Verification link invalid or expired.", "error");
