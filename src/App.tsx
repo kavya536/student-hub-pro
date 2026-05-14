@@ -1985,7 +1985,8 @@ const RegisterView = ({ setView, setCurrentUser }: {
       
       // 📧 Send Verification & Welcome Emails via GAS Bridge (Bypassing Backend)
       try {
-        const verifyLink = `${window.location.origin}/?verify=true&uid=${uid}`;
+        const hubBase = import.meta.env.VITE_STUDENT_HUB_URL || window.location.origin;
+        const verifyLink = `${hubBase}/?verify=true&uid=${uid}`;
         
         await sendPlatformEmail(
           { name: formData.name, email: formData.email }, 
@@ -5861,7 +5862,8 @@ export default function App() {
   const handleResendVerification = async () => {
     if (!currentUser?.email) return;
     try {
-      const verifyLink = `${window.location.origin}/?verify=true&uid=${currentUser.id}`;
+      const hubBase = import.meta.env.VITE_STUDENT_HUB_URL || window.location.origin;
+      const verifyLink = `${hubBase}/?verify=true&uid=${currentUser.id}`;
       
       await sendPlatformEmail(
         { name: currentUser.name, email: currentUser.email }, 
